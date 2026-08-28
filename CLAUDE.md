@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Early. Steps 1 to 6 are committed; step 7 — the last section of the `Makefile` — is not. `README.md` is a specification of the build; of its steps **1 to 7 — the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, and the QEMU test — are implemented**. Step 8 (an interactive QEMU launch script) is still to be written.
+Steps 1 to 6 are committed; steps 7 and 8 — the last two sections of the `Makefile` and `tools/qemu.sh` — are not. **All eight steps of `README.md` are implemented**: the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, the QEMU test, and the launcher.
 
-Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
+Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `tools/` (things a person runs, as opposed to things make runs), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
 
 ## Commands
 
@@ -42,6 +42,10 @@ gmake test                              # everything below, ~45 s
 gmake boot-check                        # boot as a Pi 3, assert it reaches a login prompt
 gmake grow-check                        # boot a padded copy, assert the first-boot resize
 gmake boot-log                          # the serial log of the last boot-check
+gmake run                               # boot it in a QEMU window and log in
+gmake RUN_ARGS=-f run                   # the same, starting from a fresh card
+gmake RUN_ARGS="-F -r 640x480" run      # full screen, largest console text
+tools/qemu.sh -h                        # every option the launcher takes
 gmake clean                             # drop build/, keep downloads/
 gmake distclean                         # also drop downloads/ (including ~600 MiB of toolchain)
 ```
@@ -153,6 +157,19 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - QEMU is killed as soon as the log says what was being waited for, rather than always burning `QEMU_TIMEOUT`. It has to be killed either way — with no VideoCore and no shutdown request it sits at the login prompt indefinitely.
 - **Only the Pi 3 is emulated**, which is what the README asks for. A Pi 4 run would need three changes and not more: `QEMU_MACHINE=raspi4b`, the `bcm2711-rpi-4-b.dtb`, and `QEMU_ROOTDEV=/dev/mmcblk1p2` — under QEMU the Pi 4 exposes the card as `mmcblk1` where real hardware uses `mmcblk0`. Pi 5 and CM5 have no QEMU machine at all, so BCM2712 is hardware-only.
 
+### How step 8 works
+
+`tools/qemu.sh` is the launcher; `make run` builds the image and hands over to it. It is a script rather than a recipe because it is what a person runs to *use* the OS: it takes options, it can be read, and it works on a checkout where make has built nothing.
+
+- **The window is where you log in, and that is forced, not chosen.** The serial line under QEMU is output-only (see the QEMU caveats), so the framebuffer console and a USB keyboard are the only way to type anything. Hence `console=tty1` last on the command line — making it `/dev/console`, and so where the getty lands — and `-device usb-kbd`. `dwc2`, `hid` and `usbhid` are all builtin in the Pi kernel (`modules.builtin`), so the keyboard needs no module loading, which matters because nothing in this rootfs autoloads modules.
+- **First boot is run headlessly before the window opens**, once per working copy, and this is worth keeping. QEMU's raspi3b does not come back from a warm reset cleanly: the framebuffer returns with its red and blue channels swapped — verified by screendump — and a `-serial mon:stdio` chardev stops producing output altogether, though `-serial file:` survives. An interactive session that starts before the first-boot reboot is therefore unreadable in the window and silent in the terminal. A cold boot of an already-grown card has neither problem.
+- **No `earlycon=` here**, unlike the test targets. earlycon prints the messages from before the real console registers and the kernel then replays that same buffer to the console when it does, so every early line arrives twice on the terminal. Worth it when diagnosing a kernel that will not boot; not when using one that does.
+- **Scaling the window is the only way to make the console text bigger.** The Raspberry Pi kernel has exactly two console fonts compiled in — `VGA8x16` and `VGA8x8` — so `fbcon=font:SUN12x22` and friends are silently ignored and 8x16 pixels is the ceiling. (Checked by decompressing the kernel: `kernel8.img` is a gzip stream, which is also why `strings` finds nothing in it, and why the boot image carries no readable kernel version.) So the launcher passes `-display cocoa,zoom-to-fit=on` (or `gtk`, whichever this QEMU has), which is what makes the window resizable and scales the guest image with it; without it the window is fixed at the guest's resolution. `-F` starts full screen.
+- **The framebuffer size comes from the kernel command line**, `bcm2708_fb.fbwidth=`/`fbheight=`, because QEMU never runs the firmware and so `config.txt` cannot set it the way it would on a real board. `-r` drives those; the default 1024x768 is a 128x48 console. Since the font cannot grow, a *smaller* `-r` is what reads better once the window is enlarged: `-F -r 640x480` is an 80x30 console scaled to the whole display, and about as large as the characters get.
+- The launcher never writes to the image. It copies it once to `build/qemu/run.img`, pads that copy out to `-s` (4 GiB by default, sparse, so it costs what is written), and reuses it — a changed password or an added file is still there next time. `-f` starts over, `-t` discards just this run's writes.
+- **An intermittent kernel panic on the warm reboot was seen once** and did not reproduce in four further runs — an Oops in an interrupt on a secondary CPU during `secondary_start_kernel`, straight after QEMU's machine reset. It looks like an emulator artifact rather than anything in the image; it is worth knowing about if `grow-check` ever fails once and then passes.
+- Verified by driving the emulated keyboard through the QEMU monitor (`sendkey`) and reading the framebuffer back with `screendump`: login as `root`, the default password accepted, the forced password change enforced and completed, and a shell prompt that runs commands. That is also how the step 6 login requirements were confirmed — there is no other way to see the framebuffer console from a terminal.
+
 ### Make dependency layout
 
 `Makefile` is a prerequisite of the things that are **built** (`boot.img`, the musl install, the busybox binary, the module install, the staged tree, the image) but deliberately **not** of the things that are **resolved** (`*/version.env`, `boot/release.env`) or **fetched** (`modules/.fetched`). Editing a recipe should rebuild; it must never re-run a "latest" lookup and quietly move the project onto a newer upstream release, or re-clone 54 MiB of modules. The toolchain is left out of even the build half — its version is part of its path, and re-extracting 600 MiB on every edit would be absurd.
@@ -174,7 +191,7 @@ This repository is the `rootfs` component. Per `README.md` the pipeline is:
 
 Step 7 shapes step 6: the shipped image is sized to its contents, not to any particular card, so the rootfs partition is deliberately small and the first boot rewrites the partition table in place and runs `resize2fs` before rebooting. That needs a once-only marker (Raspberry Pi OS uses a `cmdline.txt` `init=` hand-off plus a flag file) — a resize that repeats on every boot, or that runs against a mounted-read-write filesystem, is the failure mode to design against.
 
-Steps 1 to 7 are implemented, so the next milestone is **step 8** — a launch script that gives an interactive session rather than a headless assertion. The QEMU caveats below are what it has to be built around; in particular the serial console under QEMU is output-only, so an interactive session has to come from the framebuffer VT and a QEMU display, not from `-serial`.
+All eight steps of `README.md` are implemented. What is *not* here: nothing has been run on real hardware, so `config.txt`, device-tree auto-selection and overlays remain untested; there is no networking, no package management and no release/CI wiring (`dist/` is still empty and `.github/` has no workflow); and the image is not reproducible byte-for-byte, because mke2fs stamps a random filesystem UUID and the file timestamps come from the build.
 
 The sibling repositories live beside this one: [../boot](../boot) (a complete, working Makefile build — the closest model for what this repo should look like).
 

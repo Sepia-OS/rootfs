@@ -1,9 +1,9 @@
 # SepiaOS - root filesystem builder
 #
 # Builds the SepiaOS root filesystem and, eventually, a bootable card image.
-# Implemented so far: steps 1 to 7 of README.md - the boot partition, the
-# cross-compiler, musl libc, busybox, the kernel modules, the image, and the
-# QEMU test that boots it.
+# Implemented so far: all eight steps of README.md - the boot partition, the
+# cross-compiler, musl libc, busybox, the kernel modules, the image, the QEMU
+# test that boots it, and the launcher that opens it in a window.
 #
 #   make boot-partition         fetch, verify and unpack the boot image
 #   make toolchain              fetch the aarch64 cross-compiler
@@ -13,6 +13,7 @@
 #   make rootfs                 stage the FHS tree that becomes partition 2
 #   make image                  assemble the bootable card image
 #   make test                   boot it under QEMU and check that it works
+#   make run                    boot it in QEMU with a screen, and log in
 #   make help                   every target
 #
 # No root and no loop mounts, so the same recipes work on macOS and Linux.
@@ -1664,6 +1665,26 @@ boot-log: ## Show the serial log of the last boot-check
 	@[ -f $(QEMU_LOG) ] || { echo "no $(QEMU_LOG) - run 'make boot-check' first" >&2; exit 1; }
 	@cat $(QEMU_LOG)
 # ---------------------------------------------------------------------------
+# Step 8 - the QEMU launch script
+#
+# tools/qemu.sh is the launcher, and it is a script rather than a recipe
+# because it is the thing a person runs to actually use the OS: it takes
+# options, it is readable, and it works on a checkout with no image built by
+# make at all. This target just builds the image first and hands over.
+#
+# The window QEMU opens is where the login prompt is; the kernel log and QEMU's
+# own errors come out on this terminal. See the header of the script for why it
+# has to be that way round - the short version is that the serial line under
+# QEMU is output-only, so a framebuffer console and a USB keyboard are the only
+# way to type anything.
+# ---------------------------------------------------------------------------
+
+RUN_ARGS ?=
+
+.PHONY: run qemu
+run qemu: $(IMAGE) ## Boot the image in QEMU with a screen you can log in on
+	@tools/qemu.sh $(RUN_ARGS)
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -1705,6 +1726,7 @@ help: ## Show this help
 	  "ROOT_PASSWORD_HASH" "sha512-crypt for root; every $$ has to be doubled" \
 	  "GROW_SIZE_MIB"     "card size grow-check pretends to have (default $(GROW_SIZE_MIB))" \
 	  "QEMU_TIMEOUT"      "seconds to wait for a test boot (default $(QEMU_TIMEOUT))" \
+	  "RUN_ARGS"          "options passed through to tools/qemu.sh by 'make run'" \
 	  "JOBS"              "parallelism for the source builds (default $(JOBS))"
 	@echo
 	@echo "Examples:"
@@ -1724,3 +1746,7 @@ help: ## Show this help
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"
 	@echo "  make GROW_SIZE_MIB=8192 grow-check     the first-boot resize on a bigger card"
+	@echo "  make run                               boot it in a window and log in"
+	@echo "  make RUN_ARGS=-f run                   the same, from a fresh card"
+	@echo "  make RUN_ARGS=\"-F -r 640x480\" run      full screen, largest console text"
+	@echo "  tools/qemu.sh -h                       every option the launcher takes"

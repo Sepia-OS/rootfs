@@ -79,3 +79,22 @@ The launchscript shall take the built bootable image and launch Qemu (Pi3)
 with that image. Any debug outputs of Qemu shall go to the console of the
 host. The guest in Qemu shall open a screen such that the booted OS can be
 used (login, start cli tools etc.).
+
+## Github workflows
+
+Two Github workflows shall be created that are described in the following sections.
+
+### Automatic build on commits on any branch
+
+Whenever a commit and push is done on any branch, a full
+build of the image shall be done including smoke tests
+with Qemu (Pi Zero 2W, Pi 3, Pi 4, CM4).
+
+### Manual release build
+
+A manual release build shall be done that builds the
+image. The user who triggers the release build must enter
+a version number for the release. The main branch shall be
+branched into a release branch (e.g. rel-<version>).
+The build always only runs on the created release branch.
+When the build succeeded 
