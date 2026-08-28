@@ -241,6 +241,52 @@ colemak[1].update({
 })
 custom_modifications["colemak"] = colemak
 
+# --- 10. GERMAN, APPLE KEYBOARD, NO DEAD KEYS (de_mac_nodeadkeys) ---
+# xkb calls this de(mac_nodeadkeys). The letters and the digit row are the
+# German ones, so it starts from `de`; what Apple moved is the third level,
+# because there it is the Option key and the punctuation sits somewhere else
+# entirely. @ is Option-L rather than AltGr-Q, the brackets are Option-5/6/8/9
+# rather than AltGr-8/9/7/0, the pipe is Option-7 and the backslash is
+# Shift-Option-7. On an Apple keyboard the PC German map gets every one of
+# those wrong, which is the whole reason this layout exists.
+de_mac_nodeadkeys = {mod_layer: keys.copy() for mod_layer, keys in de.items()}
+
+# "No dead keys" means the two accent keys type their character instead of
+# waiting for the letter it belongs to. A console keymap has no dead keys to
+# begin with - KT_LATIN is all this generator emits - so the only thing left to
+# get right is which way round the pair goes: acute unshifted and grave
+# shifted, the way the key is printed.
+de_mac_nodeadkeys[0][13] = ord('´')
+de_mac_nodeadkeys[1][13] = ord('`')
+
+# The Option level, written out rather than layered onto the German AltGr level
+# so that it is exactly what an Apple keyboard produces. Keys not listed keep
+# the kernel's own AltGr entries - as in every layout above - so AltGr-8/9/0
+# still reach {, [ and ] for anyone who wants them.
+#
+# Most of the Mac Option level cannot be shown at all: an entry is 16 bits with
+# the type in the high byte, so «, ©, ± and the rest of Latin-1 fit, while ∑, †,
+# Ω, π, ø-adjacent typography (“ ” ‚ – … • ≠ œ ƒ ∂) does not. Those keys are
+# left off rather than listed and dropped one build note at a time.
+de_mac_nodeadkeys[2] = {
+    2: ord('¡'), 4: ord('¶'), 5: ord('¢'),
+    6: ord('['), 7: ord(']'), 8: ord('|'), 9: ord('{'), 10: ord('}'),
+    12: ord('¿'),
+    16: ord('«'),
+    18: 8364,  # € - Option-E, the same key as on the PC layout
+    19: ord('®'), 22: ord('¨'), 24: ord('ø'), 27: ord('±'),
+    30: ord('å'), 34: ord('©'), 38: ord('@'), 40: ord('æ'),
+    46: ord('ç'), 49: ord('~'), 50: ord('µ'),
+}
+
+# Shift-Option. The only layout here that reaches past AltGr, and it has to:
+# the backslash has no other home on this keyboard.
+de_mac_nodeadkeys[3] = {
+    8: ord('\\'),
+    16: ord('»'), 24: ord('Ø'), 30: ord('Å'), 40: ord('Æ'), 46: ord('Ç'),
+}
+custom_modifications["de_mac_nodeadkeys"] = de_mac_nodeadkeys
+
 
 def parse_kmap(blob):
     """Unpacks a binary keymap into {table: [128 keysyms]}."""
@@ -276,10 +322,15 @@ def compile_binary_kmap(name, matrix, out_dir="."):
     """Writes one layout as a binary keymap busybox loadkmap can read."""
     tables = parse_kmap(DEFAULT_KEYMAP)
 
-    # Only the three tables a layout can change: plain, shift and AltGr. The
-    # rest of what the kernel had - Ctrl, Alt and their combinations - is
-    # carried through untouched.
-    for mod_layer in (0, 1, 2):
+    # Only the four tables a layout can change: plain, shift, AltGr and
+    # shift+AltGr. The rest of what the kernel had - Ctrl, Alt and their
+    # combinations - is carried through untouched.
+    #
+    # The kernel has no shift+AltGr table at all, so a layout that uses one
+    # gets it created here, filled with holes and then given its own entries.
+    # That takes nothing away: the combination does nothing today, because an
+    # absent table is a keymap the kernel never looks anything up in.
+    for mod_layer in (0, 1, 2, 3):
         overrides = matrix.get(mod_layer, {})
         if not overrides:
             continue

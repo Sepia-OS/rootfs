@@ -92,8 +92,17 @@ rootfs` depends on) and writes one binary keymap per layout into
 `/usr/share/keymaps`. Generating them needs `python3` on the build host; it is
 the only part of the build that needs an interpreter.
 
-The layouts are `english_us`, `uk`, `de`, `fr`, `es`, `it`, `ch`, `nordic`,
-`dvorak` and `colemak`.
+The layouts are `english_us`, `uk`, `de`, `de_mac_nodeadkeys`, `fr`, `es`,
+`it`, `ch`, `nordic`, `dvorak` and `colemak`.
+
+`de_mac_nodeadkeys` is the German layout as an Apple keyboard has it - xkb's
+`de(mac_nodeadkeys)`. The letters and the digit row are the same as `de`; what
+differs is the third level, because on a Mac it is the Option key and Apple put
+the punctuation somewhere else: `@` is Option-L, the brackets are
+Option-5/6/8/9, the pipe is Option-7 and the backslash is Shift-Option-7.
+"No dead keys" means `^` and `´` type their character instead of waiting for
+the letter it belongs to, which on a console is true of every layout here - a
+console keymap has no dead keys to wait with.
 
 The generator does not describe a keyboard from nothing. It carries the
 keymap the kernel starts with and changes only the keys a layout actually
@@ -172,3 +181,7 @@ When the build succeeded the a release shall be created
 (either pre-release or release) with the sources and the
 image that can be downloaded and written to an SD card by
 the user who downlaoded it.
+
+## Networking
+
+Networking shall be configurable, either ethernet or wifi or both.
