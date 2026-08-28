@@ -161,7 +161,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             build-essential make git curl ca-certificates \
-            jq xz-utils bzip2 zstd mtools qemu-system-arm
+            jq xz-utils bzip2 zstd mtools qemu-system-arm python3
 
       - uses: actions/checkout@v5
         with:

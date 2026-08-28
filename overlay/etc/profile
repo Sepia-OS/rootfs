@@ -12,6 +12,11 @@ else
 	export PS1='\u@\h:\w$ '
 fi
 
+# This user's console layout, if they set one; otherwise the system's, which
+# rcS already loaded and this reloads harmlessly. Silent on a serial console,
+# which has no keymap of its own.
+[ -x /usr/bin/sepia-keymap ] && /usr/bin/sepia-keymap apply
+
 # The default root password is public - it is in the README - so it is good
 # for exactly one login. There is no password ageing to lean on here: busybox
 # login does not read the ageing fields of /etc/shadow at all (checked in

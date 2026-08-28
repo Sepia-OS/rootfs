@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Everything through step 8 is committed; the board table in the `Makefile` and `.github/workflows/` are not. **Everything `README.md` specifies is implemented**: the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, the QEMU test, the launcher, and CI plus the manual release build.
 
-Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `tools/` (things a person runs, as opposed to things make runs), `.github/workflows/` (CI and the manual release), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
+**`.gitignore` needed a fix to make this repository buildable from a clone**: the stock C section's `*.d` pattern matches the *directory* `overlay/etc/init.d`, so `rcS` and `rcK` had never been committed — a fresh clone would have built an image whose init has no sysinit script, and so no `/proc`, no `/dev`, no getty and no login prompt. `!overlay/etc/init.d/` re-includes it. Worth remembering if a file that plainly exists refuses to be added.
+
+Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `tools/` (things a person runs, plus the keymap generator the build calls), `.github/workflows/` (CI and the manual release), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
 
 ## Commands
 
@@ -41,6 +43,7 @@ gmake IMAGE_SIZE_MIB=512 image          # a roomier card image
 gmake test                              # everything below, ~45 s
 gmake boot-check                        # boot as a Pi 3, assert it reaches a login prompt
 gmake grow-check                        # boot a padded copy, assert the first-boot resize
+gmake keymaps                           # generate the console keymaps
 gmake smoke                             # boot it as all four emulable boards
 gmake QEMU_BOARD=pi4 boot-check         # boot it as one specific board
 gmake boot-log                          # the serial log of the last boot-check
@@ -54,7 +57,7 @@ gmake distclean                         # also drop downloads/ (including ~600 M
 
 Every aggregate goal (`boot-partition`, `toolchain`, `musl`, `busybox`, `modules`, `rootfs`, `image`) ends with a `READY` line naming the version and where it landed. That line prints whether or not anything was rebuilt — a phony goal whose prerequisite is already built otherwise prints *nothing*, which reads exactly like a broken target.
 
-Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, and a C compiler for the host build of e2fsprogs; `mtools` and `qemu-system-aarch64` for the test targets (`brew install make jq xz mtools qemu`; macOS 13+ already ships `jq` at `/usr/bin/jq`). Nothing needs root, on either platform.
+Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, `python3` (for the keymaps, the only part of the build needing an interpreter), and a C compiler for the host build of e2fsprogs; `mtools` and `qemu-system-aarch64` for the test targets (`brew install make jq xz mtools qemu`; macOS 13+ already ships `jq` at `/usr/bin/jq`). Nothing needs root, on either platform.
 
 ### How step 1 works
 
@@ -173,6 +176,16 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - The launcher never writes to the image. It copies it once to `build/qemu/run.img`, pads that copy out to `-s` (4 GiB by default, sparse, so it costs what is written), and reuses it — a changed password or an added file is still there next time. `-f` starts over, `-t` discards just this run's writes.
 - **An intermittent kernel panic on the warm reboot was seen once** and did not reproduce in four further runs — an Oops in an interrupt on a secondary CPU during `secondary_start_kernel`, straight after QEMU's machine reset. It looks like an emulator artifact rather than anything in the image; it is worth knowing about if `grow-check` ever fails once and then passes.
 - Verified by driving the emulated keyboard through the QEMU monitor (`sendkey`) and reading the framebuffer back with `screendump`: login as `root`, the default password accepted, the forced password change enforced and completed, and a shell prompt that runs commands. That is also how the step 6 login requirements were confirmed — there is no other way to see the framebuffer console from a terminal.
+
+### Console keymaps
+
+`tools/generate_keymaps.py` is run by `make keymaps`, which `make rootfs` depends on; the result lands in `/usr/share/keymaps` and `overlay/usr/bin/sepia-keymap` is what chooses between them. `README.md` documents the commands; what is worth knowing here is why the generator looks the way it does.
+
+- **The format is busybox's, and it is not obvious.** `console-tools/loadkmap.c` reads seven bytes of `bkeymap` magic, then 256 flag bytes (one per keymap table, `1` meaning "this table follows"), then 128 `uint16` entries per flagged table in host byte order. `NR_KEYS` is 128, not 256. An entry is `(type << 8) | value`, so only characters below U+0100 fit — the euro sign is the one character these layouts ask for that does not, and the generator leaves it unmapped and says so rather than writing `0x20ac`, whose high byte would be read as keymap type 32.
+- **A flagged table is loaded in full.** `loadkmap` calls `KDSKBENT` for all 128 of its entries, so a table is not a patch: every key it does not set is overwritten with whatever the file contains. A layout built from nothing therefore sets Ctrl, both Shifts, Alt, CapsLock and the cursor keys to NUL — a keyboard that types but cannot be typed on.
+- **So the generator starts from the kernel's own keymap.** It carries the output of `dumpkmap`, captured from a booted SepiaOS and base64'd into the script, and overlays only the plain, shift and AltGr tables with what a layout changes. The regeneration recipe is in the file. Two consequences worth keeping: letters use `KT_LETTER` (`0x0b00 | c`) rather than `KT_LATIN` so CapsLock still applies to them, and Esc, Backspace, Tab, Enter and Space keep the kernel's keysyms — Enter is `K_ENTER` (`0x0201`), not a bare carriage return. That last part is why **`english_us.kmap` comes out byte-identical to the keymap the kernel boots with**, which is the cheapest possible check that the whole encoding is right.
+- **Keymaps are a VT thing.** They apply to keys arriving from a real keyboard; a serial console has no keymap, so `sepia-keymap` reports that it cannot find a console rather than appearing to work. This is also why the feature can only be tested through the framebuffer: `sendkey` into the emulated USB keyboard, `screendump` to read the result.
+- Verified that way end to end: `sepia-keymap set de`, then the keys QEMU calls `y` and `z` produce `zy` (QWERTZ), `shift-a` produces `A` (the modifiers survived), and `bracket_left` produces `ü` (a layout key the US map does not have).
 
 ### How the workflows work
 

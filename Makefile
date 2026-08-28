@@ -1199,6 +1199,15 @@ ROOT_PASSWORD_HASH ?= $$6$$SepiaOSsalt$$FWNx87IZVDqzgxDUvZkO6uuqumlfSuqXmP9gXCX/
 OVERLAY      := overlay
 OVERLAY_SRC  := $(shell find $(OVERLAY) -type f 2>/dev/null)
 
+# Console keymaps, generated rather than committed: tools/generate_keymaps.py
+# writes one binary keymap per layout in the format busybox loadkmap reads.
+# python3 is the only thing in this build that needs an interpreter, and it is
+# needed for this alone.
+KEYMAP_GEN   := tools/generate_keymaps.py
+KEYMAP_DIR   := $(BUILD_DIR)/keymaps
+KEYMAP_STAMP := $(KEYMAP_DIR)/.generated
+PYTHON       ?= python3
+
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
 IMG_DIR      := $(BUILD_DIR)/image
 ROOTFS_STAMP := $(IMG_DIR)/.rootfs
@@ -1207,14 +1216,56 @@ ROOTFS_STAMP := $(IMG_DIR)/.rootfs
 # put them since 3.0 and where every tool expects to find them.
 ROOTFS_DIRS := bin boot dev etc etc/init.d home lib media mnt opt proc root run \
                sbin srv sys tmp usr usr/bin usr/lib usr/local usr/sbin usr/share \
+               usr/share/keymaps \
                var var/cache var/lib var/lib/sepia var/log var/spool var/tmp
+
+# The generator carries the kernel's own default keymap inside it and changes
+# only the keys a layout actually moves, so everything it does not mention -
+# Ctrl, both Shifts, Alt, CapsLock, the function and cursor keys - keeps the
+# value the kernel booted with. That is not a detail: a table written into a
+# .kmap is loaded in full, so a layout built from nothing would set every key
+# it forgot to NUL and leave a keyboard that types but cannot be typed on.
+$(KEYMAP_STAMP): $(KEYMAP_GEN) Makefile
+	@command -v $(PYTHON) >/dev/null 2>&1 || { \
+	  echo "$(PYTHON) is required to generate the console keymaps" >&2; \
+	  echo "(brew install python / apt-get install python3, or set PYTHON=)" >&2; \
+	  exit 1; }
+	@echo "  KEYMAPS  $(KEYMAP_DIR)"
+	@rm -rf $(KEYMAP_DIR)
+	@$(PYTHON) $(KEYMAP_GEN) $(KEYMAP_DIR) | sed -n 's/^ *note:/  NOTE    /p'
+	@$(call assert_keymaps)
+	@touch $@
+
+.PHONY: keymaps
+keymaps: $(KEYMAP_STAMP) ## Generate the console keymaps
+	@printf '  READY    %s keymaps -> %s\n' \
+	   "$$(ls $(KEYMAP_DIR)/*.kmap | wc -l | tr -d ' ')" $(KEYMAP_DIR)
+
+# busybox loadkmap refuses anything whose first seven bytes are not "bkeymap",
+# and silently mis-reads a file of the wrong length, so both are checked here
+# rather than discovered on a keyboard that has stopped working. The length is
+# 7 magic + 256 table flags + 128 uint16 per flagged table.
+define assert_keymaps
+	set -e; \
+	n=0; \
+	for f in $(KEYMAP_DIR)/*.kmap; do \
+	  [ -e "$$f" ] || { echo "  FAIL     no keymaps were generated" >&2; exit 1; }; \
+	  head -c 7 "$$f" | grep -q '^bkeymap$$' \
+	    || { echo "  FAIL     $$f does not start with the bkeymap magic" >&2; exit 1; }; \
+	  size=$$(wc -c < "$$f"); \
+	  [ $$(( (size - 263) % 256 )) -eq 0 ] && [ "$$size" -gt 263 ] \
+	    || { echo "  FAIL     $$f is $$size bytes, which is not a whole number of tables" >&2; exit 1; }; \
+	  n=$$((n + 1)); \
+	done; \
+	[ "$$n" -gt 0 ] || { echo "  FAIL     no keymaps were generated" >&2; exit 1; }
+endef
 
 .PHONY: rootfs
 rootfs: $(ROOTFS_STAMP) ## Stage the root filesystem tree under build/rootfs
 	@printf '  READY    rootfs %s -> %s (%s MiB, %s files)\n' "$(SEPIAOS_VERSION)" $(ROOTFS_DIR) \
 	   "$$(du -sm $(ROOTFS_DIR) | cut -f1)" "$$(find $(ROOTFS_DIR) | wc -l | tr -d ' ')"
 
-$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(OVERLAY_SRC) Makefile
+$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
 	@rm -rf $(ROOTFS_DIR)
@@ -1229,12 +1280,13 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(OVERLA
 	@cp -R $(SYSROOT)/lib/ld-musl-aarch64.so.1 $(ROOTFS_DIR)/lib/
 	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
 	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
+	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
 	@$(call generate_etc)
 	@chmod 0755 $(ROOTFS_DIR) $(ROOTFS_DIR)/etc/init.d/rcS $(ROOTFS_DIR)/etc/init.d/rcK \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-gettys $(ROOTFS_DIR)/usr/sbin/sepia-firstboot \
-	            $(ROOTFS_DIR)/usr/sbin/resize2fs
+	            $(ROOTFS_DIR)/usr/sbin/resize2fs $(ROOTFS_DIR)/usr/bin/sepia-keymap
 	@chmod 0700 $(ROOTFS_DIR)/root
 	@chmod 0600 $(ROOTFS_DIR)/etc/shadow
 	@chmod 1777 $(ROOTFS_DIR)/tmp $(ROOTFS_DIR)/var/tmp
@@ -1279,7 +1331,9 @@ define assert_rootfs
 	[ ! -L "$$r/sbin/init" ] && [ -s "$$r/bin/busybox" ] \
 	  || { echo "  FAIL     sbin/init should be the wrapper script, not a busybox symlink" >&2; exit 1; }; \
 	for f in sbin/init bin/sh bin/busybox bin/login usr/bin/passwd sbin/getty \
-	         usr/sbin/resize2fs etc/inittab etc/init.d/rcS etc/passwd etc/shadow \
+	         sbin/loadkmap usr/sbin/resize2fs etc/inittab etc/init.d/rcS \
+	         etc/passwd etc/shadow usr/bin/sepia-keymap \
+	         usr/share/keymaps/english_us.kmap \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
 	done; \

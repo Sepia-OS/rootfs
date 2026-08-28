@@ -1,0 +1,41 @@
+#!/bin/sh
+# SepiaOS system initialisation. Run once by init, before anything else.
+
+# No `set -e`: a single failed mount must not leave the system with no getty
+# and no way in. Each step reports for itself.
+
+mount -t proc  -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+
+# The kernel mounts the root read-only unless the command line says otherwise,
+# and the one the boot partition ships does not. Everything below this line
+# writes something - /etc/inittab, /var/lib/sepia, the partition table - so
+# this is the step that has to come first and has to be reported when it fails.
+mount -o remount,rw / || echo "rcS: could not remount / read-write"
+
+# The kernel mounts devtmpfs itself when CONFIG_DEVTMPFS_MOUNT=y, which is how
+# /dev/console exists before this script runs at all. Mounting it here as well
+# is what keeps the image working on a kernel built without that option.
+grep -q ' /dev devtmpfs ' /proc/mounts || mount -t devtmpfs -o nosuid dev /dev
+
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o nosuid,noexec,gid=5,mode=620  devpts /dev/pts
+mount -t tmpfs  -o nosuid,nodev,mode=1777        shm    /dev/shm
+mount -t tmpfs  -o nosuid,nodev,mode=0755        run    /run
+mount -t tmpfs  -o nosuid,nodev,mode=1777        tmp    /tmp
+mkdir -p /run/lock
+
+hostname -F /etc/hostname
+
+# Grows the filesystem into the card and adds swap. Reboots on the first pass,
+# so nothing below it runs then.
+/usr/sbin/sepia-firstboot
+
+swapon -a 2>/dev/null
+
+# Before the getty, so the first thing typed at the login prompt is already in
+# the configured layout. Silent when there is no screen attached.
+/usr/bin/sepia-keymap apply
+
+# Last, so that a login prompt appears only once the system is actually up.
+/usr/sbin/sepia-gettys

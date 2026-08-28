@@ -52,13 +52,15 @@ jobs:
       # Before checkout on purpose: without git in the container, actions/checkout
       # silently falls back to downloading a tarball, and the Makefile needs git
       # both for the module fetch and to resolve the musl version. zstd is here
-      # for actions/cache, which otherwise falls back to gzip and says so.
+      # for actions/cache, which otherwise falls back to gzip and says so, and
+      # python3 for tools/generate_keymaps.py - the one part of the build that
+      # needs an interpreter.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             build-essential make git curl ca-certificates \
-            jq xz-utils bzip2 zstd mtools qemu-system-arm
+            jq xz-utils bzip2 zstd mtools qemu-system-arm python3
 
       - uses: actions/checkout@v5
 

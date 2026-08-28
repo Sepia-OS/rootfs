@@ -1,0 +1,11 @@
+#!/bin/sh
+# SepiaOS shutdown. Run by init on halt, reboot and poweroff.
+
+swapoff -a 2>/dev/null
+
+# -r remounts read-only whatever cannot be unmounted, which always includes /
+# itself. Without it the next boot finds a dirty filesystem and replays the
+# journal, and on a card that is where corruption comes from.
+sync
+umount -a -r
+sync

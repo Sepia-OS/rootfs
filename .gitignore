@@ -16,6 +16,12 @@ dist/
 # Prerequisites
 *.d
 
+# ...but not the rootfs overlay's /etc/init.d, which "*.d" above matches as a
+# directory. Without this, overlay/etc/init.d/rcS and rcK are never committed
+# and a fresh clone builds an image whose init has no sysinit script: no /proc,
+# no /dev, no getty, no login prompt.
+!overlay/etc/init.d/
+
 # Object files
 *.o
 *.ko
