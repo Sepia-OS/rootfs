@@ -87,6 +87,10 @@ compiled in, VGA8x16 and VGA8x8, so fbcon=font: cannot go above 8x16 pixels.
 A smaller -r therefore reads better once the window is enlarged, and -F -r
 640x480 is about as large as the characters get.
 
+Typing 'reboot' in the guest restarts it: QEMU exits and this script starts it
+again, which is the only way a reboot works here - see the comment above the
+launch loop. 'halt', 'poweroff' and Ctrl-A X end the session instead.
+
 The image itself is never written to. It is copied once to the working copy and
 padded out to -s, which is what gives first boot a card to grow into; that
 first boot is then run headlessly, once, before the window opens. After that
@@ -247,14 +251,64 @@ else
 fi
 echo "qemu.sh: Ctrl-A X quits, Ctrl-A C opens the QEMU monitor"
 
-exec qemu-system-aarch64 \
-	-machine "$MACHINE" \
-	${DISPLAY_ARG:+-display "$DISPLAY_ARG"} \
-	-name "SepiaOS" \
-	-kernel "$WORKDIR/$KERNEL" \
-	-dtb "$WORKDIR/$DTB" \
-	-drive file="$COPY",format=raw,if=sd"$snapshot" \
-	-device usb-kbd \
-	$fullscreen \
-	-append "console=$CONSOLE,115200 console=tty1 $FBARGS root=$ROOTDEV rootfstype=ext4 rootwait" \
-	-serial mon:stdio
+# `reboot` in the guest restarts QEMU rather than resetting the machine, and
+# that is not a preference either.
+#
+# QEMU's raspi3b does not come back from a warm reset while a USB device is
+# attached to its dwc2 controller. Tested all four combinations: with no USB
+# keyboard it resets and boots again whether or not the framebuffer console is
+# in use; with `-device usb-kbd` it never comes back, and the guest reaches
+# `reboot: Restarting system` identically in every case. A USB keyboard is the
+# only way to type on this machine - there is no PS/2 controller on a Pi - so
+# the keyboard cannot be given up, and the reset cannot be used.
+#
+# So `-no-reboot` turns the guest's reset request into a clean QEMU exit, and
+# this loop starts it again. The guest boots cold each time, which also avoids
+# the two things a warm reset leaves behind here: a framebuffer whose red and
+# blue channels have swapped, and a serial console that has gone quiet.
+#
+# Telling a reboot from a quit needs the kernel, because both exit 0. The
+# console is logged to a file as well as shown, and `reboot: Restarting system`
+# - printed at emerg level, so it survives the console quietening rcS does - is
+# what distinguishes them. `halt` and `poweroff` print something else and so
+# stay down, which is what they are for. The log is truncated on every launch,
+# so a marker from an earlier boot cannot restart anything.
+CONSOLE_LOG=$WORKDIR/console.log
+fast=0
+
+while :; do
+	started=$(date +%s)
+
+	qemu-system-aarch64 \
+		-machine "$MACHINE" \
+		${DISPLAY_ARG:+-display "$DISPLAY_ARG"} \
+		-name "SepiaOS" \
+		-no-reboot \
+		-kernel "$WORKDIR/$KERNEL" \
+		-dtb "$WORKDIR/$DTB" \
+		-drive file="$COPY",format=raw,if=sd"$snapshot" \
+		-device usb-kbd \
+		$fullscreen \
+		-append "console=$CONSOLE,115200 console=tty1 $FBARGS root=$ROOTDEV rootfstype=ext4 rootwait" \
+		-chardev stdio,id=sepia-console,mux=on,signal=off,logfile="$CONSOLE_LOG" \
+		-serial chardev:sepia-console \
+		-mon chardev=sepia-console || true
+
+	if ! tail -c 8192 "$CONSOLE_LOG" 2>/dev/null | grep -aq 'Restarting system'; then
+		break
+	fi
+
+	# A guest that reboots the moment it starts would otherwise spin here.
+	if [ $(( $(date +%s) - started )) -lt 10 ]; then
+		fast=$((fast + 1))
+	else
+		fast=0
+	fi
+	if [ "$fast" -ge 3 ]; then
+		echo "qemu.sh: the guest has rebooted three times in under ten seconds each;"
+		echo "qemu.sh: stopping rather than looping. Console log: $CONSOLE_LOG"
+		break
+	fi
+
+	echo "qemu.sh: the guest asked to reboot; starting it again"
+done
