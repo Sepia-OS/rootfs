@@ -136,6 +136,21 @@ entry is 16 bits with the key type in the high byte, so only characters below
 U+0100 fit; the build prints a note for each key it has to leave unmapped for
 that reason.
 
+## Console messages
+
+The console is quietened once booting is finished: `/etc/init.d/rcS` ends with
+`dmesg -n 3`, so the whole boot is printed as it happens and nothing printed
+afterwards lands on top of the login prompt or on what is being typed at it.
+`dmesg` still holds everything, and emerg, alert and crit still reach the
+console, so a panic is still seen.
+
+Under QEMU this hides two messages that look like faults and are not. `mmc1:
+Timeout waiting for hardware interrupt` is the SDIO controller giving up on the
+Pi 3's on-board wifi chip, which the emulator does not provide; `leds-gpio:
+Failed to get GPIO '/leds/led-act'` is the ACT LED never getting its GPIO,
+because that comes from the VideoCore firmware, which QEMU does not run.
+Neither happens on real hardware, where both are actually present.
+
 ## Github workflows
 
 Two Github workflows shall be created that are described in the following sections.

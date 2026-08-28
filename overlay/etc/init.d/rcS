@@ -39,3 +39,16 @@ swapon -a 2>/dev/null
 
 # Last, so that a login prompt appears only once the system is actually up.
 /usr/sbin/sepia-gettys
+
+# Quieten the console now that booting is over. Everything above this line has
+# already been printed, so the boot itself is still fully visible; what this
+# stops is late messages landing on top of the login prompt and on whatever is
+# being typed at it. Under QEMU there are always two of those - the SDIO
+# controller giving up on the Pi 3's on-board wifi chip, which the emulator
+# does not provide, and the ACT LED's GPIO never arriving because that comes
+# from the VideoCore firmware, which QEMU does not run either. Both are "err"
+# priority, so nothing short of level 3 hides them.
+#
+# The ring buffer is untouched - dmesg still shows everything - and emerg,
+# alert and crit still reach the console, so a panic is still seen.
+dmesg -n 3
