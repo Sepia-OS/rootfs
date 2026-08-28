@@ -97,4 +97,7 @@ image. The user who triggers the release build must enter
 a version number for the release. The main branch shall be
 branched into a release branch (e.g. rel-<version>).
 The build always only runs on the created release branch.
-When the build succeeded 
+When the build succeeded the a release shall be created
+(either pre-release or release) with the sources and the
+image that can be downloaded and written to an SD card by
+the user who downlaoded it.
