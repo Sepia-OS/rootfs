@@ -13,6 +13,7 @@
 #   make rootfs                 stage the FHS tree that becomes partition 2
 #   make image                  assemble the bootable card image
 #   make test                   boot it under QEMU and check that it works
+#   make smoke                  boot it as all four emulable boards
 #   make run                    boot it in QEMU with a screen, and log in
 #   make help                   every target
 #
@@ -1508,13 +1509,57 @@ image-info: $(IMAGE) ## Show the finished image's layout
 # tree auto-selection or overlays, because QEMU never executes any of them.
 # ---------------------------------------------------------------------------
 
-QEMU_MACHINE  ?= raspi3b
+# The boards QEMU can run. Pi 5 and CM5 are absent because QEMU has no BCM2712
+# machine type at all, so BCM2712 is hardware-only - the same split ../boot
+# makes. The Zero 2 W is emulated as raspi3b rather than raspi3ap: its device
+# tree takes a synchronous external abort in bcm2835_power_probe on the 3A+.
+QEMU_BOARDS := pi-zero2w pi3 pi4 cm4
+QEMU_BOARD  ?= pi3
+
+QEMU_MACHINE_pi-zero2w := raspi3b
+QEMU_MACHINE_pi3       := raspi3b
+QEMU_MACHINE_pi4       := raspi4b
+QEMU_MACHINE_cm4       := raspi4b
+
+QEMU_DTB_pi-zero2w := bcm2710-rpi-zero-2-w.dtb
+QEMU_DTB_pi3       := bcm2710-rpi-3-b.dtb
+QEMU_DTB_pi4       := bcm2711-rpi-4-b.dtb
+QEMU_DTB_cm4       := bcm2711-rpi-cm4.dtb
+
+# What the kernel prints as "Machine model", so a test can tell that the device
+# tree it was handed is the board it meant to boot.
+QEMU_MODEL_pi-zero2w := Raspberry Pi Zero 2 W
+QEMU_MODEL_pi3       := Raspberry Pi 3
+QEMU_MODEL_pi4       := Raspberry Pi 4
+QEMU_MODEL_cm4       := Raspberry Pi Compute Module 4
+
+# These follow the SoC rather than the board. The PL011 sits at a different
+# address on BCM2711, and under QEMU the Pi 4 exposes the card as mmcblk1 where
+# real hardware and BCM2837 use mmcblk0 - so the root device passed here and
+# the root= in the image's own cmdline.txt legitimately differ.
+QEMU_EARLYCON_raspi3b := pl011,0x3f201000
+QEMU_EARLYCON_raspi4b := pl011,0xfe201000
+QEMU_ROOTDEV_raspi3b  := /dev/mmcblk0p2
+QEMU_ROOTDEV_raspi4b  := /dev/mmcblk1p2
+
+QEMU_MACHINE   = $(QEMU_MACHINE_$(QEMU_BOARD))
+QEMU_DTB       = $(QEMU_DTB_$(QEMU_BOARD))
+QEMU_MODEL     = $(QEMU_MODEL_$(QEMU_BOARD))
+QEMU_EARLYCON  = $(QEMU_EARLYCON_$(QEMU_MACHINE))
+QEMU_ROOTDEV   = $(QEMU_ROOTDEV_$(QEMU_MACHINE))
+
 QEMU_KERNEL   ?= kernel8.img
-QEMU_DTB      ?= bcm2710-rpi-3-b.dtb
+# Every one of the four registers its PL011 as ttyAMA1, checked on each; see
+# the comment above the section for what console=ttyAMA0 does instead.
 QEMU_CONSOLE  ?= ttyAMA1
-QEMU_EARLYCON ?= pl011,0x3f201000
-QEMU_ROOTDEV  ?= /dev/mmcblk0p2
 QEMU_TIMEOUT  ?= 120
+
+BOARD_GOALS := boot-check grow-check smoke test
+ifneq ($(filter $(BOARD_GOALS),$(MAKECMDGOALS)),)
+  ifeq ($(QEMU_MACHINE),)
+    $(error QEMU_BOARD must be one of: $(QEMU_BOARDS) (got '$(QEMU_BOARD)'). Pi 5 and CM5 have no QEMU machine)
+  endif
+endif
 
 # The card grow-check pretends to have been written to. A power of two, like
 # every SD image QEMU will accept, and large enough that the README's swap
@@ -1524,9 +1569,9 @@ GROW_SIZE_MIB ?= 4096
 
 QEMU_DIR   := $(BUILD_DIR)/qemu
 QEMU_STAMP := $(QEMU_DIR)/.extracted
-QEMU_LOG   := $(QEMU_DIR)/boot.log
-GROW_IMG   := $(QEMU_DIR)/grow.img
-GROW_LOG   := $(QEMU_DIR)/grow.log
+QEMU_LOG    = $(QEMU_DIR)/boot-$(QEMU_BOARD).log
+GROW_IMG    = $(QEMU_DIR)/grow-$(QEMU_BOARD).img
+GROW_LOG    = $(QEMU_DIR)/grow-$(QEMU_BOARD).log
 
 QEMU_APPEND = console=$(QEMU_CONSOLE),115200 earlycon=$(QEMU_EARLYCON) \
               root=$(QEMU_ROOTDEV) rootfstype=ext4 rootwait
@@ -1542,13 +1587,26 @@ ifneq ($(filter grow-check test,$(MAKECMDGOALS)),)
 endif
 
 .PHONY: test
-test: image-check boot-check grow-check ## Test the image: contents, boot to a login prompt, first-boot resize
-	@echo "  PASS     $(IMAGE) boots and grows"
+test: image-check boot-check grow-check ## Test the image on one board: contents, login prompt, first-boot resize
+	@echo "  PASS     $(IMAGE) boots on $(QEMU_BOARD) and grows"
+
+# What CI runs. Every board QEMU can emulate gets the same image booted on it,
+# which is the claim a single universal card makes and so the claim worth
+# testing. Sequential rather than parallel: four TCG guests on one runner would
+# only take turns anyway, and interleaved serial logs are unreadable.
+.PHONY: smoke
+smoke: $(QEMU_STAMP) ## Boot the image on every board QEMU can emulate
+	@fail=""; \
+	 for b in $(QEMU_BOARDS); do \
+	   $(MAKE) --no-print-directory QEMU_BOARD=$$b boot-check || fail="$$fail $$b"; \
+	 done; \
+	 if [ -n "$$fail" ]; then echo "  FAIL    $$fail" >&2; exit 1; fi
+	@echo "  PASS     one image, a login prompt on all $(words $(QEMU_BOARDS)) boards"
 
 .PHONY: boot-check
 boot-check: $(QEMU_STAMP) ## Boot the image under QEMU as a Pi 3 and check it reaches a login prompt
 	@$(call require_qemu)
-	@echo "  BOOT     $(QEMU_MACHINE), $(IMAGE_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
+	@echo "  BOOT     $(QEMU_BOARD) as $(QEMU_MACHINE), $(IMAGE_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
 	@rm -f $(QEMU_LOG)
 	@$(call run_qemu,$(QEMU_LOG),-no-reboot -drive file=$(IMAGE)$(comma)format=raw$(comma)if=sd$(comma)snapshot=on,login:)
 	@$(call assert_booted,$(QEMU_LOG))
@@ -1562,7 +1620,7 @@ boot-check: $(QEMU_STAMP) ## Boot the image under QEMU as a Pi 3 and check it re
 grow-check: $(QEMU_STAMP) ## Boot a copy on a larger card and check the first-boot resize and swap
 	@$(call require_qemu)
 	@mkdir -p $(QEMU_DIR)
-	@echo "  GROW     $(QEMU_MACHINE), $(GROW_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
+	@echo "  GROW     $(QEMU_BOARD) as $(QEMU_MACHINE), $(GROW_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
 	@rm -f $(GROW_LOG) $(GROW_IMG)
 	@cp $(IMAGE) $(GROW_IMG)
 	@dd if=/dev/zero of=$(GROW_IMG) bs=1 count=0 seek=$$(( $(GROW_SIZE_MIB) * 1048576 )) 2>/dev/null
@@ -1606,9 +1664,10 @@ $(QEMU_STAMP): $(IMAGE)
 	@mkdir -p $(QEMU_DIR)
 	@le32() { od -An -tu4 -j $$1 -N4 $(IMAGE) | tr -d ' '; }; \
 	 off=$$(( $$(le32 454) * 512 )); \
-	 echo "  EXTRACT  $(QEMU_KERNEL), $(QEMU_DTB) from the boot partition"; \
-	 mcopy -o -i $(IMAGE)@@$$off ::$(QEMU_KERNEL) ::$(QEMU_DTB) $(QEMU_DIR)/ || { \
-	   echo "  FAIL     $(QEMU_KERNEL) or $(QEMU_DTB) is not in the boot partition" >&2; exit 1; }
+	 echo "  EXTRACT  $(QEMU_KERNEL) and $(words $(QEMU_BOARDS)) device trees from the boot partition"; \
+	 mcopy -o -i $(IMAGE)@@$$off ::$(QEMU_KERNEL) \
+	   $(foreach b,$(QEMU_BOARDS),::$(QEMU_DTB_$(b))) $(QEMU_DIR)/ || { \
+	   echo "  FAIL     the kernel or a device tree is not in the boot partition" >&2; exit 1; }
 	@touch $@
 
 # Each line of the boot is checked separately rather than just looking for the
@@ -1619,8 +1678,8 @@ define assert_booted
 	check() { \
 	  if grep -aqE "$$1" "$$l"; then printf '  OK       %s\n' "$$2"; \
 	  else printf '  FAIL     %s\n' "$$2"; fail=1; fi; }; \
-	check 'Machine model: Raspberry Pi 3'   'the kernel came up as a Pi 3'; \
-	check 'mmcblk0: p1 p2'                  'both partitions were enumerated'; \
+	check 'Machine model: $(QEMU_MODEL)'    'the kernel came up as a $(QEMU_MODEL)'; \
+	check 'mmcblk[0-9]: p1 p2'              'both partitions were enumerated'; \
 	check 'Mounted root \(ext4 filesystem\)' 'the root filesystem mounted'; \
 	check 'Run /sbin/init as init process'  'init was started'; \
 	check 're-mounted.*r/w'                 'rcS remounted / read-write'; \
@@ -1640,7 +1699,7 @@ define assert_grown
 	  else printf '  FAIL     %s\n' "$$2"; fail=1; fi; }; \
 	check 'sepia-firstboot: root partition .* -> '  'first boot planned a bigger layout'; \
 	check 'partition table rewritten'               'the table was rewritten'; \
-	check 'mmcblk0: p1 p2 p3'                       'the reboot came back with three partitions'; \
+	check 'mmcblk[0-9]: p1 p2 p3'                   'the reboot came back with three partitions'; \
 	check 'resized filesystem to'                   'the kernel resized the filesystem'; \
 	check 'root filesystem resized'                 'resize2fs reported success'; \
 	check 'Adding .* swap on'                       'swap was activated'; \
@@ -1725,6 +1784,7 @@ help: ## Show this help
 	  "IMAGE_SIZE_MIB"    "shipped image size, power of two (default $(IMAGE_SIZE_MIB))" \
 	  "ROOT_PASSWORD_HASH" "sha512-crypt for root; every $$ has to be doubled" \
 	  "GROW_SIZE_MIB"     "card size grow-check pretends to have (default $(GROW_SIZE_MIB))" \
+	  "QEMU_BOARD"        "board to emulate: $(QEMU_BOARDS) (default $(QEMU_BOARD))" \
 	  "QEMU_TIMEOUT"      "seconds to wait for a test boot (default $(QEMU_TIMEOUT))" \
 	  "RUN_ARGS"          "options passed through to tools/qemu.sh by 'make run'" \
 	  "JOBS"              "parallelism for the source builds (default $(JOBS))"
@@ -1745,6 +1805,8 @@ help: ## Show this help
 	@echo "  make IMAGE_SIZE_MIB=512 image          a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"
+	@echo "  make smoke                             boot it as all four emulable boards"
+	@echo "  make QEMU_BOARD=pi4 boot-check         boot it as one specific board"
 	@echo "  make GROW_SIZE_MIB=8192 grow-check     the first-boot resize on a bigger card"
 	@echo "  make run                               boot it in a window and log in"
 	@echo "  make RUN_ARGS=-f run                   the same, from a fresh card"

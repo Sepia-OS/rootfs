@@ -1,0 +1,108 @@
+name: CI
+
+# Every commit on every branch, every pull request against main, and the push
+# that lands when a pull request is merged into main.
+#
+# Tag pushes deliberately do not match: `branches:` never matches a tag ref, so
+# cutting a release cannot start a second pipeline for the commit it just built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede the previous run for the same branch or PR. A branch that also has
+# an open PR gets one run per event in two separate groups, so neither run can
+# cancel the other's checks out from under branch protection.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Hosted runners are x86_64, so the AArch64 guests run under full TCG
+  # emulation - correct, but several times slower than the arm64 machine this
+  # was developed on. The Makefile's 120 second default is not enough headroom,
+  # and a generous cap costs nothing: each run stops as soon as its serial log
+  # says what it was waiting for.
+  QEMU_TIMEOUT: 300
+
+jobs:
+  # -------------------------------------------------------------------------
+  # One job, one image, every board. Deliberately not a matrix over boards:
+  # this build produces a single card that is supposed to boot all four, and
+  # four parallel jobs would each build their own image and so test four
+  # different cards instead of the claim actually being made. (The image is not
+  # byte-reproducible - mke2fs stamps a random filesystem UUID - so they really
+  # would differ.) The cost is wall-clock time rather than confidence.
+  # -------------------------------------------------------------------------
+  build:
+    name: build and boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # QEMU's raspi4b machine arrived in QEMU 9.0. Debian 12 ships 7.2 and
+    # Ubuntu 24.04 ships 8.2, so on the bare runner pi4 and cm4 could not be
+    # booted at all. Trixie ships QEMU 10.x. Before changing this image, check
+    # `qemu-system-aarch64 -machine help | grep raspi4b`.
+    container: debian:trixie-slim
+    steps:
+      # Before checkout on purpose: without git in the container, actions/checkout
+      # silently falls back to downloading a tarball, and the Makefile needs git
+      # both for the module fetch and to resolve the musl version. zstd is here
+      # for actions/cache, which otherwise falls back to gzip and says so.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential make git curl ca-certificates \
+            jq xz-utils bzip2 zstd mtools qemu-system-arm
+
+      - uses: actions/checkout@v5
+
+      # After checkout, never before: actions/checkout runs `git clean -ffdx` on
+      # an existing workspace, which would delete the restored downloads.
+      #
+      # Worth caching because downloads/ holds a ~600 MiB cross-toolchain that
+      # otherwise comes off developer.arm.com on every push. Everything in there
+      # is keyed by version or tag and immutable, so a stale entry is only ever
+      # unused, never wrong - which is why the restore-key prefix is safe.
+      - name: Cache the downloaded upstream artifacts
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: downloads-${{ runner.os }}-${{ hashFiles('Makefile') }}
+          restore-keys: downloads-${{ runner.os }}-
+
+      - name: Build the image
+        run: make image
+
+      - name: Show what was built
+        run: |
+          make image-info
+          make rootfs-info
+          make modules-info
+
+      - name: Read the image back
+        run: make image-check
+
+      # The README asks for smoke tests on these four boards; this is that step.
+      # One image, booted as each of them, checked all the way to a login prompt.
+      - name: Boot it as every board QEMU can emulate
+        run: make smoke
+
+      # Not asked for by the README, and the most valuable test here: it is the
+      # only one that exercises the partition rewrite, the reboot between the
+      # two passes of sepia-firstboot, the online resize and swap.
+      - name: Check the first-boot resize
+        run: make grow-check
+
+      - name: Upload the serial logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: serial-logs
+          path: build/qemu/*.log
+          if-no-files-found: ignore
