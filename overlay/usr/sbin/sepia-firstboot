@@ -1,0 +1,172 @@
+#!/bin/sh
+# Grow the root filesystem into the storage device and add swap, once.
+#
+# This runs in two passes with a reboot between them, and that is a constraint
+# rather than a choice: the kernel will not re-read a partition table while one
+# of that disk's partitions is mounted, and / always is. So pass 1 rewrites the
+# table and reboots, and pass 2 - which now sees the larger partition - grows
+# the filesystem onto it and brings up swap. Raspberry Pi OS splits its own
+# resize the same way for the same reason.
+#
+# The partition table is written byte by byte instead of through fdisk: the
+# layout wanted is exact and already known (partition 1 and the start of
+# partition 2 never move), and 16 bytes per entry is less machinery than
+# driving an interactive tool from a script.
+
+STATE=/var/lib/sepia
+DONE=$STATE/firstboot-done
+PENDING=$STATE/resize-pending
+
+[ -f "$DONE" ] && exit 0
+mkdir -p "$STATE"
+
+say() { echo "sepia-firstboot: $*"; }
+give_up() { say "$*"; say "leaving the storage layout alone"; touch "$DONE"; exit 0; }
+
+# --- which device did we boot from -----------------------------------------
+
+rootdev=
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in root=*) rootdev=${arg#root=} ;; esac
+done
+case "$rootdev" in
+	PARTUUID=*|UUID=*|LABEL=*) rootdev=$(findfs "$rootdev" 2>/dev/null) ;;
+esac
+[ -n "$rootdev" ] || give_up "no root= on the kernel command line"
+
+part=${rootdev#/dev/}
+[ -b "/dev/$part" ] || give_up "/dev/$part is not a block device"
+
+# The partition's sysfs directory lives inside the disk's, so the parent
+# directory names the disk - no guessing about whether the suffix is 'p2' or
+# '2', which differs between mmcblk and sd devices.
+disk=$(readlink -f "/sys/class/block/$part/..") || give_up "cannot resolve $part"
+disk=${disk##*/}
+[ -f "/sys/block/$disk/size" ] || give_up "no /sys/block/$disk"
+
+# The suffix is whatever the partition name has beyond the disk name, so
+# partition 3 is built the same way round: mmcblk0 + p3, sda + 3.
+suffix=${part#$disk}
+case "$suffix" in
+	p2) sep=p ;;
+	2)  sep= ;;
+	*)  give_up "root is $part, not partition 2 of $disk - this is not a SepiaOS layout" ;;
+esac
+swappart=/dev/$disk${sep}3
+
+disk_sectors=$(cat "/sys/block/$disk/size")
+part_start=$(cat "/sys/block/$disk/$part/start")
+part_sectors=$(cat "/sys/block/$disk/$part/size")
+
+# --- pass 2: the table is already right, grow onto it -----------------------
+
+if [ -f "$PENDING" ]; then
+	say "growing the root filesystem to $((part_sectors / 2048)) MiB"
+	if resize2fs "/dev/$part"; then
+		say "root filesystem resized"
+	else
+		say "resize2fs failed - the filesystem is unchanged and still usable"
+	fi
+
+	if [ -b "$swappart" ]; then
+		say "making swap on $swappart"
+		if mkswap "$swappart" >/dev/null; then
+			grep -q "^$swappart " /etc/fstab 2>/dev/null \
+				|| echo "$swappart	none	swap	sw	0	0" >> /etc/fstab
+			swapon "$swappart" && say "swap active"
+		else
+			say "mkswap failed - continuing without swap"
+		fi
+	else
+		say "$swappart is missing - continuing without swap"
+	fi
+
+	rm -f "$PENDING"
+	touch "$DONE"
+	sync
+	exit 0
+fi
+
+# --- pass 1: work out the new layout and write it ---------------------------
+
+# Thresholds in GB as storage is sold (10^9), swap in GiB as memory is
+# measured. README: under 64 GB gives 1 GiB, under 128 GB gives 2 GiB, above
+# that 4 GiB.
+disk_bytes=$((disk_sectors * 512))
+if   [ "$disk_bytes" -lt 64000000000 ];  then swap_mib=1024
+elif [ "$disk_bytes" -lt 128000000000 ]; then swap_mib=2048
+else                                          swap_mib=4096
+fi
+swap_sectors=$((swap_mib * 2048))
+
+# Swap starts on a 4 MiB boundary: that is the erase block size cards are
+# optimised for, and it is the alignment the boot partition already uses.
+align=8192
+swap_start=$(( (disk_sectors - swap_sectors) / align * align ))
+
+# The sizes above come straight from the README, and on a small card they ask
+# for a swap partition bigger than the card. Growing the filesystem is the more
+# useful half of this, so when swap will not fit without eating the space the
+# rootfs was going to gain, the whole device goes to the rootfs and swap is
+# skipped. Reported, not silent - "where is my swap" should have an answer in
+# the boot log.
+if [ $((swap_start - part_start)) -lt $((part_sectors + align)) ]; then
+	say "a $((swap_sectors / 2048)) MiB swap partition will not fit on a $((disk_bytes / 1048576)) MiB device"
+	say "using the whole device for the root filesystem instead"
+	swap_sectors=0
+	swap_start=0
+	new_sectors=$((disk_sectors - part_start))
+else
+	swap_sectors=$((disk_sectors - swap_start))
+	new_sectors=$((swap_start - part_start))
+fi
+
+if [ "$new_sectors" -le "$part_sectors" ]; then
+	give_up "$disk holds $((disk_bytes / 1048576)) MiB, which leaves nothing to grow into"
+fi
+
+say "$disk is $((disk_bytes / 1000000000)) GB ($((disk_bytes / 1048576)) MiB)"
+if [ "$swap_sectors" -gt 0 ]; then
+	say "root partition $((part_sectors / 2048)) MiB -> $((new_sectors / 2048)) MiB, swap $((swap_sectors / 2048)) MiB"
+else
+	say "root partition $((part_sectors / 2048)) MiB -> $((new_sectors / 2048)) MiB, no swap"
+fi
+
+# One MBR entry: status, CHS first, type, CHS last, LBA start, sector count.
+# The CHS fields are set to the 0xFE/0xFF/0xFF "too big to express" value that
+# every tool writes for partitions beyond 8 GB; Linux ignores them entirely and
+# reads the LBA fields.
+byte() { printf '\\0%03o' "$1"; }
+le32() {
+	byte $(( $1        & 255 )); byte $(( ($1 >> 8)  & 255 ))
+	byte $(( ($1 >> 16) & 255 )); byte $(( ($1 >> 24) & 255 ))
+}
+entry() { # type start sectors
+	byte 0; byte 254; byte 255; byte 255
+	byte "$1"; byte 254; byte 255; byte 255
+	le32 "$2"; le32 "$3"
+}
+
+# The whole sector is read, patched and written back in one go. Writing 16
+# bytes straight at the block device would work, but a single 512-byte write is
+# the one that cannot leave a half-updated table behind if the power goes.
+mbr=/run/sepia-mbr
+dd if="/dev/$disk" of="$mbr" bs=512 count=1 2>/dev/null || give_up "cannot read the MBR of $disk"
+printf '%b' "$(entry 131 "$part_start" "$new_sectors")" \
+	| dd of="$mbr" bs=1 seek=462 count=16 conv=notrunc 2>/dev/null
+if [ "$swap_sectors" -gt 0 ]; then
+	printf '%b' "$(entry 130 "$swap_start" "$swap_sectors")" \
+		| dd of="$mbr" bs=1 seek=478 count=16 conv=notrunc 2>/dev/null
+fi
+dd if="$mbr" of="/dev/$disk" bs=512 count=1 2>/dev/null || give_up "cannot write the MBR of $disk"
+rm -f "$mbr"
+sync
+
+touch "$PENDING"
+sync
+
+say "partition table rewritten; rebooting to pick it up"
+sleep 1
+mount -o remount,ro / 2>/dev/null
+sync
+reboot -f

@@ -1,14 +1,16 @@
 # SepiaOS - root filesystem builder
 #
 # Builds the SepiaOS root filesystem and, eventually, a bootable card image.
-# Implemented so far: steps 1 to 5 of README.md - the boot partition, the
-# cross-compiler, musl libc, busybox, and the kernel modules.
+# Implemented so far: steps 1 to 6 of README.md - the boot partition, the
+# cross-compiler, musl libc, busybox, the kernel modules, and the image.
 #
 #   make boot-partition         fetch, verify and unpack the boot image
 #   make toolchain              fetch the aarch64 cross-compiler
 #   make musl                   cross-build musl into build/sysroot
 #   make busybox                cross-build busybox against that musl
 #   make modules                install the boot kernel's modules into it
+#   make rootfs                 stage the FHS tree that becomes partition 2
+#   make image                  assemble the bootable card image
 #   make help                   every target
 #
 # No root and no loop mounts, so the same recipes work on macOS and Linux.
@@ -988,6 +990,490 @@ modules-info: $(MOD_STAMP) ## Show the kernel module trees that were installed
 	 tree "$$KVER_V8_16K" "kernel_2712.img: Pi 5, CM5"
 
 # ---------------------------------------------------------------------------
+# Step 6, part 1 - e2fsprogs, built for this machine and for the target
+#
+# macOS has no mkfs.ext4, no loop mounts and no root, and Linux distributions
+# ship whichever e2fsprogs their release froze on - and the version decides the
+# on-disk layout. Both problems go away by building it here: one pinned source
+# tree, configured twice.
+#
+#   host   - mke2fs, debugfs and e2fsck. mke2fs -d builds an ext4 image from a
+#            directory, which is what makes the whole image build unprivileged.
+#   target - resize2fs, the one tool first boot needs that busybox has no
+#            applet for. Dynamic against the musl from step 3, exactly like
+#            busybox, and proved that way rather than assumed.
+#
+# HOST_E2FSPROGS=<dir> points at tools you already have (say
+# /opt/homebrew/opt/e2fsprogs/sbin) and skips the host build; the image layout
+# then depends on whatever version that is.
+#
+# The cross build has one trap worth stating: configure looks for
+# aarch64-linux-ar, does not find it, and falls back to the host's ar without
+# comment. On macOS that writes archives carrying a __.SYMDEF index, which GNU
+# ld cannot read - so every library appears to build and every symbol in it
+# then comes back undefined at link time. AR, RANLIB and STRIP are passed
+# explicitly for that reason, and only for that reason.
+# ---------------------------------------------------------------------------
+
+E2FS_VERSION ?=
+E2FS_BASE    ?= https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs
+E2FS_SIG      = $(E2FS_VERSION)|$(E2FS_BASE)
+
+DL_E2FS       := $(DL_DIR)/e2fsprogs
+E2FS_DIR      := $(BUILD_DIR)/e2fsprogs
+E2FS_CFG      := $(E2FS_DIR)/.config
+E2FS_ENV      := $(E2FS_DIR)/version.env
+E2FS_UNPACKED := $(E2FS_DIR)/.unpacked
+E2FS_HOST_STAMP := $(E2FS_DIR)/.host-built
+E2FS_TGT_STAMP  := $(E2FS_DIR)/.target-built
+
+HOST_E2FSPROGS ?=
+E2FS_HOST_DEP   = $(if $(HOST_E2FSPROGS),,$(E2FS_HOST_STAMP))
+MKE2FS          = $(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS)/mke2fs,$(abspath $(E2FS_DIR)/host/misc/mke2fs))
+DEBUGFS         = $(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS)/debugfs,$(abspath $(E2FS_DIR)/host/debugfs/debugfs))
+E2FSCK          = $(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS)/e2fsck,$(abspath $(E2FS_DIR)/host/e2fsck/e2fsck))
+RESIZE2FS       = $(E2FS_DIR)/target/resize/resize2fs
+
+# Neither build needs nls, uuidd, the initrd helper, e4defrag or e2image, and
+# every one of them is another way for a cross build to go wrong.
+E2FS_CONFIGURE = --disable-nls --disable-fsck --disable-uuidd \
+                 --disable-e2initrd-helper --disable-defrag --disable-imager
+
+.PHONY: e2fsprogs
+e2fsprogs: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Build mke2fs/debugfs for this host and resize2fs for the target
+	@source $(E2FS_ENV); printf '  READY    e2fsprogs %s -> %s + %s\n' \
+	   "$$E2FS_VER" "$(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS) (host tools),$(E2FS_DIR)/host)" $(RESIZE2FS)
+
+$(E2FS_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(E2FS_SIG)' | cmp -s - $@ || printf '%s\n' '$(E2FS_SIG)' > $@
+
+# The index lists one directory per release, so "latest" is the highest vN.N.N
+# in it. sort -V again, for the same reason as everywhere else here.
+$(E2FS_ENV): $(E2FS_CFG)
+	@mkdir -p $(@D)
+	@echo "  RESOLVE  e2fsprogs ($(if $(E2FS_VERSION),pinned $(E2FS_VERSION),latest release))"
+	@if [ -n '$(E2FS_VERSION)' ]; then v='$(E2FS_VERSION)'; else \
+	   v=$$($(CURL) "$(E2FS_BASE)/" \
+	        | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?/' \
+	        | sed 's|^v||; s|/$$||' \
+	        | sort -uV | tail -1); \
+	   [ -n "$$v" ] || { echo "Could not read the release index at $(E2FS_BASE)/." >&2; exit 1; }; \
+	 fi; \
+	 [[ "$$v" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || { echo "Refusing e2fsprogs version '$$v'." >&2; exit 1; }; \
+	 printf "E2FS_VER='%s'\n" "$$v" > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^E2FS_VER='\(.*\)'/  E2FSPROGS \1/p" $@
+
+# kernel.org publishes sha256sums.asc next to every release. It is a clearsigned
+# document rather than a bare digest file, but the digest lines inside it are in
+# sha256sum's own format, so grepping out the one line for this tarball gives
+# something --check reads directly - upstream's digest, no record kept here.
+$(E2FS_UNPACKED): $(E2FS_ENV)
+	@mkdir -p $(DL_E2FS) $(E2FS_DIR)
+	@source $(E2FS_ENV); t=e2fsprogs-$$E2FS_VER.tar.gz; d=$(DL_E2FS)/$$E2FS_VER; \
+	 mkdir -p "$$d"; \
+	 if [ ! -f "$$d/$$t" ]; then \
+	   echo "  FETCH    $$t"; \
+	   $(CURL) -o "$$d/$$t.part" "$(E2FS_BASE)/v$$E2FS_VER/$$t" || { \
+	     echo "  FAIL     could not fetch $$t from $(E2FS_BASE)/v$$E2FS_VER" >&2; exit 1; }; \
+	   mv -f "$$d/$$t.part" "$$d/$$t"; \
+	 fi; \
+	 if [ ! -f "$$d/sha256sums.asc" ]; then \
+	   $(CURL) -o "$$d/sha256sums.asc.part" "$(E2FS_BASE)/v$$E2FS_VER/sha256sums.asc" || { \
+	     echo "  FAIL     no upstream digests for $$t - refusing an unverifiable tarball" >&2; exit 1; }; \
+	   mv -f "$$d/sha256sums.asc.part" "$$d/sha256sums.asc"; \
+	 fi; \
+	 echo "  VERIFY   $$t"; \
+	 ( cd "$$d" && grep -F "  $$t" sha256sums.asc | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$t does not match upstream's digest; delete $$d and retry" >&2; exit 1; }; \
+	 echo "  UNPACK   $$t"; \
+	 rm -rf $(E2FS_DIR)/e2fsprogs-$$E2FS_VER; \
+	 tar -xf "$$d/$$t" -C $(E2FS_DIR)
+	@touch $@
+
+# Both builds are out-of-tree, so the two configurations cannot contaminate
+# each other and neither writes into the unpacked source.
+$(E2FS_HOST_STAMP): $(E2FS_UNPACKED) Makefile
+	@source $(E2FS_ENV); s=$(abspath $(E2FS_DIR))/e2fsprogs-$$E2FS_VER; b=$(E2FS_DIR)/host; \
+	 mkdir -p $$b; \
+	 echo "  CONFIG   e2fsprogs $$E2FS_VER (host tools)"; \
+	 ( cd $$b && $$s/configure $(E2FS_CONFIGURE) ) > $$b/configure.log 2>&1 || { \
+	   tail -20 $$b/configure.log >&2; \
+	   echo "  FAIL     configure (full log: $$b/configure.log)" >&2; exit 1; }; \
+	 echo "  BUILD    e2fsprogs $$E2FS_VER (host, -j$(JOBS))"; \
+	 $(MAKE) --no-print-directory -C $$b -j$(JOBS) > $$b/build.log 2>&1 || { \
+	   tail -30 $$b/build.log >&2; \
+	   echo "  FAIL     build (full log: $$b/build.log)" >&2; exit 1; }
+	@for t in $(MKE2FS) $(DEBUGFS) $(E2FSCK); do \
+	   [ -x "$$t" ] || { echo "  FAIL     $$t was not built" >&2; exit 1; }; \
+	 done
+	@touch $@
+
+# Only the libraries and resize2fs, not `make all`: everything else in the tree
+# is either a host tool or a test program, and several of the test programs do
+# not cross-link at all.
+$(E2FS_TGT_STAMP): $(E2FS_UNPACKED) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
+	@source $(E2FS_ENV); s=$(abspath $(E2FS_DIR))/e2fsprogs-$$E2FS_VER; b=$(E2FS_DIR)/target; \
+	 mkdir -p $$b; \
+	 echo "  CONFIG   e2fsprogs $$E2FS_VER (aarch64, dynamic against $(SYSROOT))"; \
+	 ( cd $$b && $$s/configure --host=aarch64-linux $(E2FS_CONFIGURE) \
+	     CC=$(CROSS)gcc AR=$(CROSS)ar RANLIB=$(CROSS)ranlib STRIP=$(CROSS)strip \
+	     CFLAGS="-O2 --sysroot=$(abspath $(SYSROOT))" \
+	     LDFLAGS="--sysroot=$(abspath $(SYSROOT)) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
+	   ) > $$b/configure.log 2>&1 || { \
+	   tail -20 $$b/configure.log >&2; \
+	   echo "  FAIL     configure (full log: $$b/configure.log)" >&2; exit 1; }; \
+	 echo "  BUILD    resize2fs (-j$(JOBS))"; \
+	 $(MAKE) --no-print-directory -C $$b -j$(JOBS) libs > $$b/build.log 2>&1 || { \
+	   tail -30 $$b/build.log >&2; \
+	   echo "  FAIL     libs (full log: $$b/build.log)" >&2; exit 1; }; \
+	 $(MAKE) --no-print-directory -C $$b/resize resize2fs >> $$b/build.log 2>&1 || { \
+	   tail -30 $$b/build.log >&2; \
+	   echo "  FAIL     resize2fs (full log: $$b/build.log)" >&2; exit 1; }
+	@$(call assert_target_binary,$(RESIZE2FS))
+	@touch $@
+
+# The same three questions asked of busybox, asked again of anything else that
+# has to run on the card: right architecture, right loader, links our libc.
+define assert_target_binary
+	set -e; \
+	$(CROSS)readelf -h $(1) | grep -q AArch64 \
+	  || { echo "  FAIL     $(1) is not an aarch64 binary" >&2; exit 1; }; \
+	$(CROSS)readelf -l $(1) | grep -q 'interpreter: /lib/ld-musl-aarch64.so.1' \
+	  || { echo "  FAIL     $(1) does not use the musl loader" >&2; exit 1; }; \
+	$(CROSS)readelf -d $(1) | grep -q 'NEEDED.*libc\.so' \
+	  || { echo "  FAIL     $(1) does not link libc.so" >&2; exit 1; }
+endef
+
+.PHONY: e2fsprogs-info
+e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Show the e2fsprogs build
+	@source $(E2FS_ENV); echo "  version  e2fsprogs $$E2FS_VER"
+	@echo "  mke2fs   $(MKE2FS)$(if $(HOST_E2FSPROGS), (HOST_E2FSPROGS))"
+	@$(MKE2FS) -V 2>&1 | sed -n '1s/^/  reports  /p'
+	@printf '  resize2fs %s (%s KiB, aarch64)\n' $(RESIZE2FS) "$$(( $$(wc -c < $(RESIZE2FS)) / 1024 ))"
+# ---------------------------------------------------------------------------
+# Step 6, part 2 - the root filesystem tree
+#
+# build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
+# 408 applet links, the musl loader and libc.so, both kernel module trees, the
+# cross-built resize2fs, and the configuration in overlay/.
+#
+# overlay/ is a directory of real files rather than heredocs in this Makefile
+# on purpose - /etc/init.d/rcS and the two scripts under usr/sbin are shell
+# programs of some size, and they are far easier to read, diff and check with
+# `sh -n` as files. Only what genuinely varies per build is generated here:
+# the password hash, the version strings, and fstab.
+#
+# The tree is staged with ordinary user ownership and turned into root-owned
+# files when the image is made, so nothing in this step needs privileges.
+#
+# busybox's own install puts a symlink at sbin/init, and the overlay replaces it
+# with a script. That symlink has to be removed first: cp onto a symlink follows
+# it, so copying the overlay over the top would silently overwrite
+# /bin/busybox with a five-line shell script and produce an image with no
+# userspace at all.
+# ---------------------------------------------------------------------------
+
+SEPIAOS_VERSION ?= 0.1.0
+
+# Where the boot partition's cmdline.txt says the rootfs is, and where fstab
+# should look for the boot partition. These must match ../boot's CMDLINE_ROOT.
+ROOT_DEVICE ?= /dev/mmcblk0p2
+BOOT_DEVICE ?= /dev/mmcblk0p1
+
+# sha512-crypt of "sepiaos". The password is public - it is in the README - so
+# it is worth exactly one login, and /etc/profile refuses to give a shell until
+# it has been changed. Regenerate with:
+#   openssl passwd -6 -salt <salt> <password>
+# (LibreSSL, which is what /usr/bin/openssl is on macOS, has no -6; Homebrew's
+# openssl and every Linux one do.) Doubling every $ is what keeps make from
+# reading the hash as three variable references, and an override on the command
+# line has to double them too.
+ROOT_PASSWORD_HASH ?= $$6$$SepiaOSsalt$$FWNx87IZVDqzgxDUvZkO6uuqumlfSuqXmP9gXCX/6CEOaAVGz/aqfqPgRrHrHkLDsxlOrl8Y94g01xzuVtIrr/
+
+OVERLAY      := overlay
+OVERLAY_SRC  := $(shell find $(OVERLAY) -type f 2>/dev/null)
+
+ROOTFS_DIR   := $(BUILD_DIR)/rootfs
+IMG_DIR      := $(BUILD_DIR)/image
+ROOTFS_STAMP := $(IMG_DIR)/.rootfs
+
+# /var/run and /var/lock are symlinks into /run, which is where the FHS has
+# put them since 3.0 and where every tool expects to find them.
+ROOTFS_DIRS := bin boot dev etc etc/init.d home lib media mnt opt proc root run \
+               sbin srv sys tmp usr usr/bin usr/lib usr/local usr/sbin usr/share \
+               var var/cache var/lib var/lib/sepia var/log var/spool var/tmp
+
+.PHONY: rootfs
+rootfs: $(ROOTFS_STAMP) ## Stage the root filesystem tree under build/rootfs
+	@printf '  READY    rootfs %s -> %s (%s MiB, %s files)\n' "$(SEPIAOS_VERSION)" $(ROOTFS_DIR) \
+	   "$$(du -sm $(ROOTFS_DIR) | cut -f1)" "$$(find $(ROOTFS_DIR) | wc -l | tr -d ' ')"
+
+$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(OVERLAY_SRC) Makefile
+	@mkdir -p $(IMG_DIR)
+	@echo "  STAGE    $(ROOTFS_DIR)"
+	@rm -rf $(ROOTFS_DIR)
+	@mkdir -p $(addprefix $(ROOTFS_DIR)/,$(ROOTFS_DIRS))
+	@ln -s ../run      $(ROOTFS_DIR)/var/run
+	@ln -s ../run/lock $(ROOTFS_DIR)/var/lock
+	@cp -R $(SYSROOT)/bin/.      $(ROOTFS_DIR)/bin/
+	@cp -R $(SYSROOT)/sbin/.     $(ROOTFS_DIR)/sbin/
+	@cp -R $(SYSROOT)/usr/bin/.  $(ROOTFS_DIR)/usr/bin/
+	@cp -R $(SYSROOT)/usr/sbin/. $(ROOTFS_DIR)/usr/sbin/
+	@cp -R $(SYSROOT)/lib/modules $(ROOTFS_DIR)/lib/
+	@cp -R $(SYSROOT)/lib/ld-musl-aarch64.so.1 $(ROOTFS_DIR)/lib/
+	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
+	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
+	@rm -f $(ROOTFS_DIR)/sbin/init
+	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
+	@$(call generate_etc)
+	@chmod 0755 $(ROOTFS_DIR) $(ROOTFS_DIR)/etc/init.d/rcS $(ROOTFS_DIR)/etc/init.d/rcK \
+	            $(ROOTFS_DIR)/usr/sbin/sepia-gettys $(ROOTFS_DIR)/usr/sbin/sepia-firstboot \
+	            $(ROOTFS_DIR)/usr/sbin/resize2fs
+	@chmod 0700 $(ROOTFS_DIR)/root
+	@chmod 0600 $(ROOTFS_DIR)/etc/shadow
+	@chmod 1777 $(ROOTFS_DIR)/tmp $(ROOTFS_DIR)/var/tmp
+	@chmod 0555 $(ROOTFS_DIR)/proc $(ROOTFS_DIR)/sys
+	@$(call assert_rootfs)
+	@touch $@
+
+# fstab names the boot partition so `mount /boot` in rcS has something to read,
+# and the swap line is appended by sepia-firstboot once the partition exists.
+# The root entry is documentation and a fsck order: the kernel has already
+# mounted / from root= on the command line by the time anything reads this.
+define generate_etc
+	set -e; r=$(ROOTFS_DIR); \
+	source $(MOD_KERNELS); source $(BOOT_ENV); \
+	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
+	  echo 'daemon:*:20000:0:99999:7:::'; \
+	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
+	f='%-16s %-14s %-6s %-18s %-6s %s\n'; \
+	{ printf "$$f" '# <device>' '<mount point>' '<type>' '<options>' '<dump>' '<pass>'; \
+	  printf "$$f" '$(ROOT_DEVICE)' /     ext4 defaults,noatime 0 1; \
+	  printf "$$f" '$(BOOT_DEVICE)' /boot vfat defaults,noatime 0 2; } > $$r/etc/fstab; \
+	{ echo 'NAME="SepiaOS"'; \
+	  echo 'ID=sepiaos'; \
+	  echo 'VERSION="$(SEPIAOS_VERSION)"'; \
+	  echo 'VERSION_ID="$(SEPIAOS_VERSION)"'; \
+	  echo 'PRETTY_NAME="SepiaOS $(SEPIAOS_VERSION)"'; \
+	  echo 'HOME_URL="https://github.com/Sepia-OS"'; \
+	  echo "SEPIAOS_BOOT_RELEASE=\"$$BOOT_TAG\""; \
+	  echo "SEPIAOS_FIRMWARE=\"$$FW_TAG\""; \
+	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; } > $$r/etc/os-release; \
+	{ echo 'SepiaOS $(SEPIAOS_VERSION) \n \l'; echo; } > $$r/etc/issue; \
+	: > $$r/etc/sepiaos-password-unchanged
+endef
+
+# What has to be true for this tree to boot at all, asked of the tree itself
+# rather than of the steps that filled it: init has to exist, the loader every
+# binary asks for has to be present *inside* the image, and the tools the two
+# boot-time scripts call have to be there. A missing loader is the failure that
+# looks like a kernel panic with no explanation.
+define assert_rootfs
+	set -e; r=$(ROOTFS_DIR); \
+	[ ! -L "$$r/sbin/init" ] && [ -s "$$r/bin/busybox" ] \
+	  || { echo "  FAIL     sbin/init should be the wrapper script, not a busybox symlink" >&2; exit 1; }; \
+	for f in sbin/init bin/sh bin/busybox bin/login usr/bin/passwd sbin/getty \
+	         usr/sbin/resize2fs etc/inittab etc/init.d/rcS etc/passwd etc/shadow \
+	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
+	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
+	done; \
+	[ -L "$$r/lib/ld-musl-aarch64.so.1" ] \
+	  || { echo "  FAIL     no musl loader in the tree" >&2; exit 1; }; \
+	l=$$(readlink "$$r/lib/ld-musl-aarch64.so.1"); \
+	[ -f "$$r$$l" ] \
+	  || { echo "  FAIL     the loader points at $$l, which is not in the tree" >&2; exit 1; }; \
+	grep -q '^# --- generated by sepia-gettys' "$$r/etc/inittab" \
+	  || { echo "  FAIL     etc/inittab has no marker for the generated getty lines" >&2; exit 1; }; \
+	grep -q '^root:\$$6\$$' "$$r/etc/shadow" \
+	  || { echo "  FAIL     root has no sha512 password hash in etc/shadow" >&2; exit 1; }; \
+	source $(MOD_KERNELS); \
+	for k in "$$KVER_V8" "$$KVER_V8_16K"; do \
+	  [ -s "$$r/lib/modules/$$k/modules.dep" ] \
+	    || { echo "  FAIL     lib/modules/$$k did not make it into the tree" >&2; exit 1; }; \
+	done
+endef
+
+.PHONY: rootfs-check
+rootfs-check: $(ROOTFS_STAMP) ## Re-read the staged tree and check it could boot
+	@$(call assert_rootfs)
+	@echo "  OK       $(ROOTFS_DIR) has an init, a shell, a loader and both module trees"
+
+.PHONY: rootfs-info
+rootfs-info: $(ROOTFS_STAMP) ## Show what was staged into the root filesystem
+	@echo "  version  SepiaOS $(SEPIAOS_VERSION)"
+	@echo "  tree     $(ROOTFS_DIR)"
+	@printf '  size     %s MiB in %s files\n' \
+	   "$$(du -sm $(ROOTFS_DIR) | cut -f1)" "$$(find $(ROOTFS_DIR) | wc -l | tr -d ' ')"
+	@printf '  modules  %s MiB\n' "$$(du -sm $(ROOTFS_DIR)/lib/modules | cut -f1)"
+	@sed -n 's/^PRETTY_NAME=/  os       /p;s/^SEPIAOS_KERNELS=/  kernels  /p' $(ROOTFS_DIR)/etc/os-release
+# ---------------------------------------------------------------------------
+# Step 6, part 3 - the bootable image
+#
+# One MBR disk image: partition 1 is the boot partition exactly as the boot
+# release published it, partition 2 is an ext4 filesystem holding build/rootfs.
+# The boot image already carries a valid MBR with partition 1 in it, so it is
+# copied in whole and only the second table entry is written here.
+#
+# Nothing is mounted and nothing needs root. mke2fs -d builds the filesystem
+# straight from the staged directory, and debugfs then sets every inode to
+# root:root - mke2fs copies the ownership it finds on disk, which would
+# otherwise ship a card whose /etc and /bin belong to whichever uid happened to
+# run the build. Doing it this way also makes the result independent of who
+# built it, which a `sudo chown -R` staging tree would not be.
+#
+# The image is deliberately small: it is sized to its contents, and first boot
+# grows partition 2 into whatever card it was written to. IMAGE_SIZE_MIB has to
+# be a power of two all the same, because QEMU refuses any other SD image size,
+# and an image that cannot be booted in QEMU cannot be tested before it is
+# written to a card.
+# ---------------------------------------------------------------------------
+
+IMAGE_SIZE_MIB ?= 256
+ROOTFS_LABEL   ?= sepiaos-root
+
+
+ROOTFS_IMG := $(IMG_DIR)/rootfs.ext4
+IMAGE      := $(IMG_DIR)/sepiaos-$(SEPIAOS_VERSION).img
+
+IMAGE_GOALS := image image-info image-check rootfs-image
+ifneq ($(filter $(IMAGE_GOALS),$(MAKECMDGOALS)),)
+  ifneq ($(shell echo $$(( $(IMAGE_SIZE_MIB) & ($(IMAGE_SIZE_MIB) - 1) ))),0)
+    $(error IMAGE_SIZE_MIB must be a power of two - QEMU rejects any other SD image size, got $(IMAGE_SIZE_MIB))
+  endif
+endif
+
+.PHONY: image
+image: $(IMAGE) ## Build the bootable SepiaOS card image
+	@printf '  READY    image -> %s (%s MiB)\n' $(IMAGE) "$$(( $$(wc -c < $(IMAGE)) / 1048576 ))"
+
+# Partition 1's start and length are read out of the boot image rather than
+# assumed: they are the boot release's decision, and if it ever moves them a
+# hardcoded 64 MiB here would write the rootfs straight over the FAT.
+define image_geometry
+	le32() { od -An -tu4 -j $$1 -N4 $(BOOT_IMG) | tr -d ' '; }; \
+	boot_start=$$(le32 454); boot_sectors=$$(le32 458); \
+	root_start=$$((boot_start + boot_sectors)); \
+	total_sectors=$$(( $(IMAGE_SIZE_MIB) * 2048 )); \
+	root_sectors=$$((total_sectors - root_start)); \
+	if [ "$$root_sectors" -le 0 ]; then \
+	  echo "  FAIL     IMAGE_SIZE_MIB=$(IMAGE_SIZE_MIB) leaves no room after the $$((root_start / 2048)) MiB boot partition" >&2; \
+	  exit 1; \
+	fi
+endef
+
+.PHONY: rootfs-image
+rootfs-image: $(ROOTFS_IMG) ## Build just the ext4 filesystem image
+
+# -b 4096 rather than letting mke2fs choose: the block size decides how the
+# free space in a 200 MiB filesystem is spent, and it must not change under us
+# when the image size does.
+#
+# The chown pass is one debugfs run over a generated command file - about 7500
+# commands for a tree this size, and quicker than it sounds because debugfs
+# opens the filesystem once. sif is set_inode_field; e2fsck afterwards is what
+# says the result is a filesystem and not just bytes.
+$(ROOTFS_IMG): $(ROOTFS_STAMP) $(BOOT_IMG) $(E2FS_HOST_DEP) Makefile
+	@mkdir -p $(@D)
+	@$(call image_geometry); \
+	 echo "  MKFS     ext4 $$((root_sectors / 2048)) MiB <- $(ROOTFS_DIR)"; \
+	 rm -f $@.part; \
+	 $(MKE2FS) -q -F -t ext4 -b 4096 -m 1 -L $(ROOTFS_LABEL) \
+	   -d $(ROOTFS_DIR) -E root_owner=0:0 $@.part $$((root_sectors / 8)) || { \
+	   echo "  FAIL     mke2fs" >&2; exit 1; }
+	@echo "  CHOWN    every inode to root:root"
+	@find $(ROOTFS_DIR) -mindepth 1 | sed 's|^$(ROOTFS_DIR)||' \
+	  | awk '{printf "sif \"%s\" uid 0\nsif \"%s\" gid 0\n", $$0, $$0}' > $(IMG_DIR)/chown.debugfs
+	@$(DEBUGFS) -w -f $(IMG_DIR)/chown.debugfs $@.part > $(IMG_DIR)/chown.log 2>&1 || { \
+	   tail -20 $(IMG_DIR)/chown.log >&2; echo "  FAIL     debugfs" >&2; exit 1; }
+	@$(call assert_rootfs_image,$@.part)
+	@mv -f $@.part $@
+
+# Two things can go wrong that a successful mke2fs does not rule out: the
+# filesystem can be inconsistent, and the ownership pass can have silently
+# missed. e2fsck answers the first; reading two inodes back answers the second.
+define assert_rootfs_image
+	set -e; \
+	$(E2FSCK) -fn $(1) > $(IMG_DIR)/fsck.log 2>&1 || { \
+	  cat $(IMG_DIR)/fsck.log >&2; echo "  FAIL     the filesystem is not clean" >&2; exit 1; }; \
+	for f in /bin/busybox /etc/shadow /sbin/init; do \
+	  o=$$($(DEBUGFS) -R "stat $$f" $(1) 2>/dev/null | sed -n 's/.*User: *\([0-9]*\) *Group: *\([0-9]*\).*/\1:\2/p'); \
+	  [ "$$o" = "0:0" ] || { echo "  FAIL     $$f in the image is owned by $$o, not 0:0" >&2; exit 1; }; \
+	done
+endef
+
+# The whole file is created at full size first, then the two partitions are
+# written into it with conv=notrunc. Creating it by seeking leaves a sparse
+# file, so an image that reports 256 MiB occupies only what is written until it
+# is copied to a card.
+$(IMAGE): $(ROOTFS_IMG) $(BOOT_IMG) Makefile
+	@mkdir -p $(@D)
+	@$(call image_geometry); \
+	 echo "  IMAGE    $(IMAGE_SIZE_MIB) MiB: boot $$((boot_sectors / 2048)) MiB + root $$((root_sectors / 2048)) MiB"; \
+	 rm -f $@.part; \
+	 dd if=/dev/zero of=$@.part bs=1 count=0 seek=$$((total_sectors * 512)) 2>/dev/null; \
+	 dd if=$(BOOT_IMG)   of=$@.part conv=notrunc                      2>/dev/null; \
+	 dd if=$(ROOTFS_IMG) of=$@.part conv=notrunc bs=512 seek=$$root_start 2>/dev/null; \
+	 $(call mbr_entry,131,$$root_start,$$root_sectors) \
+	   | dd of=$@.part bs=1 seek=462 count=16 conv=notrunc 2>/dev/null
+	@$(call assert_image,$@.part)
+	@mv -f $@.part $@
+
+# One MBR partition entry on stdout: status, CHS first, type, CHS last, LBA
+# start, sector count. The CHS fields get the 0xFE/0xFF/0xFF "cannot be
+# expressed" value that every tool writes past 8 GB - Linux and the Pi firmware
+# read the LBA fields and ignore these.
+define mbr_entry
+	byte() { printf '\\0%03o' "$$1"; }; \
+	le32() { byte $$(( $$1 & 255 )); byte $$(( ($$1 >> 8) & 255 )); \
+	         byte $$(( ($$1 >> 16) & 255 )); byte $$(( ($$1 >> 24) & 255 )); }; \
+	printf '%b' "$$( byte 0; byte 254; byte 255; byte 255; \
+	                 byte $(1); byte 254; byte 255; byte 255; \
+	                 le32 $(2); le32 $(3) )"
+endef
+
+# The partition table is the one part of this that no earlier step checked, and
+# a wrong type byte or a partition that runs off the end of the image is a card
+# that does not boot with nothing to see. Both entries are read back out of the
+# finished image.
+define assert_image
+	set -e; \
+	le32() { od -An -tu4 -j $$1 -N4 $(1) | tr -d ' '; }; \
+	byte() { od -An -tx1 -j $$1 -N1 $(1) | tr -d ' '; }; \
+	[ "$$(byte 450)" = "0c" ] \
+	  || { echo "  FAIL     partition 1 is type 0x$$(byte 450), expected 0x0c (FAT32 LBA)" >&2; exit 1; }; \
+	[ "$$(byte 466)" = "83" ] \
+	  || { echo "  FAIL     partition 2 is type 0x$$(byte 466), expected 0x83 (Linux)" >&2; exit 1; }; \
+	[ "$$(byte 510)$$(byte 511)" = "55aa" ] \
+	  || { echo "  FAIL     no MBR signature" >&2; exit 1; }; \
+	end=$$(( $$(le32 470) + $$(le32 474) )); \
+	have=$$(( $$(wc -c < $(1)) / 512 )); \
+	[ "$$end" -le "$$have" ] \
+	  || { echo "  FAIL     partition 2 ends at sector $$end, past the $$have sector image" >&2; exit 1; }; \
+	[ "$$(le32 470)" = "$$(( $$(le32 454) + $$(le32 458) ))" ] \
+	  || { echo "  FAIL     partition 2 does not start where partition 1 ends" >&2; exit 1; }
+endef
+
+.PHONY: image-check
+image-check: $(IMAGE) ## Re-read the finished image: filesystem, ownership, partition table
+	@$(call assert_rootfs_image,$(ROOTFS_IMG))
+	@$(call assert_image,$(IMAGE))
+	@echo "  OK       $(IMAGE) is a clean ext4 owned by root, behind a valid MBR"
+
+.PHONY: image-info
+image-info: $(IMAGE) ## Show the finished image's layout
+	@printf '  image    %s (%s MiB)\n' $(IMAGE) "$$(( $$(wc -c < $(IMAGE)) / 1048576 ))"
+	@$(SHA256) $(IMAGE) | sed 's/^/  sha256   /'
+	@le32() { od -An -tu4 -j $$1 -N4 $(IMAGE) | tr -d ' '; }; \
+	 byte() { od -An -tx1 -j $$1 -N1 $(IMAGE) | tr -d ' '; }; \
+	 printf '  part 1   type 0x%s  start %8s  %5s MiB  boot\n' \
+	   "$$(byte 450)" "$$(le32 454)" "$$(( $$(le32 458) / 2048 ))"; \
+	 printf '  part 2   type 0x%s  start %8s  %5s MiB  %s\n' \
+	   "$$(byte 466)" "$$(le32 470)" "$$(( $$(le32 474) / 2048 ))" "$(ROOTFS_LABEL)"
+	@$(E2FSCK) -fn $(ROOTFS_IMG) 2>&1 | tail -1 | sed 's/^/  ext4     /'
+	@echo "  grows to the whole card on first boot; swap is added then too"
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -1022,6 +1508,11 @@ help: ## Show this help
 	  "MUSL_VERSION"      "pin a musl release instead of taking the latest one" \
 	  "BUSYBOX_VERSION"   "pin a busybox release instead of taking the latest one" \
 	  "FIRMWARE_TAG"      "pin the kernel modules' firmware tag (default: the boot release's)" \
+	  "E2FS_VERSION"      "pin an e2fsprogs release instead of taking the latest one" \
+	  "HOST_E2FSPROGS"    "directory of mke2fs/debugfs to use instead of building them" \
+	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
+	  "IMAGE_SIZE_MIB"    "shipped image size, power of two (default $(IMAGE_SIZE_MIB))" \
+	  "ROOT_PASSWORD_HASH" "sha512-crypt for root; every $$ has to be doubled" \
 	  "JOBS"              "parallelism for the source builds (default $(JOBS))"
 	@echo
 	@echo "Examples:"
@@ -1035,3 +1526,6 @@ help: ## Show this help
 	@echo "  make busybox                           latest busybox, dynamic against musl"
 	@echo "  make modules                           the boot kernel's modules, both trees"
 	@echo "  make FIRMWARE_TAG=1.20260521 modules   modules from a specific firmware tag"
+	@echo "  make rootfs                            stage the root filesystem tree"
+	@echo "  make image                             the bootable card image"
+	@echo "  make IMAGE_SIZE_MIB=512 image          a roomier one"

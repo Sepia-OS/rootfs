@@ -1,0 +1,34 @@
+#!/bin/sh
+# SepiaOS init: a wrapper that gives busybox init a console, then becomes it.
+#
+# It exists because of two things that are individually obscure and together
+# produce a system that boots perfectly and says absolutely nothing.
+#
+# The kernel opens /dev/console for PID 1 in console_on_rootfs(), which runs
+# *before* prepare_namespace() mounts the real root. Without an initramfs there
+# is nothing to open then - "Warning: unable to open an initial console" in the
+# boot log - so init is exec'd with descriptors 0, 1 and 2 closed. And busybox
+# init does not open a console of its own on Linux: it honours a CONSOLE or
+# console environment variable and otherwise calls bb_sanitize_stdio, which
+# points everything at /dev/null. By the time this script runs the kernel has
+# mounted devtmpfs, so the console can be opened here instead.
+#
+# /dev/console is probed in a subshell rather than trusted, because it can be
+# present and still refuse to open: it resolves to whichever console the kernel
+# registered, and if console= on the command line named a device that does not
+# exist - console=ttyAMA0 under QEMU, where the PL011 comes up as ttyAMA1 -
+# then nothing was ever registered and the open fails with ENODEV. A failed
+# redirection on `exec` is fatal to the shell, so probing first is the
+# difference between a quiet boot and a kernel panic.
+#
+# Not having a console is survivable: init's own messages go nowhere, but the
+# getty lines carry the tty to open in the inittab id field and init opens
+# those itself, so logging in still works.
+
+if [ -c /dev/console ] && ( : < /dev/console ) 2>/dev/null; then
+	exec <>/dev/console >&0 2>&0
+	CONSOLE=/dev/console
+	export CONSOLE
+fi
+
+exec /bin/busybox init

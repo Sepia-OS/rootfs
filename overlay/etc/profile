@@ -1,0 +1,45 @@
+# SepiaOS login shell environment. Read by ash for login shells only.
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=${HOME:-/root}
+export TERM=${TERM:-vt100}
+export PAGER=more
+umask 022
+
+if [ "$(id -u)" = 0 ]; then
+	export PS1='\h:\w# '
+else
+	export PS1='\u@\h:\w$ '
+fi
+
+# The default root password is public - it is in the README - so it is good
+# for exactly one login. There is no password ageing to lean on here: busybox
+# login does not read the ageing fields of /etc/shadow at all (checked in
+# 1.38.0), so the marker file is what carries the requirement, and only a
+# passwd that actually succeeded removes it.
+if [ "$(id -u)" = 0 ] && [ -f /etc/sepiaos-password-unchanged ]; then
+	echo
+	echo "This system still has the default root password."
+	echo "Choose a new one now - you cannot get a shell until you do."
+	echo
+	tries=0
+	while [ -f /etc/sepiaos-password-unchanged ]; do
+		if passwd root; then
+			rm -f /etc/sepiaos-password-unchanged
+			break
+		fi
+		tries=$((tries + 1))
+		# Bounded, and it has to be: passwd fails immediately when there is
+		# nothing on stdin, so an unbounded loop would spin at full speed for
+		# a login shell started from a script. Giving up ends the login shell,
+		# which drops back to the getty and its login prompt - still no shell
+		# without a new password.
+		if [ "$tries" -ge 3 ]; then
+			echo
+			echo "The password was not changed. Logging out."
+			exit 1
+		fi
+		echo "The password was not changed. Try again."
+	done
+	echo
+fi

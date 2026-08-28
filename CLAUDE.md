@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Early. The repository has one commit (`Created the repository`); the `Makefile` and `checksums/` are not committed yet. `README.md` is a specification of the build; of its seven steps **steps 1 to 5 — the boot partition, the cross-compiler, musl libc, busybox, and the kernel modules — are implemented**. The rest of the `Makefile` is still to be written.
+Early. Steps 1 to 5 are committed (`Implemented steps 1-5`); step 6 — `overlay/` and the last three sections of the `Makefile` — is not. `README.md` is a specification of the build; of its steps **1 to 6 — the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, and the bootable image — are implemented**. Steps 7 and 8 (test under QEMU, ship a QEMU launch script) are still to be written.
 
-Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
+Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
 
 ## Commands
 
@@ -31,13 +31,20 @@ gmake modules                           # install the boot kernel's modules into
 gmake modules-info                      # firmware tag, commit, both trees with sizes
 gmake modules-check                     # re-read the installed trees and their depmod data
 gmake FIRMWARE_TAG=1.20260521 modules   # pin the firmware tag instead of taking boot's
+gmake e2fsprogs                         # mke2fs/debugfs for this host, resize2fs for the target
+gmake rootfs                            # stage the FHS tree under build/rootfs
+gmake rootfs-info                       # size, file count, kernels it carries
+gmake image                             # build/image/sepiaos-<version>.img
+gmake image-info                        # partition table, sha256, ext4 state
+gmake image-check                       # re-read it: fsck, ownership, partition table
+gmake IMAGE_SIZE_MIB=512 image          # a roomier card image
 gmake clean                             # drop build/, keep downloads/
 gmake distclean                         # also drop downloads/ (including ~600 MiB of toolchain)
 ```
 
-Every aggregate goal (`boot-partition`, `toolchain`, `musl`, `busybox`, `modules`) ends with a `READY` line naming the version and where it landed. That line prints whether or not anything was rebuilt — a phony goal whose prerequisite is already built otherwise prints *nothing*, which reads exactly like a broken target.
+Every aggregate goal (`boot-partition`, `toolchain`, `musl`, `busybox`, `modules`, `rootfs`, `image`) ends with a `READY` line naming the version and where it landed. That line prints whether or not anything was rebuilt — a phony goal whose prerequisite is already built otherwise prints *nothing*, which reads exactly like a broken target.
 
-Required tools: `gmake` ≥ 4.0, `curl`, `jq`, `xz`, `tar` (`brew install make jq xz`; macOS 13+ already ships `jq` at `/usr/bin/jq`).
+Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, and a C compiler for the host build of e2fsprogs (`brew install make jq xz`; macOS 13+ already ships `jq` at `/usr/bin/jq`). Nothing needs root, on either platform.
 
 ### How step 1 works
 
@@ -100,9 +107,41 @@ So: **macOS → messense 15.2.0** (`aarch64-unknown-linux-gnu`, gcc 15.2), **Lin
 - Downloads are keyed by tag under `downloads/modules/<tag>/` and survive `clean`; a `.complete` marker distinguishes a finished copy from an interrupted one, which would otherwise look like a good cache entry. `clean` + `modules` is ~3 s.
 - **For step 6:** busybox's `FEATURE_SEAMLESS_XZ` defaults to `y` and its help text names modprobe explicitly (`modprobe` reads modules through `xmalloc_open_zipped_read_close`), so a defconfig busybox can load these `.ko.xz` files. Worth re-reading off the generated `.config` when module loading is actually wired up.
 
+### How step 6 works
+
+Three parts: e2fsprogs, the staged tree, and the image.
+
+**e2fsprogs, built twice.** macOS has no `mkfs.ext4`, no loop mounts and no root; Linux has e2fsprogs but at whatever version the distribution froze on, and the version decides the on-disk layout. One pinned source tree configured twice settles both: host `mke2fs`/`debugfs`/`e2fsck`, and a target `resize2fs` — the one thing first boot needs that busybox has no applet for. Verified against kernel.org's `sha256sums.asc`, whose digest lines are already in `sha256sum --check` format. `HOST_E2FSPROGS=<dir>` skips the host build. Only `make libs` plus `make -C resize` is built for the target: several of the test programs in the tree do not cross-link, and none of them are wanted.
+
+- **A cross build that finds the host's `ar` fails in a way that reads as a source problem.** configure looks for `aarch64-linux-ar`, does not find it, and silently uses `ar`. On macOS that writes archives with a `__.SYMDEF` index, which GNU ld cannot read — so every library "builds" and then every symbol in it is undefined at link time, including symbols `ar t` will happily list. `AR`, `RANLIB` and `STRIP` are passed explicitly.
+
+**The staged tree** (`build/rootfs`) is busybox and its 408 applet links, the musl loader and `libc.so`, both module trees, `resize2fs`, and `overlay/`. `overlay/` holds real files rather than heredocs in the Makefile — `rcS`, `sepia-gettys` and `sepia-firstboot` are shell programs worth reading, diffing and running `sh -n` over. Only what varies per build is generated: `/etc/shadow`, `/etc/fstab`, `/etc/os-release`, `/etc/issue`. The tree is ~57 MiB, of which 54 MiB is kernel modules.
+
+- **`/sbin/init` is a wrapper script, not busybox.** The kernel opens `/dev/console` for PID 1 in `console_on_rootfs()`, which runs *before* `prepare_namespace()` mounts the real root — with no initramfs there is nothing to open (`Warning: unable to open an initial console` in the log) and init is exec'd with fds 0, 1 and 2 closed. busybox init does not open a console of its own on Linux: it honours `CONSOLE`/`console` in the environment and otherwise calls `bb_sanitize_stdio()`, pointing everything at `/dev/null`. The result is a system that boots perfectly and says nothing whatsoever. The wrapper opens `/dev/console` (devtmpfs is mounted by then) and execs busybox init.
+- **The probe before that `exec` is load-bearing.** `/dev/console` can exist and still fail to open — see the QEMU caveats below — and a failed redirection on `exec` kills the shell, which as PID 1 is a kernel panic. It is tested in a subshell first.
+- **busybox's install puts a symlink at `sbin/init`, so it is removed before the overlay is copied.** `cp` onto a symlink follows it: copying the overlay over the top would overwrite `/bin/busybox` with a five-line shell script and produce an image with no userspace at all.
+- **The kernel mounts / read-only** unless the command line says `rw`, and the one `../boot` ships says neither `ro` nor `rw`. `rcS` remounts it read-write before anything that writes — which is everything after it.
+- **busybox 1.38.0 `login` has no password ageing at all** (no `sp_expire`/`sp_lstchg` handling; checked in the source), so "must change the password on first login" cannot lean on `/etc/shadow`. A marker file, `/etc/sepiaos-password-unchanged`, carries it instead, and `/etc/profile` refuses to hand over a shell until `passwd` has actually succeeded. The retry loop is **bounded**: `passwd` fails instantly when stdin is at EOF, so an unbounded loop would spin at full speed for a login shell started from a script. After three failures the login shell exits, which drops back to the getty.
+- **`/etc/securetty` is deliberately absent.** busybox's `is_tty_secure()` reports "secure" when the file is missing or empty, so absence allows root everywhere; a partial list would lock root out of any console not on it, which on six boards plus QEMU is a trap.
+- The shipped root password hash is a fixed sha512-crypt of `sepiaos`, embedded rather than generated: `/usr/bin/openssl` on macOS is LibreSSL and has no `-6`. It was verified inside a booted image against busybox's own crypt (`mkpasswd -m sha512 -S SepiaOSsalt sepiaos`), which is the implementation that has to accept it.
+
+**The image** is the boot release's own 64 MiB partition 1 copied in whole, an ext4 filesystem behind it, and one MBR entry written by hand. Nothing is mounted and nothing needs privileges.
+
+- **`mke2fs -d` copies the ownership it finds on disk**, so a staged tree owned by uid 501 becomes an image whose `/etc` and `/bin` belong to uid 501. `-E root_owner=0:0` fixes only the root inode. Every inode is set to `0:0` afterwards by one `debugfs` run over a generated file of `sif` commands — about 7500 of them, quick because debugfs opens the filesystem once. Doing it this way also makes the image independent of who built it, which a `sudo chown -R` of the staging tree would not be.
+- `e2fsck -fn` afterwards is what says the result is a filesystem rather than bytes; the ownership pass is checked by reading three inodes back out of the finished image, because a `sif` that silently missed would not fail the build.
+- Partition 1's start and length are **read out of the boot image** rather than assumed. They are the boot release's decision, and a hardcoded 64 MiB would write the rootfs over the FAT if it ever changed.
+- `IMAGE_SIZE_MIB` must be a power of two (QEMU), and the default 256 MiB is sized to its contents — 192 MiB of rootfs against 57 MiB of tree. Growing it is first boot's job.
+
+**First boot** (`/usr/sbin/sepia-firstboot`) is two passes with a reboot between them, and that is a constraint rather than a choice: **the kernel will not re-read a partition table while one of that disk's partitions is mounted, and / always is.** Pass 1 rewrites the table and reboots; pass 2 sees the larger partition, grows the filesystem onto it with an online `resize2fs`, and brings up swap. Raspberry Pi OS splits its own resize the same way for the same reason.
+
+- The table is written as raw MBR bytes rather than through `fdisk`: the wanted layout is exact and already known (partition 1 and the start of partition 2 never move), and 16 bytes per entry is less machinery than driving an interactive tool from a script. The whole 512-byte sector is read, patched and written back in one write, so a power cut cannot leave half a table.
+- The disk is found through sysfs (`/sys/class/block/<part>/..`), which names it without guessing whether the partition suffix is `p2` or `2` — that differs between `mmcblk` and `sd` devices, and partition 3 has to be built the same way round.
+- Swap sizes are the README's (1/2/4 GiB by device size, thresholds in GB as storage is sold). **On a small card the rule asks for a swap partition bigger than the space there is**; growing the filesystem is the more useful half, so when swap will not fit the whole device goes to the rootfs and the boot log says so.
+- Verified end to end under QEMU on a 4 GiB card: root 192 MiB → 3008 MiB, swap 1024 MiB at partition 3, `fstab` updated, `firstboot-done` marker written, and a second boot that does nothing but `swapon -a`.
+
 ### Make dependency layout
 
-`Makefile` is a prerequisite of the things that are **built** (`boot.img`, the musl install, the busybox binary, the module install) but deliberately **not** of the things that are **resolved** (`*/version.env`, `boot/release.env`) or **fetched** (`modules/.fetched`). Editing a recipe should rebuild; it must never re-run a "latest" lookup and quietly move the project onto a newer upstream release, or re-clone 54 MiB of modules. The toolchain is left out of even the build half — its version is part of its path, and re-extracting 600 MiB on every edit would be absurd.
+`Makefile` is a prerequisite of the things that are **built** (`boot.img`, the musl install, the busybox binary, the module install, the staged tree, the image) but deliberately **not** of the things that are **resolved** (`*/version.env`, `boot/release.env`) or **fetched** (`modules/.fetched`). Editing a recipe should rebuild; it must never re-run a "latest" lookup and quietly move the project onto a newer upstream release, or re-clone 54 MiB of modules. The toolchain is left out of even the build half — its version is part of its path, and re-extracting 600 MiB on every edit would be absurd.
 
 ## What This Repository Is For
 
@@ -121,7 +160,7 @@ This repository is the `rootfs` component. Per `README.md` the pipeline is:
 
 Step 7 shapes step 6: the shipped image is sized to its contents, not to any particular card, so the rootfs partition is deliberately small and the first boot rewrites the partition table in place and runs `resize2fs` before rebooting. That needs a once-only marker (Raspberry Pi OS uses a `cmdline.txt` `init=` hand-off plus a flag file) — a resize that repeats on every boot, or that runs against a mounted-read-write filesystem, is the failure mode to design against.
 
-Steps 1 to 5 are implemented, so the next milestone is **step 6** — the ext4 rootfs and the bootable image. Two facts about step 5 that shape it: the modules live in `raspberrypi/firmware` under `modules/`, at the same tag `../boot` pins as `FIRMWARE_TAG`; and **two trees are needed, not one**, because the universal boot partition ships two kernels — `kernel8.img` (Zero 2 W, Pi 3, Pi 4, CM4) takes `<version>-v8+`, `kernel_2712.img` (Pi 5, CM5, 16K pages) takes `<version>-v8-16k+`. Shipping only `-v8+` gives a card that boots four boards with modules and two without. That is ~54 MiB of the image before anything else is in it.
+Steps 1 to 6 are implemented, so the next milestone is **step 7 and step 8** — booting the image under QEMU as a regression gate, and a launch script that gives an interactive session. The QEMU caveats below are what those two have to be built around; in particular the serial console under QEMU is output-only, so an interactive session has to come from the framebuffer VT and a QEMU display, not from `-serial`.
 
 The sibling repositories live beside this one: [../boot](../boot) (a complete, working Makefile build — the closest model for what this repo should look like).
 
@@ -151,7 +190,10 @@ These apply the moment this repository boots an image, and each one reads like a
 
 - **QEMU never runs the VideoCore boot chain** — it ignores `bootcode.bin`, `start.elf` and `config.txt` on the card. The kernel and DTB must be passed as `-kernel`/`-dtb`. No `-kernel` produces *no output at all*.
 - **`earlycon=` is mandatory** or the serial console stays silent — the kernel stalls before `ttyAMA0` registers. PL011 base per SoC: `0x3f201000` (BCM2837), `0xfe201000` (BCM2711).
-- **QEMU rejects any SD image whose size is not a power of two.** This collides with sizing the shipped image to its contents for the first-boot resize: an image built to fit has to be padded up to the next power of two before it can be booted under QEMU at all. Padding also gives the resize something to grow into, so a QEMU run can actually exercise it.
+- **QEMU rejects any SD image whose size is not a power of two**, which is why `IMAGE_SIZE_MIB` is validated. Testing the first-boot resize means padding a copy of the image up to a larger power of two — 4 GiB is a good size, because it is the smallest that leaves room for both the growth and the 1 GiB swap partition the README asks for below 64 GB.
+- **The serial console under QEMU is output-only, so you cannot log in over it.** With `-machine raspi3b` and the Pi 6.18 kernel the PL011 comes up as a console with *no tty device behind it*: `/proc/consoles` shows `ttyAMA1  -W- (EC N  a)  204:65` — `-W-` meaning write, no read — `/sys/class/tty` has no `ttyAMA` entry at all, and `/dev/ttyAMA1` does not exist. Creating the node from that major:minor and opening it fails with ENXIO. Kernel messages and everything userspace prints appear on `-serial`, and nothing typed into it arrives. An interactive session has to use the framebuffer VT (`console=tty1`) with a QEMU display, which is what README step 8 asks for anyway.
+- **`console=ttyAMA0` under QEMU binds nothing** for the same reason — the port is `ttyAMA1` there. Everything still *looks* fine, because `earlycon=pl011,0x3f201000` writes to the UART registers directly and keeps printing; what is lost is `/dev/console`, which then cannot be opened at all, so userspace gets no console and no login prompt. `../boot`'s `boot-check` passes `console=ttyAMA0` and only greps for `mmcblk*: p1`, so it never noticed. Use `console=ttyAMA1,115200` when booting a full image.
+- **A getty belongs on `console`, not on the console's device name.** Any console the kernel is actually using can be reached through `/dev/console`; its own device node is the thing that may not exist. That is what `sepia-gettys` does with the console `/proc/consoles` flags `C`, using device names only for the others.
 - **The Pi 4 exposes the card as `mmcblk1` under QEMU but `mmcblk0` on real hardware**, so the QEMU `-append` root device and the `root=` in `cmdline.txt` legitimately differ.
 - The Zero 2 W device tree faults on `raspi3ap`; emulate it as `raspi3b`.
-- A green QEMU boot proves the kernel, the partition layout and (here) whether init runs. It proves nothing about `config.txt`, device-tree auto-selection or overlays — only real hardware tests those.
+- A green QEMU boot proves the kernel, the partition layout, that init runs, that the first-boot resize works and that a login prompt appears. It proves nothing about `config.txt`, device-tree auto-selection or overlays — only real hardware tests those. It also says nothing about which tty the console lands on for a real board, since QEMU's answer to that is its own.
