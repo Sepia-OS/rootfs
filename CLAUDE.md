@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Early. Steps 1 to 5 are committed (`Implemented steps 1-5`); step 6 — `overlay/` and the last three sections of the `Makefile` — is not. `README.md` is a specification of the build; of its steps **1 to 6 — the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, and the bootable image — are implemented**. Steps 7 and 8 (test under QEMU, ship a QEMU launch script) are still to be written.
+Early. Steps 1 to 6 are committed; step 7 — the last section of the `Makefile` — is not. `README.md` is a specification of the build; of its steps **1 to 7 — the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the bootable image, and the QEMU test — are implemented**. Step 8 (an interactive QEMU launch script) is still to be written.
 
 Layout, matching the sibling `boot` repository and already encoded in `.gitignore`: `overlay/` (the files that are copied into the root filesystem verbatim — source, not generated), `downloads/` (fetched upstream artifacts, kept across `clean`), `build/` (everything generated), `dist/` (release artifacts).
 
@@ -38,13 +38,17 @@ gmake image                             # build/image/sepiaos-<version>.img
 gmake image-info                        # partition table, sha256, ext4 state
 gmake image-check                       # re-read it: fsck, ownership, partition table
 gmake IMAGE_SIZE_MIB=512 image          # a roomier card image
+gmake test                              # everything below, ~45 s
+gmake boot-check                        # boot as a Pi 3, assert it reaches a login prompt
+gmake grow-check                        # boot a padded copy, assert the first-boot resize
+gmake boot-log                          # the serial log of the last boot-check
 gmake clean                             # drop build/, keep downloads/
 gmake distclean                         # also drop downloads/ (including ~600 MiB of toolchain)
 ```
 
 Every aggregate goal (`boot-partition`, `toolchain`, `musl`, `busybox`, `modules`, `rootfs`, `image`) ends with a `READY` line naming the version and where it landed. That line prints whether or not anything was rebuilt — a phony goal whose prerequisite is already built otherwise prints *nothing*, which reads exactly like a broken target.
 
-Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, and a C compiler for the host build of e2fsprogs (`brew install make jq xz`; macOS 13+ already ships `jq` at `/usr/bin/jq`). Nothing needs root, on either platform.
+Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, and a C compiler for the host build of e2fsprogs; `mtools` and `qemu-system-aarch64` for the test targets (`brew install make jq xz mtools qemu`; macOS 13+ already ships `jq` at `/usr/bin/jq`). Nothing needs root, on either platform.
 
 ### How step 1 works
 
@@ -139,6 +143,16 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - Swap sizes are the README's (1/2/4 GiB by device size, thresholds in GB as storage is sold). **On a small card the rule asks for a swap partition bigger than the space there is**; growing the filesystem is the more useful half, so when swap will not fit the whole device goes to the rootfs and the boot log says so.
 - Verified end to end under QEMU on a 4 GiB card: root 192 MiB → 3008 MiB, swap 1024 MiB at partition 3, `fstab` updated, `firstboot-done` marker written, and a second boot that does nothing but `swapon -a`.
 
+### How step 7 works
+
+`make test` is `image-check` (the image read back on the host), then `boot-check`, then `grow-check`. About 45 seconds in total, which makes it usable as the gate after any change.
+
+- **The kernel and device tree are pulled out of the image's own FAT partition** with mtools, at the offset its own MBR gives. QEMU emulates the ARM side of a Pi and not the VideoCore boot ROM, so it never reads `bootcode.bin`, `start.elf` or `config.txt` off the card and the kernel has to be handed to it as `-kernel`; taking it from anywhere else would let the test pass against a kernel the image does not carry.
+- **`boot-check` checks each step of the boot separately** rather than only looking for the login prompt: kernel up as a Pi 3, both partitions enumerated, root mounted, init started, `/` remounted read-write, first boot ran, a getty started, prompt appeared. When something breaks, *which of those is the last to pass* is the entire diagnosis. Booting with `QEMU_CONSOLE=ttyAMA0` demonstrates it — everything through the remount passes and the three userspace lines fail, which is exactly the signature of a userspace with no console.
+- **`grow-check` runs without `snapshot=on`**, because the thing under test is the reboot between the two passes of `sepia-firstboot`; it works on a copy padded to `GROW_SIZE_MIB`. It then checks the log *and* the partition table it left behind, since a resize that reports success and writes a table nothing can boot is the failure worth catching. 4 GiB is the smallest sensible card: below 64 GB the README asks for 1 GiB of swap, so anything smaller is all swap and no growth.
+- QEMU is killed as soon as the log says what was being waited for, rather than always burning `QEMU_TIMEOUT`. It has to be killed either way — with no VideoCore and no shutdown request it sits at the login prompt indefinitely.
+- **Only the Pi 3 is emulated**, which is what the README asks for. A Pi 4 run would need three changes and not more: `QEMU_MACHINE=raspi4b`, the `bcm2711-rpi-4-b.dtb`, and `QEMU_ROOTDEV=/dev/mmcblk1p2` — under QEMU the Pi 4 exposes the card as `mmcblk1` where real hardware uses `mmcblk0`. Pi 5 and CM5 have no QEMU machine at all, so BCM2712 is hardware-only.
+
 ### Make dependency layout
 
 `Makefile` is a prerequisite of the things that are **built** (`boot.img`, the musl install, the busybox binary, the module install, the staged tree, the image) but deliberately **not** of the things that are **resolved** (`*/version.env`, `boot/release.env`) or **fetched** (`modules/.fetched`). Editing a recipe should rebuild; it must never re-run a "latest" lookup and quietly move the project onto a newer upstream release, or re-clone 54 MiB of modules. The toolchain is left out of even the build half — its version is part of its path, and re-extracting 600 MiB on every edit would be absurd.
@@ -160,7 +174,7 @@ This repository is the `rootfs` component. Per `README.md` the pipeline is:
 
 Step 7 shapes step 6: the shipped image is sized to its contents, not to any particular card, so the rootfs partition is deliberately small and the first boot rewrites the partition table in place and runs `resize2fs` before rebooting. That needs a once-only marker (Raspberry Pi OS uses a `cmdline.txt` `init=` hand-off plus a flag file) — a resize that repeats on every boot, or that runs against a mounted-read-write filesystem, is the failure mode to design against.
 
-Steps 1 to 6 are implemented, so the next milestone is **step 7 and step 8** — booting the image under QEMU as a regression gate, and a launch script that gives an interactive session. The QEMU caveats below are what those two have to be built around; in particular the serial console under QEMU is output-only, so an interactive session has to come from the framebuffer VT and a QEMU display, not from `-serial`.
+Steps 1 to 7 are implemented, so the next milestone is **step 8** — a launch script that gives an interactive session rather than a headless assertion. The QEMU caveats below are what it has to be built around; in particular the serial console under QEMU is output-only, so an interactive session has to come from the framebuffer VT and a QEMU display, not from `-serial`.
 
 The sibling repositories live beside this one: [../boot](../boot) (a complete, working Makefile build — the closest model for what this repo should look like).
 

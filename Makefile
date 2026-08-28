@@ -1,8 +1,9 @@
 # SepiaOS - root filesystem builder
 #
 # Builds the SepiaOS root filesystem and, eventually, a bootable card image.
-# Implemented so far: steps 1 to 6 of README.md - the boot partition, the
-# cross-compiler, musl libc, busybox, the kernel modules, and the image.
+# Implemented so far: steps 1 to 7 of README.md - the boot partition, the
+# cross-compiler, musl libc, busybox, the kernel modules, the image, and the
+# QEMU test that boots it.
 #
 #   make boot-partition         fetch, verify and unpack the boot image
 #   make toolchain              fetch the aarch64 cross-compiler
@@ -11,6 +12,7 @@
 #   make modules                install the boot kernel's modules into it
 #   make rootfs                 stage the FHS tree that becomes partition 2
 #   make image                  assemble the bootable card image
+#   make test                   boot it under QEMU and check that it works
 #   make help                   every target
 #
 # No root and no loop mounts, so the same recipes work on macOS and Linux.
@@ -1474,6 +1476,194 @@ image-info: $(IMAGE) ## Show the finished image's layout
 	@$(E2FSCK) -fn $(ROOTFS_IMG) 2>&1 | tail -1 | sed 's/^/  ext4     /'
 	@echo "  grows to the whole card on first boot; swap is added then too"
 # ---------------------------------------------------------------------------
+# Step 7 - test the image
+#
+# `make test` boots the finished image under QEMU as a Pi 3 and reads the
+# serial log back. Two runs, because they answer different questions:
+#
+#   boot-check  the image as shipped, on a card its own size: does it get all
+#               the way to a login prompt, and does each step on the way there
+#               happen. ~30 s.
+#   grow-check  a copy of it padded to a larger card: does first boot rewrite
+#               the partition table, reboot, grow the filesystem onto it and
+#               bring up swap. ~60 s, and it is the one worth running after
+#               touching anything under overlay/usr/sbin.
+#
+# QEMU emulates the ARM side of a Pi and not the VideoCore boot ROM, so it
+# never reads bootcode.bin, start.elf or config.txt off the card: the kernel
+# and device tree have to be handed to it directly. They are pulled out of the
+# image's own FAT partition rather than kept separately, so what is tested is
+# what is in the image.
+#
+# console=ttyAMA1 is not a typo. Under this machine the PL011 comes up as
+# ttyAMA1, and console=ttyAMA0 - which is what ../boot's own boot-check passes,
+# and what looks right - binds to nothing at all. Everything still appears on
+# the serial line because earlycon writes to the UART registers directly, but
+# no console is registered, /dev/console cannot be opened, and userspace gets
+# no console and no login prompt. The failure looks like a broken image.
+#
+# A green run here proves the kernel, the partition layout, init, the first
+# boot logic and the login prompt. It proves nothing about config.txt, device
+# tree auto-selection or overlays, because QEMU never executes any of them.
+# ---------------------------------------------------------------------------
+
+QEMU_MACHINE  ?= raspi3b
+QEMU_KERNEL   ?= kernel8.img
+QEMU_DTB      ?= bcm2710-rpi-3-b.dtb
+QEMU_CONSOLE  ?= ttyAMA1
+QEMU_EARLYCON ?= pl011,0x3f201000
+QEMU_ROOTDEV  ?= /dev/mmcblk0p2
+QEMU_TIMEOUT  ?= 120
+
+# The card grow-check pretends to have been written to. A power of two, like
+# every SD image QEMU will accept, and large enough that the README's swap
+# rules leave room to grow: below 64 GB they ask for 1 GiB of swap, so a
+# smaller card than this would be all swap and no growth.
+GROW_SIZE_MIB ?= 4096
+
+QEMU_DIR   := $(BUILD_DIR)/qemu
+QEMU_STAMP := $(QEMU_DIR)/.extracted
+QEMU_LOG   := $(QEMU_DIR)/boot.log
+GROW_IMG   := $(QEMU_DIR)/grow.img
+GROW_LOG   := $(QEMU_DIR)/grow.log
+
+QEMU_APPEND = console=$(QEMU_CONSOLE),115200 earlycon=$(QEMU_EARLYCON) \
+              root=$(QEMU_ROOTDEV) rootfstype=ext4 rootwait
+
+QEMU_BASE = qemu-system-aarch64 -machine $(QEMU_MACHINE) -display none \
+            -kernel $(QEMU_DIR)/$(QEMU_KERNEL) -dtb $(QEMU_DIR)/$(QEMU_DTB) \
+            -append "$(QEMU_APPEND)"
+
+ifneq ($(filter grow-check test,$(MAKECMDGOALS)),)
+  ifneq ($(shell echo $$(( $(GROW_SIZE_MIB) & ($(GROW_SIZE_MIB) - 1) ))),0)
+    $(error GROW_SIZE_MIB must be a power of two - QEMU rejects any other SD image size, got $(GROW_SIZE_MIB))
+  endif
+endif
+
+.PHONY: test
+test: image-check boot-check grow-check ## Test the image: contents, boot to a login prompt, first-boot resize
+	@echo "  PASS     $(IMAGE) boots and grows"
+
+.PHONY: boot-check
+boot-check: $(QEMU_STAMP) ## Boot the image under QEMU as a Pi 3 and check it reaches a login prompt
+	@$(call require_qemu)
+	@echo "  BOOT     $(QEMU_MACHINE), $(IMAGE_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
+	@rm -f $(QEMU_LOG)
+	@$(call run_qemu,$(QEMU_LOG),-no-reboot -drive file=$(IMAGE)$(comma)format=raw$(comma)if=sd$(comma)snapshot=on,login:)
+	@$(call assert_booted,$(QEMU_LOG))
+	@echo "  OK       reached a login prompt"
+
+# snapshot=on is deliberately absent here and present above: this run has to
+# write, because the whole point is the reboot between the two passes of
+# sepia-firstboot. It works on a copy, so `make grow-check` twice in a row
+# tests the same thing twice rather than a fresh card and then a grown one.
+.PHONY: grow-check
+grow-check: $(QEMU_STAMP) ## Boot a copy on a larger card and check the first-boot resize and swap
+	@$(call require_qemu)
+	@mkdir -p $(QEMU_DIR)
+	@echo "  GROW     $(QEMU_MACHINE), $(GROW_SIZE_MIB) MiB card (max $(QEMU_TIMEOUT)s)"
+	@rm -f $(GROW_LOG) $(GROW_IMG)
+	@cp $(IMAGE) $(GROW_IMG)
+	@dd if=/dev/zero of=$(GROW_IMG) bs=1 count=0 seek=$$(( $(GROW_SIZE_MIB) * 1048576 )) 2>/dev/null
+	@$(call run_qemu,$(GROW_LOG),-drive file=$(GROW_IMG)$(comma)format=raw$(comma)if=sd,swap active|no swap|leaves nothing)
+	@$(call assert_grown,$(GROW_LOG),$(GROW_IMG))
+	@echo "  OK       grew to $(GROW_SIZE_MIB) MiB with swap, and came back up"
+
+# A comma cannot be written literally inside a $(call) argument list, so the
+# -drive options are joined with this instead.
+comma := ,
+
+# Run QEMU in the background and stop as soon as the log says what was being
+# waited for, rather than always burning the whole timeout. QEMU is killed
+# either way: with no VideoCore and no shutdown request it would otherwise sit
+# at the login prompt forever.
+define run_qemu
+	$(QEMU_BASE) -serial file:$(1) $(2) </dev/null >/dev/null 2>&1 & \
+	pid=$$!; \
+	for i in $$(seq $(QEMU_TIMEOUT)); do \
+	  sleep 1; \
+	  grep -aqE '$(3)' $(1) 2>/dev/null && break; \
+	  kill -0 $$pid 2>/dev/null || break; \
+	done; \
+	sleep 2; \
+	kill -9 $$pid 2>/dev/null || true; wait $$pid 2>/dev/null || true
+endef
+
+define require_qemu
+	command -v qemu-system-aarch64 >/dev/null 2>&1 || { \
+	  echo "qemu-system-aarch64 is required to test the image (brew install qemu / apt-get install qemu-system-arm)" >&2; \
+	  exit 1; }
+endef
+
+# The kernel and device tree come out of the image's own boot partition, so a
+# test can never run against a kernel the image does not carry. mtools reads
+# the FAT without mounting anything, which is the same reason ../boot uses it.
+$(QEMU_STAMP): $(IMAGE)
+	@command -v mcopy >/dev/null 2>&1 || { \
+	  echo "mtools is required to take the kernel out of the boot partition (brew install mtools / apt-get install mtools)" >&2; \
+	  exit 1; }
+	@mkdir -p $(QEMU_DIR)
+	@le32() { od -An -tu4 -j $$1 -N4 $(IMAGE) | tr -d ' '; }; \
+	 off=$$(( $$(le32 454) * 512 )); \
+	 echo "  EXTRACT  $(QEMU_KERNEL), $(QEMU_DTB) from the boot partition"; \
+	 mcopy -o -i $(IMAGE)@@$$off ::$(QEMU_KERNEL) ::$(QEMU_DTB) $(QEMU_DIR)/ || { \
+	   echo "  FAIL     $(QEMU_KERNEL) or $(QEMU_DTB) is not in the boot partition" >&2; exit 1; }
+	@touch $@
+
+# Each line of the boot is checked separately rather than just looking for the
+# login prompt, because when something does break, which of these is the last
+# one to pass is the whole diagnosis.
+define assert_booted
+	l=$(1); fail=0; \
+	check() { \
+	  if grep -aqE "$$1" "$$l"; then printf '  OK       %s\n' "$$2"; \
+	  else printf '  FAIL     %s\n' "$$2"; fail=1; fi; }; \
+	check 'Machine model: Raspberry Pi 3'   'the kernel came up as a Pi 3'; \
+	check 'mmcblk0: p1 p2'                  'both partitions were enumerated'; \
+	check 'Mounted root \(ext4 filesystem\)' 'the root filesystem mounted'; \
+	check 'Run /sbin/init as init process'  'init was started'; \
+	check 're-mounted.*r/w'                 'rcS remounted / read-write'; \
+	check 'sepia-firstboot:'                'first boot ran'; \
+	check 'sepia-gettys: login prompt'      'a getty was started'; \
+	check 'login:'                          'the login prompt appeared'; \
+	[ "$$fail" = 0 ] || { echo "  full log: $$l" >&2; exit 1; }
+endef
+
+# The log says what the guest thought it did; the partition table says what it
+# actually wrote. Both are checked, because a resize that reports success and
+# leaves a table nothing can boot is exactly the failure worth catching.
+define assert_grown
+	l=$(1); img=$(2); fail=0; \
+	check() { \
+	  if grep -aqE "$$1" "$$l"; then printf '  OK       %s\n' "$$2"; \
+	  else printf '  FAIL     %s\n' "$$2"; fail=1; fi; }; \
+	check 'sepia-firstboot: root partition .* -> '  'first boot planned a bigger layout'; \
+	check 'partition table rewritten'               'the table was rewritten'; \
+	check 'mmcblk0: p1 p2 p3'                       'the reboot came back with three partitions'; \
+	check 'resized filesystem to'                   'the kernel resized the filesystem'; \
+	check 'root filesystem resized'                 'resize2fs reported success'; \
+	check 'Adding .* swap on'                       'swap was activated'; \
+	check 'sepia-gettys: login prompt'              'a getty was started'; \
+	le32() { od -An -tu4 -j $$1 -N4 "$$img" | tr -d ' '; }; \
+	byte() { od -An -tx1 -j $$1 -N1 "$$img" | tr -d ' '; }; \
+	if [ "$$(byte 482)" = "82" ]; then printf '  OK       %s\n' "partition 3 is Linux swap"; \
+	else printf '  FAIL     %s\n' "partition 3 is type 0x$$(byte 482), expected 0x82"; fail=1; fi; \
+	grown=$$(( $$(le32 474) / 2048 )); \
+	if [ "$$grown" -gt "$$(( $(IMAGE_SIZE_MIB) ))" ]; then \
+	  printf '  OK       partition 2 is now %s MiB\n' "$$grown"; \
+	else printf '  FAIL     partition 2 is still %s MiB\n' "$$grown"; fail=1; fi; \
+	end=$$(( $$(le32 486) + $$(le32 490) )); \
+	have=$$(( $$(wc -c < "$$img") / 512 )); \
+	if [ "$$end" -le "$$have" ]; then printf '  OK       %s\n' "swap ends inside the card"; \
+	else printf '  FAIL     swap ends at sector %s, past the card\n' "$$end"; fail=1; fi; \
+	[ "$$fail" = 0 ] || { echo "  full log: $$l" >&2; exit 1; }
+endef
+
+.PHONY: boot-log
+boot-log: ## Show the serial log of the last boot-check
+	@[ -f $(QEMU_LOG) ] || { echo "no $(QEMU_LOG) - run 'make boot-check' first" >&2; exit 1; }
+	@cat $(QEMU_LOG)
+# ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -1513,6 +1703,8 @@ help: ## Show this help
 	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
 	  "IMAGE_SIZE_MIB"    "shipped image size, power of two (default $(IMAGE_SIZE_MIB))" \
 	  "ROOT_PASSWORD_HASH" "sha512-crypt for root; every $$ has to be doubled" \
+	  "GROW_SIZE_MIB"     "card size grow-check pretends to have (default $(GROW_SIZE_MIB))" \
+	  "QEMU_TIMEOUT"      "seconds to wait for a test boot (default $(QEMU_TIMEOUT))" \
 	  "JOBS"              "parallelism for the source builds (default $(JOBS))"
 	@echo
 	@echo "Examples:"
@@ -1529,3 +1721,6 @@ help: ## Show this help
 	@echo "  make rootfs                            stage the root filesystem tree"
 	@echo "  make image                             the bootable card image"
 	@echo "  make IMAGE_SIZE_MIB=512 image          a roomier one"
+	@echo "  make test                              boot it under QEMU and check it works"
+	@echo "  make boot-check                        just the boot to a login prompt"
+	@echo "  make GROW_SIZE_MIB=8192 grow-check     the first-boot resize on a bigger card"
