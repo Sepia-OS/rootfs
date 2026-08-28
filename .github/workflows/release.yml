@@ -155,6 +155,14 @@ jobs:
       # Sepia-OS/boot must actually have a full release for the former to work.
       CHANNEL: ${{ inputs.prerelease && 'prerelease' || 'release' }}
       BOOT_TAG: ${{ inputs.boot_tag }}
+      # The Makefile asks api.github.com which boot release to build against.
+      # Unauthenticated that is 60 requests an hour *per IP*, and hosted
+      # runners share their egress addresses with every other job on the
+      # platform, so the budget is routinely already spent by someone else -
+      # the build then dies two minutes in, right after busybox, with
+      # "GitHub API rate limit hit". The automatic per-run token raises it to
+      # 1000 an hour for this repository.
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Install build tools
         run: |

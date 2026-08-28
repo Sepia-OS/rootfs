@@ -189,6 +189,18 @@ Three parts: e2fsprogs, the staged tree, and the image.
 - **Keymaps are a VT thing.** They apply to keys arriving from a real keyboard; a serial console has no keymap, so `sepia-keymap` reports that it cannot find a console rather than appearing to work. This is also why the feature can only be tested through the framebuffer: `sendkey` into the emulated USB keyboard, `screendump` to read the result.
 - Verified that way end to end: `sepia-keymap set de`, then the keys QEMU calls `y` and `z` produce `zy` (QWERTZ), `shift-a` produces `A` (the modifiers survived), and `bracket_left` produces `ü` (a layout key the US map does not have).
 
+### Resolving "latest" without a single point of failure
+
+A CI run failed with `fatal: unable to access 'https://git.musl-libc.org/git/musl/': Failed to connect ... after 135878 ms`. Worth reading carefully, because the shape of it recurs: the build was resolving which musl version is current, the tarball it would have asked for **was already in the restored `downloads/` cache**, and one small upstream host being unreachable for two minutes took the whole build down anyway.
+
+- **Version resolution is the part that always needs the network**, even when every byte the build consumes is already on disk. `build/*/version.env` lives under `build/`, which is deliberately not cached, so every run re-asks.
+- musl now asks `git.musl-libc.org`, then `repo.or.cz/musl.git`, then `github.com/kraj/musl.git`, then falls back to the newest tarball already in `downloads/musl`. Both mirrors were checked to report the same latest tag as the primary. They only ever supply a *number*: the tarball still comes from `MUSL_BASE` and still has to match `checksums/`, so no mirror is trusted with bytes that reach the image.
+- busybox got the same treatment minus the mirrors — `busybox.net` is the flakiest host this build touches, and there is no index elsewhere to read — so it falls back to `downloads/busybox` and says so.
+- **`|| true` on those pipelines is load-bearing.** The recipes run under `set -e` with `pipefail`, so an unreachable host, or a `grep` that matches nothing, takes the recipe down *at the assignment* — before any of the fallback logic can look at the empty result. The first version of this fix was written without it and silently skipped every fallback; the tests below are what caught it. Same trap as the `-v8+` greps in step 5.
+- Tested by pointing the primary at `https://127.0.0.1:1/…`, which fails instantly: primary → mirror 1 → mirror 2 → cached tarball → a clear error naming `MUSL_VERSION=`, all four exercised.
+
+**A wrong first guess worth recording**: the failure was at 137 s, which is also almost exactly where the GitHub API call for the boot release lands in a cold build, and CI was passing no token — so this looked like the documented 60-requests-an-hour-per-IP limit. It was not. `gh run view --log-failed` settled it in one command; the step timings from the public API were enough to narrow it down but not to identify it. **Read the log before theorising.** (`GITHUB_TOKEN: ${{ github.token }}` was added to both workflows anyway — the Makefile has always honoured it, hosted runners do share egress IPs, and it costs nothing.)
+
 ### How the workflows work
 
 Both mirror `../boot`'s, because the two repositories are cut the same way and there is no reason for them to differ. `ci.yml` runs on every push to every branch and on pull requests against main; `release.yml` is `workflow_dispatch` only.

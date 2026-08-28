@@ -30,6 +30,17 @@ env:
   # says what it was waiting for.
   QEMU_TIMEOUT: 300
 
+  # The Makefile asks api.github.com which boot release to build against.
+  # Unauthenticated that is 60 requests an hour *per IP*, and hosted runners
+  # share their egress addresses with every other job on the platform, so the
+  # budget is routinely already spent by someone else - the build then dies two
+  # minutes in, right after busybox, with "GitHub API rate limit hit". The
+  # automatic per-run token raises it to 1000 an hour for this repository.
+  # Reading another public repository's releases works with it because they are
+  # public; the token's own permissions are still only what `permissions:`
+  # grants.
+  GITHUB_TOKEN: ${{ github.token }}
+
 jobs:
   # -------------------------------------------------------------------------
   # One job, one image, every board. Deliberately not a matrix over boards:

@@ -447,6 +447,16 @@ MUSL_SIG      = $(MUSL_VERSION)|$(MUSL_GIT)|$(MUSL_BASE)
 MUSL_GIT  := https://git.musl-libc.org/git/musl
 MUSL_BASE := https://musl.libc.org/releases
 
+# Consulted, in order, only when MUSL_GIT cannot be reached. Both are mirrors
+# of the same repository and both were checked to report the same latest tag as
+# the primary. They supply a version *number* and nothing else: the tarball
+# still comes from MUSL_BASE and still has to match checksums/, so a mirror is
+# never trusted with bytes that reach the image. repo.or.cz first because musl
+# points at it itself; the GitHub one second because when this matters the
+# build is usually running on GitHub, so it is the host least likely to be
+# unreachable at that moment. Set empty to refuse the fallback entirely.
+MUSL_GIT_MIRRORS ?= https://repo.or.cz/musl.git https://github.com/kraj/musl.git
+
 DL_MUSL       := $(DL_DIR)/musl
 MUSL_DIR      := $(BUILD_DIR)/musl
 MUSL_ENV      := $(MUSL_DIR)/version.env
@@ -471,15 +481,44 @@ $(MUSL_CFG): FORCE
 
 # --refs drops the ^{} peeled entries; sort -V is what keeps 1.2.10 above
 # 1.2.6, which a plain sort would get backwards.
+#
+# Three sources, in order, because musl's own host is small and has gone away
+# mid-build: a CI run died here after git.musl-libc.org black-holed the
+# connection for 136 seconds, on a runner whose downloads/ cache already held
+# the tarball it would have asked for. Nothing below reaches for a version that
+# has not been checked - the mirror only ever names a number, and the last
+# resort names one whose tarball is already on disk and already verified.
+# The trailing `|| true` is what makes the fallbacks reachable at all. This
+# recipe runs under `set -e` with pipefail, so an unreachable host - or a grep
+# that matches nothing - takes the whole recipe down at the assignment, before
+# anything can look at the empty result and try the next source.
+define musl_latest_tag
+git ls-remote --tags --refs $(1) 2>/dev/null | sed 's|.*refs/tags/v||' | grep -E '^[0-9]+(\.[0-9]+)+$$' | sort -V | tail -1 || true
+endef
+
 $(MUSL_ENV): $(MUSL_CFG)
 	@mkdir -p $(@D)
 	@echo "  RESOLVE  musl ($(if $(MUSL_VERSION),pinned $(MUSL_VERSION),latest release))"
 	@if [ -n '$(MUSL_VERSION)' ]; then v='$(MUSL_VERSION)'; else \
-	   v=$$(git ls-remote --tags --refs $(MUSL_GIT) \
-	        | sed 's|.*refs/tags/v||' \
-	        | grep -E '^[0-9]+(\.[0-9]+)+$$' \
-	        | sort -V | tail -1); \
-	   [ -n "$$v" ] || { echo "Could not read the tag list from $(MUSL_GIT)." >&2; exit 1; }; \
+	   v=$$($(call musl_latest_tag,$(MUSL_GIT))); \
+	   if [ -z "$$v" ]; then \
+	     for m in $(MUSL_GIT_MIRRORS); do \
+	       echo "  RETRY    $(MUSL_GIT) did not answer; asking $$m" >&2; \
+	       v=$$($(call musl_latest_tag,$$m)); \
+	       if [ -n "$$v" ]; then break; fi; \
+	     done; \
+	   fi; \
+	   if [ -z "$$v" ]; then \
+	     v=$$(ls $(DL_MUSL)/musl-*.tar.gz 2>/dev/null \
+	          | sed 's|.*/musl-||; s|\.tar\.gz$$||' | sort -V | tail -1 || true); \
+	     if [ -n "$$v" ]; then \
+	       echo "  OFFLINE  nothing answered; using musl $$v, already downloaded" >&2; \
+	     fi; \
+	   fi; \
+	   [ -n "$$v" ] || { \
+	     echo "Could not read the tag list from $(MUSL_GIT)$(if $(MUSL_GIT_MIRRORS), or any of: $(MUSL_GIT_MIRRORS))," >&2; \
+	     echo "and $(DL_MUSL) holds no tarball to fall back on. Pin one with MUSL_VERSION=." >&2; \
+	     exit 1; }; \
 	 fi; \
 	 [[ "$$v" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || { echo "Refusing musl version '$$v'." >&2; exit 1; }; \
 	 printf "MUSL_VER='%s'\n" "$$v" > $@.part
@@ -668,16 +707,32 @@ $(BB_REQUEST): FORCE
 # the question being asked; git.busybox.net would answer a slightly different
 # one and lives on the same host anyway. sort -uV keeps 1.38.0 above 1.9.2,
 # which a plain sort gets spectacularly wrong.
+#
+# busybox.net is the flakiest host this build touches, so when it does not
+# answer, a tarball already in downloads/ is used rather than failing: on a CI
+# runner with a warm cache that is exactly the version the build wanted. The
+# `|| true` on both pipelines is load-bearing - under `set -e` with pipefail a
+# failed curl, or a grep that matches nothing, would otherwise take the recipe
+# down at the assignment, before the fallback could be reached.
 $(BB_ENV): $(BB_REQUEST)
 	@mkdir -p $(@D)
 	@echo "  RESOLVE  busybox ($(if $(BUSYBOX_VERSION),pinned $(BUSYBOX_VERSION),latest release))"
 	@if [ -n '$(BUSYBOX_VERSION)' ]; then v='$(BUSYBOX_VERSION)'; else \
-	   v=$$($(CURL) "$(BUSYBOX_BASE)/" \
+	   v=$$($(CURL) "$(BUSYBOX_BASE)/" 2>/dev/null \
 	        | grep -oE 'busybox-[0-9][0-9.]*\.tar\.bz2' \
 	        | sed 's/^busybox-//; s/\.tar\.bz2$$//' \
 	        | grep -E '^[0-9]+(\.[0-9]+)+$$' \
-	        | sort -uV | tail -1); \
-	   [ -n "$$v" ] || { echo "Could not read the release list at $(BUSYBOX_BASE)/." >&2; exit 1; }; \
+	        | sort -uV | tail -1 || true); \
+	   if [ -z "$$v" ]; then \
+	     v=$$(ls $(DL_BB)/busybox-*.tar.bz2 2>/dev/null \
+	          | sed 's|.*/busybox-||; s|\.tar\.bz2$$||' | sort -V | tail -1 || true); \
+	     if [ -n "$$v" ]; then \
+	       echo "  OFFLINE  $(BUSYBOX_BASE) did not answer; using busybox $$v, already downloaded" >&2; \
+	     fi; \
+	   fi; \
+	   [ -n "$$v" ] || { \
+	     echo "Could not read the release list at $(BUSYBOX_BASE)/, and $(DL_BB) holds no" >&2; \
+	     echo "tarball to fall back on. Pin one with BUSYBOX_VERSION=." >&2; exit 1; }; \
 	 fi; \
 	 [[ "$$v" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || { echo "Refusing busybox version '$$v'." >&2; exit 1; }; \
 	 printf "BB_VER='%s'\n" "$$v" > $@.part
