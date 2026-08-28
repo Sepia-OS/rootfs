@@ -1,7 +1,8 @@
 #!/bin/sh
-# Launch a built SepiaOS image under QEMU as a Raspberry Pi 3, with a screen.
+# Launch a built SepiaOS image under QEMU as a Raspberry Pi, with a screen.
 #
-#   tools/qemu.sh              boot the newest image in build/image
+#   tools/qemu.sh              boot the newest image in build/image, as a Pi 4
+#   tools/qemu.sh -b pi3       boot it as a Pi 3 instead
 #   tools/qemu.sh -f           start over from a fresh copy of it
 #   tools/qemu.sh -t           throw away everything written this session
 #   tools/qemu.sh -i some.img  boot a particular image
@@ -50,15 +51,15 @@ FULLSCREEN=0
 # same text size. 1024x768 with the 8x16 font is a 128x48 console.
 RESOLUTION=1024x768
 
-MACHINE=raspi3b
+BOARD=pi4
+# One kernel for all three: BCM2837 and BCM2711 both boot kernel8.img, and the
+# kernel_2712.img the image also carries is for boards QEMU cannot emulate.
 KERNEL=kernel8.img
-DTB=bcm2710-rpi-3-b.dtb
-# ttyAMA1, not ttyAMA0: under this machine the PL011 registers as ttyAMA1 and
-# console=ttyAMA0 binds to nothing at all. Everything still appears here,
-# because earlycon writes to the UART registers directly, but no console gets
-# registered and userspace ends up with none.
+# ttyAMA1, not ttyAMA0: on every one of these machines the PL011 registers as
+# ttyAMA1 and console=ttyAMA0 binds to nothing at all. Everything still appears
+# here, because earlycon writes to the UART registers directly, but no console
+# gets registered and userspace ends up with none.
 CONSOLE=ttyAMA1
-ROOTDEV=/dev/mmcblk0p2
 
 die() { echo "qemu.sh: $*" >&2; exit 1; }
 
@@ -66,9 +67,10 @@ usage() {
 	cat <<EOF
 usage: tools/qemu.sh [options]
 
-Boots a SepiaOS image under QEMU as a Raspberry Pi 3. The login prompt appears
+Boots a SepiaOS image under QEMU as a Raspberry Pi. The login prompt appears
 in the window QEMU opens; the kernel log appears here. Ctrl-A X quits.
 
+  -b BOARD   pi-zero2w, pi3 or pi4 (default: $BOARD)
   -i IMAGE   image to boot (default: the newest build/image/sepiaos-*.img)
   -c COPY    working copy to boot (default: build/qemu/run.img)
   -s MiB     size of the working copy, a power of two (default: $SIZE_MIB)
@@ -80,6 +82,17 @@ in the window QEMU opens; the kernel log appears here. Ctrl-A X quits.
   -D DISPLAY pass a specific -display to QEMU (cocoa, gtk, sdl, vnc=:1, none)
              instead of the default, which is the host's own with scaling on
   -h         this help
+
+A Pi 4 needs dtc installed ('brew install dtc'). Its device tree disables the
+on-SoC USB controller, because a real Pi 4 has its ports behind PCIe, which
+QEMU does not emulate - so the emulated keyboard never appears unless that one
+property is turned back on in the extracted copy of the tree. Without dtc the
+Pi 4 still boots and can be watched; it just cannot be typed at.
+
+Each board is given the most memory QEMU will give it: 1 GiB as a Pi 3 or a
+Zero 2 W, 2 GiB as a Pi 4. That is not an option because QEMU does not make it
+one - each machine is pinned to the memory of the board revision it emulates
+and refuses every other size.
 
 The window can be resized and the console scales with it. That is the only way
 to make the text bigger: the Raspberry Pi kernel has just two console fonts
@@ -99,8 +112,9 @@ next time. For a headless check that the image boots, use 'make test'.
 EOF
 }
 
-while getopts 'i:c:s:r:D:Ffth' opt; do
+while getopts 'b:i:c:s:r:D:Ffth' opt; do
 	case "$opt" in
+		b) BOARD=$OPTARG ;;
 		i) IMAGE=$OPTARG ;;
 		c) COPY=$OPTARG ;;
 		s) SIZE_MIB=$OPTARG ;;
@@ -113,6 +127,37 @@ while getopts 'i:c:s:r:D:Ffth' opt; do
 		*) usage >&2; exit 2 ;;
 	esac
 done
+
+# The boards this can boot, and what QEMU has to be told for each. The same
+# table the Makefile's test targets use, with the same two surprises in it:
+#
+#   - The Zero 2 W is emulated as a 3B and not a 3A+, because its device tree
+#     takes a synchronous external abort in bcm2835_power_probe on raspi3ap.
+#     One consequence worth knowing: it therefore gets the 3B's gigabyte where
+#     the real board has half of one.
+#   - The Pi 4 exposes the card as mmcblk1 where BCM2837 and real hardware both
+#     use mmcblk0, so root= follows the machine rather than the board.
+#
+# Pi 5 and CM5 are absent because QEMU has no BCM2712 machine at all.
+USB_NODE=
+case "$BOARD" in
+	pi-zero2w|zero2w) BOARD=pi-zero2w; MACHINE=raspi3b; DTB=bcm2710-rpi-zero-2-w.dtb ;;
+	pi3)              MACHINE=raspi3b; DTB=bcm2710-rpi-3-b.dtb ;;
+	pi4)              MACHINE=raspi4b; DTB=bcm2711-rpi-4-b.dtb; USB_NODE=/soc/usb@7e980000 ;;
+	*) die "-b takes pi-zero2w, pi3 or pi4, got '$BOARD'" ;;
+esac
+
+# How much memory each board gets, and it is the most there is. QEMU pins every
+# raspi machine to the RAM of the board revision it emulates and rejects any
+# other -m outright - "Invalid RAM size, should be 1 GiB" - which was measured
+# by asking each machine for 512M, 1G, 2G, 4G and 8G. So -m here states the
+# maximum rather than choosing it, and a QEMU that ever changes the rule says
+# so on the way up instead of quietly booting with less. There is no machine
+# property for the board revision either, so no 8 GiB Pi 4 is to be had.
+case "$MACHINE" in
+	raspi3b) MEMORY=1G; ROOTDEV=/dev/mmcblk0p2 ;;
+	raspi4b) MEMORY=2G; ROOTDEV=/dev/mmcblk1p2 ;;
+esac
 
 command -v qemu-system-aarch64 >/dev/null 2>&1 \
 	|| die "qemu-system-aarch64 is not installed (brew install qemu / apt-get install qemu-system-arm)"
@@ -180,10 +225,43 @@ fi
 start=$(od -An -tu4 -j 454 -N4 "$IMAGE" | tr -d ' ')
 [ -n "$start" ] && [ "$start" -gt 0 ] || die "$IMAGE has no partition 1"
 
-if [ ! -f "$WORKDIR/$KERNEL" ] || [ "$IMAGE" -nt "$WORKDIR/$KERNEL" ]; then
+# The device tree is named per board, so switching boards extracts the one the
+# new board needs rather than reusing whatever was there.
+if [ ! -f "$WORKDIR/$KERNEL" ] || [ ! -f "$WORKDIR/$DTB" ] \
+   || [ "$IMAGE" -nt "$WORKDIR/$KERNEL" ]; then
 	echo "qemu.sh: taking $KERNEL and $DTB out of the boot partition"
 	mcopy -o -i "$IMAGE@@$(( start * 512 ))" "::$KERNEL" "::$DTB" "$WORKDIR/" \
 		|| die "$KERNEL or $DTB is not in the boot partition of $IMAGE"
+fi
+
+# A Pi 4 has no keyboard under QEMU until this one property is flipped, and
+# without a keyboard the window shows a login prompt that cannot be answered.
+#
+# On a real Pi 4 the USB ports hang off a VL805 XHCI behind PCIe, so
+# bcm2711-rpi-4-b.dtb ships the on-SoC controller as status = "disabled" and
+# only the dwc2 overlay ever turns it on. QEMU is the other way round: it
+# emulates the on-SoC controller and no PCIe at all. So -device usb-kbd attaches
+# on QEMU's side - `info usb` lists it - and the guest never enumerates it,
+# because as far as the kernel is concerned there is no controller there.
+# Verified by screendump both ways: as shipped, typing at the Pi 4 login prompt
+# does nothing at all; with the node enabled the keyboard comes up on
+# fe980000.usb and `root` appears at the prompt.
+#
+# Only the extracted copy under build/qemu is touched, never the image, and
+# only for the machine that needs it - the Pi 3 and the Zero 2 W have their
+# controller enabled already, which is why they have always worked here.
+if [ -n "$USB_NODE" ]; then
+	if command -v fdtput >/dev/null 2>&1 && command -v fdtget >/dev/null 2>&1; then
+		if [ "$(fdtget "$WORKDIR/$DTB" "$USB_NODE" status 2>/dev/null)" != okay ]; then
+			fdtput -t s "$WORKDIR/$DTB" "$USB_NODE" status okay \
+				|| die "could not enable $USB_NODE in $WORKDIR/$DTB"
+			echo "qemu.sh: enabled the on-SoC USB controller in $DTB, so the keyboard works"
+		fi
+	else
+		echo "qemu.sh: dtc is not installed, so this $BOARD gets a screen and no keyboard."
+		echo "qemu.sh: 'brew install dtc' (or apt-get install device-tree-compiler) fixes it;"
+		echo "qemu.sh: 'tools/qemu.sh -b pi3' needs nothing."
+	fi
 fi
 
 # First boot grows the filesystem into the card and reboots, and that reboot is
@@ -205,7 +283,7 @@ if [ ! -f "$PREPARED" ]; then
 	echo "qemu.sh: running first boot headlessly, so the window opens on a settled system"
 	rm -f "$prepare_log"
 	qemu-system-aarch64 \
-		-machine "$MACHINE" -display none \
+		-machine "$MACHINE" -m "$MEMORY" -display none \
 		-kernel "$WORKDIR/$KERNEL" -dtb "$WORKDIR/$DTB" \
 		-drive file="$COPY",format=raw,if=sd \
 		-append "console=$CONSOLE,115200 root=$ROOTDEV rootfstype=ext4 rootwait" \
@@ -244,9 +322,9 @@ if [ "$THROWAWAY" = 1 ]; then
 fi
 
 if [ "$DISPLAY_ARG" = none ]; then
-	echo "qemu.sh: $MACHINE, $SIZE_MIB MiB card, no display - there is no way to log in"
+	echo "qemu.sh: $BOARD as $MACHINE, $MEMORY, $SIZE_MIB MiB card, no display - there is no way to log in"
 else
-	echo "qemu.sh: $MACHINE, $SIZE_MIB MiB card, ${RESOLUTION} screen, login prompt is in the QEMU window"
+	echo "qemu.sh: $BOARD as $MACHINE, $MEMORY, $SIZE_MIB MiB card, ${RESOLUTION} screen, login prompt is in the QEMU window"
 	echo "qemu.sh: resize the window to scale the console up; -F starts full screen"
 fi
 echo "qemu.sh: Ctrl-A X quits, Ctrl-A C opens the QEMU monitor"
@@ -280,7 +358,7 @@ while :; do
 	started=$(date +%s)
 
 	qemu-system-aarch64 \
-		-machine "$MACHINE" \
+		-machine "$MACHINE" -m "$MEMORY" \
 		${DISPLAY_ARG:+-display "$DISPLAY_ARG"} \
 		-name "SepiaOS" \
 		-no-reboot \

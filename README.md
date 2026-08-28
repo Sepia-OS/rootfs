@@ -75,10 +75,29 @@ The image shall be tested by booting it in Qemu on a Pi3.
 
 ### Create Qemu launch script
 
-The launchscript shall take the built bootable image and launch Qemu (Pi3)
-with that image. Any debug outputs of Qemu shall go to the console of the
-host. The guest in Qemu shall open a screen such that the booted OS can be
-used (login, start cli tools etc.).
+The launchscript shall take the built bootable image and launch Qemu with
+that image as a Pi Zero 2 W, a Pi 3 or a Pi 4 - a Pi 4 unless told otherwise -
+and shall give each board the most memory Qemu allows it. Any debug outputs of
+Qemu shall go to the console of the host. The guest in Qemu shall open a screen
+such that the booted OS can be used (login, start cli tools etc.).
+
+```sh
+tools/qemu.sh              # boot the newest image as a Pi 4, with 2 GiB
+tools/qemu.sh -b pi3       # as a Pi 3, with 1 GiB
+tools/qemu.sh -b pi-zero2w # as a Zero 2 W, which Qemu emulates as a 3B
+```
+
+Memory is not a setting. Qemu pins each of its `raspi` machines to the RAM of
+the board revision it emulates and refuses any other `-m`, so a Pi 3 or a Zero
+2 W gets 1 GiB and a Pi 4 gets 2 GiB - there is no 8 GiB Pi 4 to be had, and
+the Zero 2 W gets twice what the real board has.
+
+Being typed at as a Pi 4 needs `dtc` on the host. A real Pi 4 has its USB ports
+behind PCIe, which Qemu does not emulate, so `bcm2711-rpi-4-b.dtb` disables the
+on-SoC USB controller and the emulated keyboard never appears; the launcher
+turns that one property back on in its extracted copy of the device tree. Where
+`dtc` is missing it says so - a Pi 4 then boots and can be watched, but not
+used, and `-b pi3` needs nothing.
 
 ## Console keyboard layouts
 
