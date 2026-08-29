@@ -1367,6 +1367,18 @@ $(WIRELESS_ENV): $(WIRELESS_CFG)
 # it asks pkg-config only about optional test libraries, so a stub that answers
 # "not installed" to every question gives the same configuration as a host with
 # a real pkg-config and no libcheck. A real one is used whenever there is one.
+#
+# YACC=false FLEX=false for the same reason and with the same justification.
+# libnl's configure ends with a bare `test -z "$$YACC"` and `test -z "$$FLEX"`
+# and fails if either is empty - it never runs them - and the two libraries
+# built here need no generated parser, only lib/route does. Setting them
+# satisfies that check without adding two build-time dependencies that would
+# exist purely to go unused: macOS ships flex and bison, but a Debian container
+# does not, which is exactly where this first failed. `false` rather than a
+# plausible name on purpose - if a future libnl ever does invoke the parser
+# generator, it exits non-zero and the build stops, instead of quietly
+# producing nothing. Verified by configuring and building both libraries with
+# these settings on a host that does have flex and bison.
 $(LIBNL_STAMP): $(WIRELESS_ENV) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
 	@source $(WIRELESS_ENV); t=libnl-$$LIBNL_VER.tar.gz; \
 	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(LIBNL_REPO)/releases/download/libnl$$(echo $$LIBNL_VER | tr . _)/$$t,libnl-$$LIBNL_VER); \
@@ -1382,6 +1394,7 @@ $(LIBNL_STAMP): $(WIRELESS_ENV) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
 	   PATH=$$p:$$PATH; export PATH; \
 	 fi; \
 	 ( cd $$s && ./configure --host=aarch64-linux --prefix=/usr --disable-static --disable-cli \
+	     YACC=false FLEX=false \
 	     CC=$(CROSS)gcc AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
 	     CFLAGS="-Os --sysroot=$(abspath $(SYSROOT))" \
 	     LDFLAGS="--sysroot=$(abspath $(SYSROOT)) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
