@@ -3,6 +3,7 @@
 #
 #   tools/qemu.sh              boot the newest image in build/image, as a Pi 4
 #   tools/qemu.sh -b pi3       boot it as a Pi 3 instead
+#   tools/qemu.sh -n           boot it with no network device at all
 #   tools/qemu.sh -f           start over from a fresh copy of it
 #   tools/qemu.sh -t           throw away everything written this session
 #   tools/qemu.sh -i some.img  boot a particular image
@@ -46,6 +47,7 @@ FRESH=0
 THROWAWAY=0
 DISPLAY_ARG=
 FULLSCREEN=0
+NETWORK=1
 # The framebuffer the guest is told to use. Smaller means fewer, larger
 # characters once the window is scaled up; larger means a bigger window at the
 # same text size. 1024x768 with the 8x16 font is a 128x48 console.
@@ -71,6 +73,7 @@ Boots a SepiaOS image under QEMU as a Raspberry Pi. The login prompt appears
 in the window QEMU opens; the kernel log appears here. Ctrl-A X quits.
 
   -b BOARD   pi-zero2w, pi3 or pi4 (default: $BOARD)
+  -n         no network device (by default the guest gets one)
   -i IMAGE   image to boot (default: the newest build/image/sepiaos-*.img)
   -c COPY    working copy to boot (default: build/qemu/run.img)
   -s MiB     size of the working copy, a power of two (default: $SIZE_MIB)
@@ -82,6 +85,12 @@ in the window QEMU opens; the kernel log appears here. Ctrl-A X quits.
   -D DISPLAY pass a specific -display to QEMU (cocoa, gtk, sdl, vnc=:1, none)
              instead of the default, which is the host's own with scaling on
   -h         this help
+
+The guest is given a network unless -n says otherwise, on QEMU's user-mode
+networking: the guest leases 10.0.2.15, the host is 10.0.2.2 and answers DNS on
+10.0.2.3. That is enough to reach out - ping, nslookup, wget - and nothing can
+reach in without a -hostfwd, which this does not set up. The device is a USB
+one because QEMU emulates no Pi's own ethernet on any board.
 
 A Pi 4 needs dtc installed ('brew install dtc'). Its device tree disables the
 on-SoC USB controller, because a real Pi 4 has its ports behind PCIe, which
@@ -105,16 +114,19 @@ again, which is the only way a reboot works here - see the comment above the
 launch loop. 'halt', 'poweroff' and Ctrl-A X end the session instead.
 
 The image itself is never written to. It is copied once to the working copy and
-padded out to -s, which is what gives first boot a card to grow into; that
-first boot is then run headlessly, once, before the window opens. After that
-the same copy is reused, so a changed password or an added file is still there
-next time. For a headless check that the image boots, use 'make test'.
+padded out to -s, which is what gives first boot a card to grow into. That
+first boot happens in the window: it asks what the network and the keyboard
+should be, grows the filesystem and reboots, and the guest comes straight back.
+After that the same copy is reused, so a changed password or an added file is
+still there next time. For a headless check that the image boots, use
+'make test'.
 EOF
 }
 
-while getopts 'b:i:c:s:r:D:Ffth' opt; do
+while getopts 'b:i:c:s:r:D:Ffnth' opt; do
 	case "$opt" in
 		b) BOARD=$OPTARG ;;
+		n) NETWORK=0 ;;
 		i) IMAGE=$OPTARG ;;
 		c) COPY=$OPTARG ;;
 		s) SIZE_MIB=$OPTARG ;;
@@ -208,7 +220,7 @@ fi
 [ -n "$COPY" ] || COPY=$WORKDIR/run.img
 mkdir -p "$(dirname -- "$COPY")" "$WORKDIR"
 
-[ "$FRESH" = 1 ] && rm -f "$COPY" "$COPY.prepared"
+[ "$FRESH" = 1 ] && rm -f "$COPY"
 
 if [ ! -f "$COPY" ]; then
 	echo "qemu.sh: copying $(basename -- "$IMAGE") to $COPY and padding it to $SIZE_MIB MiB"
@@ -264,55 +276,37 @@ if [ -n "$USB_NODE" ]; then
 	fi
 fi
 
-# First boot grows the filesystem into the card and reboots, and that reboot is
-# worth getting out of the way before the window opens. QEMU's raspi3b does not
-# come back from a warm reset cleanly: the framebuffer comes back with its red
-# and blue channels swapped, and the serial console stops producing output
-# altogether, so an interactive session that starts before the reboot ends up
-# unreadable in the window and silent in the terminal. A cold boot of an
-# already-grown card has neither problem.
+# First boot happens in the window, like everything else. It grows the
+# filesystem into the card, asks its two setup questions and reboots, and all
+# three want a person watching: the questions are on the framebuffer, and the
+# kernel output belongs on this terminal.
 #
-# The pass runs headless with the serial as the only console - no console=tty1 -
-# so that what first boot says arrives in a log rather than on a framebuffer
-# nobody is looking at.
-PREPARED=$COPY.prepared
-PREPARE_TIMEOUT=180
-
-if [ ! -f "$PREPARED" ]; then
-	prepare_log=$WORKDIR/first-boot.log
-	echo "qemu.sh: running first boot headlessly, so the window opens on a settled system"
-	rm -f "$prepare_log"
-	qemu-system-aarch64 \
-		-machine "$MACHINE" -m "$MEMORY" -display none \
-		-kernel "$WORKDIR/$KERNEL" -dtb "$WORKDIR/$DTB" \
-		-drive file="$COPY",format=raw,if=sd \
-		-append "console=$CONSOLE,115200 root=$ROOTDEV rootfstype=ext4 rootwait" \
-		-serial file:"$prepare_log" </dev/null >/dev/null 2>&1 &
-	prepare_pid=$!
-	i=0
-	while [ "$i" -lt "$PREPARE_TIMEOUT" ]; do
-		sleep 1
-		i=$((i + 1))
-		if grep -aq 'sepia-gettys: login prompt' "$prepare_log" 2>/dev/null; then break; fi
-		if ! kill -0 "$prepare_pid" 2>/dev/null; then break; fi
-	done
-	sleep 1
-	kill -9 "$prepare_pid" 2>/dev/null || true
-	wait "$prepare_pid" 2>/dev/null || true
-	if grep -aq 'sepia-gettys: login prompt' "$prepare_log" 2>/dev/null; then
-		# The serial log carries CRLF; without stripping the CR every line
-		# printed here returns the cursor and overwrites the one before it.
-		tr -d '\r' < "$prepare_log" | sed -n 's/^sepia-firstboot: /qemu.sh:   /p' 
-		touch "$PREPARED"
-	else
-		echo "qemu.sh: first boot did not finish in ${PREPARE_TIMEOUT}s - starting anyway"
-		echo "qemu.sh: what it managed is in $prepare_log"
-	fi
-fi
+# It used to run headlessly here first, on the grounds that QEMU's raspi3b does
+# not come back from a warm reset cleanly - the framebuffer returns with its
+# red and blue channels swapped and the serial goes quiet. That does not apply
+# to the session below, which passes -no-reboot: the guest's reset becomes a
+# clean exit and the loop starts it again cold, which is the case that was
+# always fine. Running it headlessly also swallowed the setup questions, since
+# a serial console is not one sepia-firstboot will ask on.
 
 fullscreen=
 if [ "$FULLSCREEN" = 1 ]; then
 	fullscreen=-full-screen
+fi
+
+# QEMU emulates no Pi's own ethernet on any board it has: it says so about the
+# Pi 4 on the way up ("brcm,bcm2711-genet-v5 has been disabled!"), and it has no
+# model of the LAN9514 behind the Pi 3's internal USB hub either. So a network
+# here means a USB one. The guest calls it usb0 rather than eth0, loads a module
+# for it - nothing in the image autoloads modules, sepia-network does that - and
+# udhcpc takes the 10.0.2.15 lease QEMU's built-in server always hands out.
+#
+# Only this run gets it, never the first-boot pass above. That pass reboots, and
+# QEMU's raspi3b does not come back from a warm reset with a USB device attached
+# to its dwc2 controller - the same reason the keyboard is not attached there.
+netdevice=
+if [ "$NETWORK" = 1 ]; then
+	netdevice="-netdev user,id=n0 -device usb-net,netdev=n0"
 fi
 
 snapshot=
@@ -326,6 +320,9 @@ if [ "$DISPLAY_ARG" = none ]; then
 else
 	echo "qemu.sh: $BOARD as $MACHINE, $MEMORY, $SIZE_MIB MiB card, ${RESOLUTION} screen, login prompt is in the QEMU window"
 	echo "qemu.sh: resize the window to scale the console up; -F starts full screen"
+fi
+if [ "$NETWORK" = 1 ]; then
+	echo "qemu.sh: with a network - the guest leases 10.0.2.15, the host is 10.0.2.2"
 fi
 echo "qemu.sh: Ctrl-A X quits, Ctrl-A C opens the QEMU monitor"
 
@@ -366,6 +363,7 @@ while :; do
 		-dtb "$WORKDIR/$DTB" \
 		-drive file="$COPY",format=raw,if=sd"$snapshot" \
 		-device usb-kbd \
+		$netdevice \
 		$fullscreen \
 		-append "console=$CONSOLE,115200 console=tty1 $FBARGS root=$ROOTDEV rootfstype=ext4 rootwait" \
 		-chardev stdio,id=sepia-console,mux=on,signal=off,logfile="$CONSOLE_LOG" \

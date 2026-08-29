@@ -1,0 +1,55 @@
+#!/bin/sh
+# What udhcpc does with a lease. The name is not a choice: busybox is compiled
+# with CONFIG_UDHCPC_DEFAULT_SCRIPT="/usr/share/udhcpc/default.script" and runs
+# exactly that unless -s says otherwise.
+#
+# udhcpc passes the event as $1 and everything else in the environment:
+# $interface, $ip, $mask (a prefix length), $subnet (the same thing dotted),
+# $broadcast, $router, $dns, $domain and $lease. Nothing here may assume any of
+# them is set - a server that offers an address and no gateway is unusual but
+# not wrong - so every use is guarded.
+
+RESOLV=/etc/resolv.conf
+
+case "$1" in
+	deconfig)
+		# Before the first lease, and after one is lost. The link is left up
+		# with no address rather than taken down: a DISCOVER has to go out of
+		# it, and an interface that is down cannot send one.
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		ip link set "$interface" up
+		;;
+
+	renew|bound)
+		# Flush first. A renew that comes back with a different address would
+		# otherwise leave the old one on the interface as well, and the source
+		# address picked for a connection is then anyone's guess.
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		ip -4 addr add "$ip/${mask:-24}" \
+			${broadcast:+broadcast "$broadcast"} dev "$interface"
+		ip link set "$interface" up
+
+		if [ -n "${router:-}" ]; then
+			# Same reasoning for the default route: replace, never add to.
+			while ip -4 route del default dev "$interface" 2>/dev/null; do :; done
+			for r in $router; do
+				ip -4 route add default via "$r" dev "$interface" 2>/dev/null
+			done
+		fi
+
+		# Written whole and moved into place, so that nothing ever reads a
+		# half-finished resolv.conf.
+		{
+			echo "# Written by udhcpc for $interface; rewritten on every lease."
+			[ -n "${domain:-}" ] && echo "search $domain"
+			for s in ${dns:-}; do echo "nameserver $s"; done
+		} > "$RESOLV.$$" && mv -f "$RESOLV.$$" "$RESOLV"
+		;;
+
+	leasefail|nak)
+		# Nothing to undo: the address stays until deconfig says otherwise, so
+		# a momentary failure to renew does not drop a working network.
+		;;
+esac
+
+exit 0

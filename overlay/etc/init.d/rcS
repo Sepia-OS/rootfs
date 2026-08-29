@@ -33,6 +33,11 @@ hostname -F /etc/hostname
 
 swapon -a 2>/dev/null
 
+# Networking, as /etc/network.conf asks for it. Bounded on purpose: a DHCP
+# server that does not answer costs a few seconds here and is then waited for
+# in the background, rather than holding the login prompt up behind it.
+/usr/sbin/sepia-network up
+
 # Before the getty, so the first thing typed at the login prompt is already in
 # the configured layout. Silent when there is no screen attached.
 /usr/bin/sepia-keymap apply

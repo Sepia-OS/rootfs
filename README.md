@@ -57,7 +57,22 @@ for the user is started.
 The user `root` is created with the password `sepiaos` by default. When the
 `root` user logs in for the first time, the user must change the password.
 
-On the first boot,
+On the first boot the user shall first be asked two questions, and the answers
+shall be saved for the system:
+
+- what the network should be - 1) Ethernet (DHCP), 2) Wifi (DHCP), 3) Both,
+  4) None. Choosing wifi also asks for the network name, the passphrase and a
+  country code.
+- which console keymap to use, chosen by number from a list of every keymap
+  installed on the image.
+
+The questions are asked on the screen, since answering them needs a keyboard: a
+board booting to a serial console keeps the defaults (ethernet on DHCP, and
+whichever keymap is configured), and `sepia-network` and `sepia-keymap` change
+either of them at any time afterwards. An unanswered question leaves the
+defaults in place rather than holding the boot up.
+
+Then, still on the first boot,
 - the rootfs shall be enlarged such that the entire space of the data storage
   (SD Card, USB Stick, SSD) is used, minus the size of the swap partition (see
   next step)
@@ -85,7 +100,14 @@ such that the booted OS can be used (login, start cli tools etc.).
 tools/qemu.sh              # boot the newest image as a Pi 4, with 2 GiB
 tools/qemu.sh -b pi3       # as a Pi 3, with 1 GiB
 tools/qemu.sh -b pi-zero2w # as a Zero 2 W, which Qemu emulates as a 3B
+tools/qemu.sh -n           # with no network device at all
 ```
+
+The guest is given a network unless `-n` says otherwise. It is a USB device,
+because Qemu emulates no Pi's own ethernet on any board, and the guest sees it
+as `usb0`: it leases 10.0.2.15 from Qemu's own server, reaches the host at
+10.0.2.2 and resolves names through 10.0.2.3. Outbound only - nothing reaches
+in without a `-hostfwd`, which the launcher does not set up.
 
 Memory is not a setting. Qemu pins each of its `raspi` machines to the RAM of
 the board revision it emulates and refuses any other `-m`, so a Pi 3 or a Zero
@@ -204,3 +226,80 @@ the user who downlaoded it.
 ## Networking
 
 Networking shall be configurable, either ethernet or wifi or both.
+
+Both are described in `/etc/network.conf` and applied by
+`/usr/sbin/sepia-network`, which `/etc/init.d/rcS` runs at boot. The two
+interfaces are independent: each is off, on DHCP, or on a static address, so
+"ethernet or wifi or both" is just the combinations that fall out of that. Out
+of the box it is ethernet on DHCP and wifi off.
+
+```sh
+sepia-network status                  # what is configured, and what is up
+sepia-network ethernet dhcp
+sepia-network ethernet static 192.168.1.50/24 192.168.1.1 1.1.1.1
+sepia-network ethernet off
+sepia-network wifi 'my network' 'the passphrase' DE
+sepia-network wifi off
+sepia-network up                      # or down, or restart; ethernet, wifi or both
+```
+
+Each command writes the choice to `/etc/network.conf` and applies it straight
+away. The file is mode 0600, because the wifi passphrase is in it, and it can
+equally be edited by hand.
+
+Nothing about this holds up the boot. A DHCP server that does not answer costs
+a few seconds and is then waited for in the background; an interface that has
+not appeared yet is waited for for ten seconds, because on a Pi 3 the ethernet
+is a USB device that is still enumerating when `rcS` gets here.
+
+### Ethernet
+
+Nothing has to be built for it. Every Pi's own adapter is in the kernel already
+— `genet` on a Pi 4, Pi 5 and CM4, `smsc95xx` on a Pi 3, `lan78xx` on a 3B+ —
+and busybox brings `udhcpc`, `ip`, `ping` and `nslookup`. A USB adapter works
+too: nothing in this system autoloads modules, so `sepia-network` asks each
+device on the USB and SDIO buses which module it wants and loads that, the way
+udev would.
+
+### Wifi
+
+Wifi needs three things ethernet does not, all built by `make wireless` and
+installed into the image:
+
+- the Broadcom firmware and its per-board NVRAM, from the same package
+  Raspberry Pi OS installs. Every chip Raspberry Pi has shipped is covered:
+  43430, 43436, 43455 and 43456, which between them are every supported board.
+- `libnl`, because `wpa_supplicant` speaks to the kernel over nl80211 and that
+  is a netlink protocol.
+- `wpa_supplicant`, built against its own internal TLS and libtommath so that
+  nothing here needs OpenSSL. That covers WPA and WPA2 with a passphrase.
+
+Image builds carry wifi by default (`WITH_WIFI=1`). `WITH_WIFI=0` is an
+option, not a default, and leaves all three out - worth having for more than
+the build time it saves, since the firmware is redistributable but not free and
+an image that carries none of it is a reasonable thing to want.
+
+The country code is passed to the supplicant as `country=`. Without one the
+radio is held to the channels that are legal everywhere.
+
+```sh
+make wireless          # firmware, libnl and wpa_supplicant
+make wireless-info     # versions, size, and which chips the firmware covers
+make WITH_WIFI=0 image # optional: an image with no wifi in it at all
+```
+
+### What the tests cover
+
+`make net-check` boots the image with a network attached and reads the serial
+log back: a driver gets loaded for a device nothing autoloads for, the
+interface is found without its name being assumed, and DHCP puts an address and
+a default route on it. Logging in and using it - `nslookup` through the leased
+resolver, `ping` out - was checked by driving the framebuffer console.
+
+Wifi cannot be tested that way, and it is worth being plain about it: QEMU
+emulates no wifi hardware of any kind, so there is nothing for the firmware to
+load onto and nothing to associate with. What has been checked is that
+`wpa_supplicant` runs on the target and finds its libraries, that the firmware
+is in the image, and that the wireless path in `sepia-network` drives a
+`mac80211_hwsim` radio. Whether a real Pi joins a real network is a question
+only a real Pi can answer.

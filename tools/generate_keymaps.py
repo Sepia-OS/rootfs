@@ -145,23 +145,40 @@ uk[1].update({3: ord('"'), 4: ord('£'), 40: ord('@'), 41: ord('~'), 43: ord('~'
 custom_modifications["uk"] = uk
 
 # --- 2. GERMAN (de) ---
+# The T1 layout, key for key. Two things here were wrong for a long time and
+# are worth naming, because both were invisible until somebody typed them:
+#
+#   - **The comma and full stop keys carry ; and : when shifted**, not < and >.
+#     Not stating that left the US values in place, so shift-. gave > and there
+#     was no way to type a colon at all - while < and > turned up in a place
+#     German does not have them. The real < > | key is scancode 86, next to the
+#     left shift, and it was always fine.
+#   - **The dead-key pair is acute unshifted, grave shifted**, the way the key
+#     is printed. It was the other way round.
 de = make_layout_base()
-# Handle QWERTZ key flips and localized umlauts
+# QWERTZ, the umlauts, and the punctuation German moves.
 de[0].update({
-    12: ord('ß'), 13: ord('`'), 21: ord('z'), 26: ord('ü'), 27: ord('+'),
-    39: ord('ö'), 40: ord('ä'), 41: ord('^'), 43: ord('#'), 44: ord('y'), 53: ord('-')
+    12: ord('ß'), 13: ord('´'), 21: ord('z'), 26: ord('ü'), 27: ord('+'),
+    39: ord('ö'), 40: ord('ä'), 41: ord('^'), 43: ord('#'), 44: ord('y'),
+    53: ord('-')
 })
 de[1].update({
     2: ord('!'), 3: ord('"'), 4: ord('§'), 5: ord('$'), 6: ord('%'),
     7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='),
-    12: ord('?'), 13: ord('´'), 21: ord('Z'), 26: ord('Ü'), 27: ord('*'),
-    39: ord('Ö'), 40: ord('Ä'), 41: ord('°'), 43: ord('\''), 44: ord('Y'), 50: ord('M'), 53: ord('_')
+    12: ord('?'), 13: ord('`'), 21: ord('Z'), 26: ord('Ü'), 27: ord('*'),
+    39: ord('Ö'), 40: ord('Ä'), 41: ord('°'), 43: ord('\''), 44: ord('Y'),
+    50: ord('M'), 51: ord(';'), 52: ord(':'), 53: ord('_')
 })
-# AltGr bindings for syntax characters
+# AltGr, where German actually puts it: the braces and brackets on the digits,
+# not on the letters above them. Every one of these is stated even where the
+# kernel's own AltGr table already agrees, so that the layout describes itself
+# rather than depending on what the map underneath happens to hold.
 de[2].update({
-    3: ord('²'), 4: ord('³'), 11: ord('}'), 12: ord('\\'), 16: ord('@'),
-    18: 8364, # € Symbol (Unicode value)
-    24: ord('['), 25: ord(']'), 30: ord('æ'), 43: ord('~'), 50: ord('µ'), 26: ord('{')
+    3: ord('²'), 4: ord('³'),
+    8: ord('{'), 9: ord('['), 10: ord(']'), 11: ord('}'), 12: ord('\\'),
+    16: ord('@'),
+    18: 8364,  # € - Unicode, so it does not fit a keysym; dropped with a note
+    27: ord('~'), 50: ord('µ')
 })
 custom_modifications["de"] = de
 
@@ -185,31 +202,35 @@ fr[1].update({
 fr[2].update({18: 8364, 4: ord('#'), 5: ord('{'), 6: ord('['), 7: ord('|'), 8: ord('`'), 9: ord('\\'), 10: ord('^'), 11: ord('@'), 12: ord(']'), 13: ord('}')})
 custom_modifications["fr"] = fr
 
+# Every continental layout below shares one correction with `de`: shift on the
+# comma and full-stop keys is ; and :, not the < and > the US map leaves there.
+# That is the only thing changed in them - they have not been audited further.
+
 # --- 4. SPANISH (es) ---
 es = make_layout_base()
 es[0].update({12: ord('\''), 13: ord('¡'), 26: ord('`'), 27: ord('+'), 39: ord('ñ'), 40: ord('´'), 41: ord('º'), 43: ord('ç'), 53: ord('-')})
-es[1].update({2: ord('!'), 3: ord('"'), 4: ord('·'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('¿'), 26: ord('^'), 27: ord('*'), 39: ord('Ñ'), 40: ord('¨'), 41: ord('ª'), 43: ord('Ç'), 53: ord('_')})
+es[1].update({2: ord('!'), 3: ord('"'), 4: ord('·'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('¿'), 26: ord('^'), 27: ord('*'), 39: ord('Ñ'), 40: ord('¨'), 41: ord('ª'), 43: ord('Ç'), 51: ord(';'), 52: ord(':'), 53: ord('_')})
 es[2].update({2: ord('|'), 3: ord('@'), 4: ord('#'), 6: ord('~'), 11: ord('\\'), 26: ord('['), 27: ord(']'), 40: ord('{'), 43: ord('}')})
 custom_modifications["es"] = es
 
 # --- 5. ITALIAN (it) ---
 it = make_layout_base()
 it[0].update({12: ord('\''), 13: ord('ì'), 26: ord('è'), 27: ord('+'), 39: ord('ò'), 40: ord('à'), 41: ord('ì'), 43: ord('ù'), 53: ord('-')})
-it[1].update({2: ord('!'), 3: ord('"'), 4: ord('£'), 5: ord('$'), 6: ord('%'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('^'), 26: ord('é'), 27: ord('*'), 39: ord('ç'), 40: ord('°'), 41: ord('§'), 43: ord('§'), 53: ord('_')})
+it[1].update({2: ord('!'), 3: ord('"'), 4: ord('£'), 5: ord('$'), 6: ord('%'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('^'), 26: ord('é'), 27: ord('*'), 39: ord('ç'), 40: ord('°'), 41: ord('§'), 43: ord('§'), 51: ord(';'), 52: ord(':'), 53: ord('_')})
 it[2].update({18: 8364, 26: ord('['), 27: ord(']'), 39: ord('@'), 40: ord('#')})
 custom_modifications["it"] = it
 
 # --- 6. SWISS (ch) ---
 ch = make_layout_base()
 ch[0].update({21: ord('z'), 44: ord('y'), 12: ord('\''), 13: ord('^'), 26: ord('ü'), 27: ord('¨'), 39: ord('ö'), 40: ord('ä'), 43: ord('$')})
-ch[1].update({21: ord('Z'), 44: ord('Y'), 2: ord('1'), 3: ord('2'), 4: ord('3'), 12: ord('?'), 26: ord('è'), 27: ord('!'), 39: ord('é'), 40: ord('à'), 43: ord('£')})
+ch[1].update({21: ord('Z'), 44: ord('Y'), 2: ord('1'), 3: ord('2'), 4: ord('3'), 12: ord('?'), 26: ord('è'), 27: ord('!'), 39: ord('é'), 40: ord('à'), 43: ord('£'), 51: ord(';'), 52: ord(':')})
 ch[2].update({3: ord('@'), 4: ord('#'), 18: 8364, 26: ord('['), 27: ord(']'), 39: ord('{'), 40: ord('}')})
 custom_modifications["ch"] = ch
 
 # --- 7. NORDIC UNIVERSAL WRAPPER (no / se / fi / dk) ---
 nordic = make_layout_base()
 nordic[0].update({12: ord('+'), 13: ord('\\'), 26: ord('å'), 27: ord('¨'), 39: ord('ø'), 40: ord('æ'), 41: ord('|'), 43: ord('\'')})
-nordic[1].update({2: ord('!'), 3: ord('"'), 4: ord('#'), 5: ord('¤'), 6: ord('%'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('`'), 26: ord('Å'), 27: ord('^'), 39: ord('Ø'), 40: ord('Æ'), 43: ord('*')})
+nordic[1].update({2: ord('!'), 3: ord('"'), 4: ord('#'), 5: ord('¤'), 6: ord('%'), 7: ord('&'), 8: ord('/'), 9: ord('('), 10: ord(')'), 11: ord('='), 12: ord('?'), 13: ord('`'), 26: ord('Å'), 27: ord('^'), 39: ord('Ø'), 40: ord('Æ'), 43: ord('*'), 51: ord(';'), 52: ord(':')})
 nordic[2].update({3: ord('@'), 5: ord('$'), 8: ord('{'), 9: ord('['), 10: ord(']'), 11: ord('}'), 13: ord('~'), 27: ord('~')})
 custom_modifications["nordic"] = nordic
 
@@ -251,13 +272,10 @@ custom_modifications["colemak"] = colemak
 # those wrong, which is the whole reason this layout exists.
 de_mac_nodeadkeys = {mod_layer: keys.copy() for mod_layer, keys in de.items()}
 
-# "No dead keys" means the two accent keys type their character instead of
-# waiting for the letter it belongs to. A console keymap has no dead keys to
-# begin with - KT_LATIN is all this generator emits - so the only thing left to
-# get right is which way round the pair goes: acute unshifted and grave
-# shifted, the way the key is printed.
-de_mac_nodeadkeys[0][13] = ord('´')
-de_mac_nodeadkeys[1][13] = ord('`')
+# "No dead keys" needs nothing done here: a console keymap has no dead keys to
+# begin with, since KT_LATIN is all this generator emits, and `de` above
+# already has the accent key the right way round - acute unshifted, grave
+# shifted, the way it is printed.
 
 # The Option level, written out rather than layered onto the German AltGr level
 # so that it is exactly what an Apple keyboard produces. Keys not listed keep

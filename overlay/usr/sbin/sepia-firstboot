@@ -1,5 +1,7 @@
 #!/bin/sh
-# Grow the root filesystem into the storage device and add swap, once.
+# Set this machine up, once: ask what it should do about networking and which
+# keyboard it has, then grow the root filesystem into the storage device and
+# add swap.
 #
 # This runs in two passes with a reboot between them, and that is a constraint
 # rather than a choice: the kernel will not re-read a partition table while one
@@ -16,12 +18,207 @@
 STATE=/var/lib/sepia
 DONE=$STATE/firstboot-done
 PENDING=$STATE/resize-pending
+SETUP=$STATE/setup-done
 
-[ -f "$DONE" ] && exit 0
+KEYMAP_DIR=/usr/share/keymaps
+NETWORK=/usr/sbin/sepia-network
+KEYMAP=/usr/bin/sepia-keymap
+
+# How long to wait for an answer. The first question is the one that finds out
+# whether anybody is there: if it goes unanswered the rest are not asked at all,
+# which bounds a screen nobody is watching to one wait rather than several.
+FIRST_WAIT=60
+NEXT_WAIT=120
+
+[ -f "$DONE" ] && [ -f "$SETUP" ] && exit 0
 mkdir -p "$STATE"
 
 say() { echo "sepia-firstboot: $*"; }
 give_up() { say "$*"; say "leaving the storage layout alone"; touch "$DONE"; exit 0; }
+
+# --- asking, where there is somebody to ask ---------------------------------
+#
+# These questions need a keyboard, and the only console this can be sure has
+# one is a virtual terminal. /proc/consoles flags the console /dev/console
+# resolves to; if that is a UART then there may be a person at the far end of
+# it or there may be nothing at all, and a read that blocks on a headless board
+# is a board that never finishes booting. So a VT gets asked, and anything else
+# keeps the defaults - which are the ones the image ships with anyway, and
+# which sepia-network and sepia-keymap can change at any time afterwards.
+#
+# When there is nothing to ask, the marker is deliberately left unwritten until
+# the storage work has finished. That is what makes the QEMU launcher work:
+# tools/qemu.sh runs first boot headlessly, on serial, before it opens a
+# window, so the questions would otherwise be swallowed by a boot nobody was
+# watching. Once the resizing is done the marker is written anyway, so a board
+# that is always headless is asked twice and then left alone.
+
+console_is_vt() {
+	[ -c /dev/console ] || return 1
+	[ -r /proc/consoles ] || return 1
+	# Field 3 is the flag group, "(EC" or "(E"; C marks the console that
+	# /dev/console resolves to. Same field sepia-gettys reads.
+	awk '$3 ~ /C/ { print $1 }' /proc/consoles | grep -qE '^tty[0-9]+$'
+}
+
+# The questions are written to the console on fd 3 rather than to stdout, and
+# that is not tidiness. Printed to the stdout init hands a sysinit script, none
+# of it appears on screen during boot - the same echoes are perfectly visible
+# when the script is run from a shell afterwards. Writing to the console that
+# is being read from is what a getty does, and it puts the prompt where the
+# answer is coming from.
+out()  { printf '%s\n' "$*" >&3; }
+outn() { printf '%s' "$*" >&3; }
+
+# Reads one line from the console, or fails if nothing arrives in $1 seconds.
+# $2 = silent, for the passphrase.
+ask() {
+	line=
+	if [ "${2:-}" = silent ]; then
+		read -t "$1" -s -r line <&3 || return 1
+		out ""
+	else
+		read -t "$1" -r line <&3 || { out ""; return 1; }
+	fi
+	printf '%s\n' "$line"
+}
+
+ask_network() {
+	out ""
+	out "  Network"
+	out "    1) Ethernet (DHCP)"
+	out "    2) Wifi (DHCP)"
+	out "    3) Both"
+	out "    4) None"
+	outn '  Choose 1-4 [1]: '
+	answer=$(ask "$FIRST_WAIT") || return 1
+
+	ssid= ; psk= ; country=
+	case "$answer" in
+		2) net=wifi ;;
+		3) net=both ;;
+		4) net=none ;;
+		*) net=ethernet ;;
+	esac
+
+	if [ "$net" = wifi ] || [ "$net" = both ]; then
+		outn '  Wifi network name: '
+		ssid=$(ask "$NEXT_WAIT") || ssid=
+		if [ -n "$ssid" ]; then
+			outn '  Passphrase (empty for an open network): '
+			psk=$(ask "$NEXT_WAIT" silent) || psk=
+			outn '  Country code, two letters (empty to skip): '
+			country=$(ask "$NEXT_WAIT") || country=
+		fi
+	fi
+
+	# -n throughout: this pass reboots, so applying any of it now would be
+	# work thrown away. rcS brings it up on the boot after this one.
+	case "$net" in
+		ethernet) $NETWORK -n ethernet dhcp >/dev/null ;;
+		none)     $NETWORK -n ethernet off >/dev/null; $NETWORK -n wifi off >/dev/null ;;
+		wifi)     $NETWORK -n ethernet off >/dev/null ;;
+		both)     $NETWORK -n ethernet dhcp >/dev/null ;;
+	esac
+	case "$net" in
+		wifi|both)
+			if [ -n "$ssid" ]; then
+				$NETWORK -n wifi "$ssid" "$psk" $country >/dev/null
+			else
+				say "no network name given, so wifi stays off"
+				$NETWORK -n wifi off >/dev/null
+			fi
+			;;
+	esac
+	say "network: $net"
+	return 0
+}
+
+ask_keymap() {
+	# Read from the directory rather than from `sepia-keymap list`: that is
+	# where the tool itself looks, and it cannot be misparsed the way its
+	# human-readable output could be.
+	maps=$(for f in "$KEYMAP_DIR"/*.kmap; do
+		[ -e "$f" ] || continue
+		f=${f##*/}; echo "${f%.kmap}"
+	done | sort)
+	[ -n "$maps" ] || { say "no keymaps installed to choose from"; return 0; }
+	current=$(cat /etc/keymap 2>/dev/null)
+
+	out ""
+	out "  Keyboard layout"
+	i=0
+	for m in $maps; do
+		i=$((i + 1))
+		out "$(printf '    %2d) %s' "$i" "$m")"
+	done
+	outn "$(printf '  Choose 1-%d [keep %s]: ' "$i" "${current:-english_us}")"
+	answer=$(ask "$NEXT_WAIT") || answer=
+
+	case "$answer" in
+		''|*[!0-9]*) say "keyboard: unchanged"; return 0 ;;
+	esac
+	if [ "$answer" -lt 1 ] || [ "$answer" -gt "$i" ]; then
+		say "keyboard: $answer is not one of 1-$i, leaving it unchanged"
+		return 0
+	fi
+	name=$(printf '%s\n' $maps | sed -n "${answer}p")
+	if $KEYMAP set-system "$name" >/dev/null 2>&1; then
+		say "keyboard: $name, now and on every boot"
+	else
+		# The layout is still recorded; only loading it needs a console.
+		echo "$name" > /etc/keymap 2>/dev/null
+		say "keyboard: $name recorded, but this console has no keymap to load it into"
+	fi
+	return 0
+}
+
+restore_printk() {
+	[ -n "${printk_was:-}" ] && dmesg -n "$printk_was" 2>/dev/null
+	return 0
+}
+
+setup() {
+	if ! console_is_vt; then
+		say "no keyboard console to ask on; keeping the defaults"
+		say "sepia-network and sepia-keymap change them whenever you like"
+		[ -f "$DONE" ] && touch "$SETUP"
+		return 0
+	fi
+	# A failed redirect on exec ends a non-interactive shell outright, so the
+	# open is tried in a subshell first.
+	( : <> /dev/console ) 2>/dev/null || { say "cannot open /dev/console; keeping the defaults"; return 0; }
+	exec 3<> /dev/console
+
+	# Kernel messages arriving in the middle of a question scribble over it -
+	# the same problem rcS solves at the end of the boot with dmesg -n 3, and
+	# here it lands squarely on the prompt. Quietened to emergencies only for
+	# as long as the questions are up, and put back exactly as it was: nothing
+	# is lost, dmesg still holds all of it.
+	printk_was=$(cut -f1 /proc/sys/kernel/printk 2>/dev/null)
+	dmesg -n 1 2>/dev/null
+
+	out ""
+	out "SepiaOS first boot. Two questions, then it carries on by itself."
+	if ! ask_network; then
+		say "no answer; keeping the defaults - ethernet on DHCP, keyboard unchanged"
+		touch "$SETUP"
+		restore_printk
+		exec 3>&-
+		return 0
+	fi
+	ask_keymap
+	out ""
+
+	touch "$SETUP"
+	restore_printk
+	exec 3>&-
+	return 0
+}
+
+[ -f "$SETUP" ] || setup
+
+[ -f "$DONE" ] && exit 0
 
 # --- which device did we boot from -----------------------------------------
 

@@ -1,0 +1,508 @@
+#!/bin/sh
+# Networking: what is configured, and making it so.
+#
+# The configuration lives in /etc/network.conf as shell assignments, like every
+# other piece of state here, so that reading it is a matter of sourcing it. Two
+# interfaces are described - the wired one and the wireless one - and each is
+# off, on DHCP, or on a static address, independently of the other.
+#
+# Three things in here are worth knowing before changing any of it:
+#
+#   - Interface names are looked up, never assumed. Every Pi's own ethernet is
+#     eth0 (genet on a 4, 5 and CM4, smsc95xx on a 3, lan78xx on a 3B+), but a
+#     USB adapter can arrive as usb0 - which is exactly what QEMU's own network
+#     device does - and wlan0 is a convention rather than a promise.
+#   - Nothing in this system autoloads modules: there is no udev and no
+#     mdev -s hotplug handler. Every Pi's built-in ethernet is compiled into
+#     the kernel so it is there regardless, but a USB adapter and the wifi
+#     chip both need their module loaded, which is what autoload_drivers does
+#     and why it does it by asking the device rather than from a list.
+#   - udhcpc daemonises itself and stops logging when it does, so the line the
+#     boot prints comes from here, after waiting a bounded few seconds for the
+#     lease. If it arrives later the interface still gets configured - by the
+#     lease script, not by anything here - and `status` will show it.
+
+set -u
+
+CONF=/etc/network.conf
+RESOLV=/etc/resolv.conf
+RUNDIR=/run/sepia-network
+WPA_CONF=$RUNDIR/wpa_supplicant.conf
+
+# How long to wait for a lease, and for a wifi association, before carrying on
+# and leaving them to finish in the background. Boot does not stop for either.
+DHCP_WAIT=10
+WIFI_WAIT=20
+
+# How long to wait for the interface itself to turn up, and this one is not
+# optional. rcS reaches this script about three seconds after the kernel
+# starts, and on a Pi 3 the ethernet is a USB device on an internal hub that
+# has not finished enumerating by then - so a single glance at /sys/class/net
+# decides there is no network on the most common board there is. Measured under
+# QEMU: the boot reaches here at 2.9 s and the USB network device appears at
+# 3.0 s, which is exactly the wrong side of it.
+IFACE_WAIT=10
+
+self=${0##*/}
+
+die()  { echo "$self: $*" >&2; exit 1; }
+note() { echo "$self: $*"; }
+
+usage() {
+	cat <<USAGE
+usage: $self [-n] <command>
+
+  -n  record the choice without applying it. First boot uses this: it asks
+      these questions and then reboots, so bringing an interface up there
+      would be ten seconds of DHCP thrown away.
+
+  status                    what is configured, and what is actually up
+  up [ethernet|wifi]        apply the configuration (this is what boot runs)
+  down [ethernet|wifi]      take it down again
+  restart [ethernet|wifi]   down, then up
+
+  ethernet dhcp
+  ethernet static ADDR/LEN [GATEWAY [DNS...]]
+  ethernet off
+
+  wifi SSID PASSPHRASE [COUNTRY]
+  wifi off
+
+Configuration is $CONF; the commands above rewrite it and apply
+the change straight away. Either interface can be used without the other, or
+both at once.
+USAGE
+}
+
+# --- configuration ---------------------------------------------------------
+
+read_conf() {
+	ETHERNET=off; ETH_ADDRESS=; ETH_GATEWAY=; ETH_DNS=
+	WIFI=off; WIFI_SSID=; WIFI_PSK=; WIFI_COUNTRY=
+	WIFI_ADDRESS=; WIFI_GATEWAY=; WIFI_DNS=
+	# shellcheck source=/dev/null
+	[ -r "$CONF" ] && . "$CONF"
+	return 0
+}
+
+# Values are written single-quoted, with any embedded quote escaped, because a
+# passphrase is arbitrary text and this file is sourced by a shell. Anything
+# less careful turns a password containing a $ or a backtick into code.
+quote() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+set_conf() {
+	key=$1 val=$2 tmp=$CONF.$$ found=0
+	umask 077
+	: > "$tmp"
+	if [ -f "$CONF" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in
+				"$key="*) printf '%s=%s\n' "$key" "$(quote "$val")" >> "$tmp"
+				          found=1 ;;
+				*)        printf '%s\n' "$line" >> "$tmp" ;;
+			esac
+		done < "$CONF"
+	fi
+	[ "$found" = 1 ] || printf '%s=%s\n' "$key" "$(quote "$val")" >> "$tmp"
+	mv -f "$tmp" "$CONF"
+	chmod 0600 "$CONF"
+}
+
+# --- interfaces ------------------------------------------------------------
+
+is_wireless() { [ -d "/sys/class/net/$1/phy80211" ]; }
+
+# The first interface that is neither loopback nor a radio, preferring the
+# names a built-in adapter uses over the ones a USB one gets.
+wired_iface() {
+	for pat in eth en usb ''; do
+		for d in /sys/class/net/"$pat"*; do
+			[ -e "$d" ] || continue
+			n=${d##*/}
+			[ "$n" = lo ] && continue
+			is_wireless "$n" && continue
+			printf '%s\n' "$n"
+			return 0
+		done
+	done
+	return 1
+}
+
+wifi_iface() {
+	for d in /sys/class/net/*; do
+		[ -e "$d" ] || continue
+		n=${d##*/}
+		is_wireless "$n" && { printf '%s\n' "$n"; return 0; }
+	done
+	return 1
+}
+
+# What udev would do, done here because nothing in this system does it: ask
+# each device on the two buses that can carry a network adapter which module it
+# wants, and load that. Asking the device beats a list of module names - it
+# gets a USB adapter nobody thought of, and it gets the wifi chip of whichever
+# Pi this is, without knowing which Pi this is.
+autoload_drivers() {
+	loaded=0
+	for f in /sys/bus/usb/devices/*/modalias /sys/bus/sdio/devices/*/modalias; do
+		[ -r "$f" ] || continue
+		# Skip anything already driven - the hubs, the keyboard, and the
+		# adapter itself on a second call. That is not just tidiness: each
+		# modprobe scans a modules.alias of some fourteen thousand lines, and
+		# on a Pi that is a noticeable pause per device rather than a free one.
+		[ -e "${f%/modalias}/driver" ] && continue
+		# And skip anything already tried. This is called once a second while
+		# waiting for an interface to appear, and a device whose module does
+		# not exist never gets a driver - so without this it is asked about
+		# again on every pass, which is a wasted scan each time and, because
+		# busybox modprobe hands the compressed module to the kernel before
+		# decompressing it, a pair of "Invalid ELF header magic" lines in the
+		# log each time as well. A device that appears later is still new to
+		# this list and still gets its turn.
+		case " ${tried:-} " in *" $f "*) continue ;; esac
+		tried="${tried:-} $f"
+		modprobe -q "$(cat "$f")" 2>/dev/null && loaded=$((loaded + 1))
+	done
+	# Probing is asynchronous: the module is loaded before the interface it
+	# creates exists. Nothing was loaded, nothing to wait for.
+	[ "$loaded" -gt 0 ] && sleep 2
+	return 0
+}
+
+# Look, load drivers for whatever has none, look again - for as long as
+# IFACE_WAIT allows. $1 is the finder to use, wired_iface or wifi_iface.
+wait_for_iface() {
+	finder=$1
+	i=0
+	while :; do
+		n=$($finder) && [ -n "$n" ] && { printf '%s\n' "$n"; return 0; }
+		autoload_drivers
+		n=$($finder) && [ -n "$n" ] && { printf '%s\n' "$n"; return 0; }
+		[ "$i" -ge "$IFACE_WAIT" ] && return 1
+		sleep 1
+		i=$((i + 1))
+	done
+}
+
+addr4() {
+	ip -4 addr show dev "$1" 2>/dev/null | awk '$1 == "inet" { print $2; exit }'
+}
+
+gateway4() {
+	ip -4 route 2>/dev/null | awk -v i="$1" '$1 == "default" && $5 == i { print $3; exit }'
+}
+
+carrier() {
+	read -r c < "/sys/class/net/$1/carrier" 2>/dev/null || return 1
+	[ "$c" = 1 ]
+}
+
+# --- addresses -------------------------------------------------------------
+
+write_resolv() {
+	umask 022
+	{
+		echo "# Written by $self. Rewritten whenever the network is brought up."
+		for s in $*; do echo "nameserver $s"; done
+	} > "$RESOLV.$$" && mv -f "$RESOLV.$$" "$RESOLV"
+}
+
+dhcp_pidfile() { echo "$RUNDIR/udhcpc.$1.pid"; }
+
+stop_dhcp() {
+	p=$(dhcp_pidfile "$1")
+	[ -f "$p" ] || return 0
+	read -r pid < "$p" 2>/dev/null && [ -n "$pid" ] && kill "$pid" 2>/dev/null
+	rm -f "$p"
+}
+
+start_dhcp() {
+	iface=$1
+	mkdir -p "$RUNDIR"
+	stop_dhcp "$iface"
+	ip link set "$iface" up 2>/dev/null
+	# -b so that a network with no DHCP server costs a few seconds rather than
+	# the whole boot: udhcpc gives up on the foreground attempt and keeps
+	# trying in the background. -t/-T bound that first attempt.
+	udhcpc -i "$iface" -p "$(dhcp_pidfile "$iface")" -t 3 -T 2 -b \
+		>/dev/null 2>&1 || return 1
+	i=0
+	while [ "$i" -lt "$DHCP_WAIT" ]; do
+		[ -n "$(addr4 "$iface")" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+start_static() {
+	iface=$1 addr=$2 gw=$3 dns=$4
+	case "$addr" in
+		*/*) ;;
+		*) die "$addr needs a prefix length, as in $addr/24" ;;
+	esac
+	ip -4 addr flush dev "$iface" 2>/dev/null
+	ip link set "$iface" up
+	ip -4 addr add "$addr" dev "$iface" || die "could not put $addr on $iface"
+	if [ -n "$gw" ]; then
+		while ip -4 route del default dev "$iface" 2>/dev/null; do :; done
+		ip -4 route add default via "$gw" dev "$iface" \
+			|| note "could not route through $gw"
+	fi
+	[ -n "$dns" ] && write_resolv $dns
+	return 0
+}
+
+iface_down() {
+	iface=$1
+	stop_dhcp "$iface"
+	ip -4 addr flush dev "$iface" 2>/dev/null
+	ip link set "$iface" down 2>/dev/null
+	return 0
+}
+
+# --- wifi ------------------------------------------------------------------
+
+wpa_pidfile() { echo "$RUNDIR/wpa_supplicant.pid"; }
+
+# The supplicant is a separate program with its own configuration file, and
+# that file is generated here rather than kept: it holds the passphrase in
+# clear, so it belongs in /run - a tmpfs, gone at power-off - and never on the
+# card. wpa_passphrase would hash it, but the hash is as good as the password
+# for joining the network, so this buys nothing but a false sense of it.
+write_wpa_conf() {
+	mkdir -p "$RUNDIR"
+	umask 077
+	{
+		echo "# Generated by $self from $CONF. Do not edit: it is rewritten."
+		echo "ctrl_interface=$RUNDIR/ctrl"
+		[ -n "$WIFI_COUNTRY" ] && echo "country=$WIFI_COUNTRY"
+		echo "network={"
+		printf '\tssid="%s"\n' "$WIFI_SSID"
+		if [ -n "$WIFI_PSK" ]; then
+			printf '\tpsk="%s"\n' "$WIFI_PSK"
+		else
+			# An open network. Saying so explicitly is the only way to stop
+			# the supplicant looking for a key it has not been given.
+			printf '\tkey_mgmt=NONE\n'
+		fi
+		echo "}"
+	} > "$WPA_CONF"
+}
+
+stop_wifi() {
+	p=$(wpa_pidfile)
+	[ -f "$p" ] && { read -r pid < "$p" 2>/dev/null && [ -n "$pid" ] \
+		&& kill "$pid" 2>/dev/null; rm -f "$p"; }
+	rm -f "$WPA_CONF"
+	return 0
+}
+
+associated() {
+	# wpa_cli would be the polite way to ask, but it is a second binary for a
+	# question the kernel already answers: an unassociated interface has no
+	# carrier.
+	carrier "$1"
+}
+
+start_wifi() {
+	iface=$1
+	command -v wpa_supplicant >/dev/null 2>&1 || {
+		note "wifi needs wpa_supplicant, which this image does not carry"
+		return 1
+	}
+	[ -n "$WIFI_SSID" ] || { note "wifi is on but WIFI_SSID is empty"; return 1; }
+	stop_wifi
+	write_wpa_conf
+	ip link set "$iface" up 2>/dev/null
+	wpa_supplicant -B -i "$iface" -c "$WPA_CONF" -P "$(wpa_pidfile)" \
+		>/dev/null 2>&1 || { note "wpa_supplicant would not start on $iface"; return 1; }
+	i=0
+	while [ "$i" -lt "$WIFI_WAIT" ]; do
+		associated "$iface" && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# --- the commands ----------------------------------------------------------
+
+up_ethernet() {
+	[ "$ETHERNET" = off ] && return 0
+	iface=$(wait_for_iface wired_iface) || :
+	[ -n "${iface:-}" ] || { note "no wired interface"; return 1; }
+	case "$ETHERNET" in
+		dhcp)
+			if start_dhcp "$iface"; then
+				note "$iface $(addr4 "$iface")$(gw_suffix "$iface") (dhcp)"
+			else
+				note "$iface is still waiting for a DHCP lease"
+			fi
+			;;
+		static)
+			[ -n "$ETH_ADDRESS" ] || { note "ETHERNET=static with no ETH_ADDRESS"; return 1; }
+			start_static "$iface" "$ETH_ADDRESS" "$ETH_GATEWAY" "$ETH_DNS"
+			note "$iface $ETH_ADDRESS$(gw_suffix "$iface") (static)"
+			;;
+		*) note "ETHERNET=$ETHERNET is not dhcp, static or off"; return 1 ;;
+	esac
+}
+
+gw_suffix() {
+	g=$(gateway4 "$1")
+	[ -n "$g" ] && printf ' via %s' "$g"
+	return 0
+}
+
+up_wifi() {
+	[ "$WIFI" = off ] && return 0
+	iface=$(wait_for_iface wifi_iface) || :
+	[ -n "${iface:-}" ] || { note "no wireless interface - no wifi chip, or no firmware for it"; return 1; }
+	if ! start_wifi "$iface"; then
+		note "$iface did not associate with '$WIFI_SSID'"
+		return 1
+	fi
+	case "$WIFI" in
+		dhcp)
+			if start_dhcp "$iface"; then
+				note "$iface $(addr4 "$iface")$(gw_suffix "$iface") on '$WIFI_SSID' (dhcp)"
+			else
+				note "$iface joined '$WIFI_SSID' but has no DHCP lease yet"
+			fi
+			;;
+		static)
+			[ -n "$WIFI_ADDRESS" ] || { note "WIFI=static with no WIFI_ADDRESS"; return 1; }
+			start_static "$iface" "$WIFI_ADDRESS" "$WIFI_GATEWAY" "$WIFI_DNS"
+			note "$iface $WIFI_ADDRESS$(gw_suffix "$iface") on '$WIFI_SSID' (static)"
+			;;
+		*) note "WIFI=$WIFI is not dhcp, static or off"; return 1 ;;
+	esac
+}
+
+down_ethernet() { iface=$(wired_iface) && iface_down "$iface"; return 0; }
+down_wifi()     { stop_wifi; iface=$(wifi_iface) && iface_down "$iface"; return 0; }
+
+status() {
+	echo "configured in $CONF:"
+	printf '  ethernet  %s\n' "$ETHERNET"
+	case "$ETHERNET" in static) printf '            %s%s\n' "$ETH_ADDRESS" \
+		"$([ -n "$ETH_GATEWAY" ] && printf ' via %s' "$ETH_GATEWAY")" ;; esac
+	printf '  wifi      %s%s\n' "$WIFI" \
+		"$([ -n "$WIFI_SSID" ] && printf " on '%s'" "$WIFI_SSID")"
+	echo
+	echo "now:"
+	found=0
+	for d in /sys/class/net/*; do
+		[ -e "$d" ] || continue
+		n=${d##*/}
+		[ "$n" = lo ] && continue
+		found=1
+		kind=wired
+		is_wireless "$n" && kind=wireless
+		a=$(addr4 "$n")
+		printf '  %-9s %-8s %s%s%s\n' "$n" "$kind" \
+			"${a:-no address}" "$(gw_suffix "$n")" \
+			"$(carrier "$n" && printf '' || printf '  [no carrier]')"
+	done
+	[ "$found" = 1 ] || echo "  no interfaces at all - no driver has claimed one"
+	if [ -r "$RESOLV" ]; then
+		sed -n 's/^nameserver /  nameserver /p' "$RESOLV"
+	fi
+	if [ "$WIFI" != off ] && ! command -v wpa_supplicant >/dev/null 2>&1; then
+		echo
+		echo "  wifi is configured but this image has no wpa_supplicant"
+	fi
+}
+
+read_conf
+
+APPLY=1
+case "${1:-}" in
+	-n|--no-apply) APPLY=0; shift ;;
+esac
+
+# Every setter ends by putting the new configuration into effect - unless -n
+# said not to, in which case the file is written and nothing is touched.
+apply_ethernet() { [ "$APPLY" = 1 ] || return 0; read_conf; down_ethernet; up_ethernet; }
+apply_wifi()     { [ "$APPLY" = 1 ] || return 0; read_conf; down_wifi; up_wifi; }
+
+cmd=${1:-}
+[ -n "$cmd" ] || { usage >&2; exit 2; }
+shift || :
+
+case "$cmd" in
+	status) status ;;
+
+	up)
+		case "${1:-both}" in
+			ethernet) up_ethernet ;;
+			wifi)     up_wifi ;;
+			both)     up_ethernet; up_wifi ;;
+			*) die "up takes ethernet or wifi, or nothing for both" ;;
+		esac
+		;;
+
+	down)
+		case "${1:-both}" in
+			ethernet) down_ethernet ;;
+			wifi)     down_wifi ;;
+			both)     down_ethernet; down_wifi ;;
+			*) die "down takes ethernet or wifi, or nothing for both" ;;
+		esac
+		;;
+
+	restart)
+		what=${1:-both}
+		"$0" down "$what"
+		"$0" up "$what"
+		;;
+
+	ethernet)
+		mode=${1:-}
+		case "$mode" in
+			dhcp)
+				set_conf ETHERNET dhcp
+				apply_ethernet
+				;;
+			static)
+				[ $# -ge 2 ] || die "ethernet static needs an address, as in 192.168.1.50/24"
+				set_conf ETHERNET static
+				set_conf ETH_ADDRESS "$2"
+				set_conf ETH_GATEWAY "${3:-}"
+				shift 3 2>/dev/null || shift $#
+				set_conf ETH_DNS "$*"
+				apply_ethernet
+				;;
+			off)
+				set_conf ETHERNET off
+				[ "$APPLY" = 1 ] && down_ethernet
+				note "ethernet off"
+				;;
+			*) die "ethernet takes dhcp, static or off" ;;
+		esac
+		;;
+
+	wifi)
+		case "${1:-}" in
+			"") die "wifi takes an SSID and a passphrase, or off" ;;
+			off)
+				set_conf WIFI off
+				[ "$APPLY" = 1 ] && down_wifi
+				note "wifi off"
+				;;
+			*)
+				set_conf WIFI_SSID "$1"
+				set_conf WIFI_PSK "${2:-}"
+				[ $# -ge 3 ] && set_conf WIFI_COUNTRY "$3"
+				set_conf WIFI dhcp
+				apply_wifi
+				;;
+		esac
+		;;
+
+	-h|--help|help) usage ;;
+	*) usage >&2; exit 2 ;;
+esac

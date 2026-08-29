@@ -1212,6 +1212,295 @@ e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Show the e2fsprogs build
 	@$(MKE2FS) -V 2>&1 | sed -n '1s/^/  reports  /p'
 	@printf '  resize2fs %s (%s KiB, aarch64)\n' $(RESIZE2FS) "$$(( $$(wc -c < $(RESIZE2FS)) / 1024 ))"
 # ---------------------------------------------------------------------------
+# Networking - the parts of it that have to be built
+#
+# Ethernet needs nothing built at all. Every Pi's own adapter is compiled into
+# the kernel - genet on a 4, a 5 and a CM4, smsc95xx on a 3, lan78xx on a 3B+ -
+# and busybox already carries udhcpc, ip and the rest. What makes ethernet work
+# is /etc/network.conf and /usr/sbin/sepia-network, which are plain files in
+# overlay/ and are copied in with everything else there.
+#
+# Wifi is the opposite: none of it is in the image unless it is put there, and
+# it takes three separate things. Missing any one of them looks identical from
+# the outside - no wlan0 at all - which is why they are built together and
+# asserted together:
+#
+#   - the firmware and its per-board NVRAM. It is not in the kernel tree and
+#     never will be; this takes it from the same package Raspberry Pi OS
+#     installs, which is the only place the raspberrypi,* NVRAM files exist.
+#   - libnl, because wpa_supplicant talks to the kernel over nl80211, and
+#     nl80211 is a netlink protocol.
+#   - wpa_supplicant. WPA2 is a handshake rather than a setting: without a
+#     supplicant there is no way onto a protected network at all.
+#
+# WITH_WIFI=0 leaves all three out, and that is worth more than the build time
+# it saves: the firmware is redistributable but not free, and an image that
+# ships none of it is a legitimate thing to want.
+#
+# This sits before the rootfs step because the rootfs copies its output in.
+# ---------------------------------------------------------------------------
+
+WITH_WIFI ?= 1
+
+# Empty means "latest", resolved once and cached like every other version here.
+LIBNL_VERSION ?=
+WPA_VERSION   ?=
+BRCM_VERSION  ?=
+
+# Two hosts, deliberately: the API answers what the latest release is, and the
+# release assets are served from github.com itself - api.github.com does not
+# serve them, and a download URL built from it 404s.
+LIBNL_API  := https://api.github.com/repos/thom311/libnl/releases/latest
+LIBNL_REPO := https://github.com/thom311/libnl
+WPA_BASE   := https://w1.fi/releases
+BRCM_BASE  := https://archive.raspberrypi.com/debian/pool/main/f/firmware-nonfree
+
+WIRELESS_DIR   := $(BUILD_DIR)/wireless
+WIRELESS_STAGE := $(WIRELESS_DIR)/stage
+DL_WIRELESS    := $(DL_DIR)/wireless
+
+WIRELESS_SIG   = $(LIBNL_VERSION)|$(WPA_VERSION)|$(BRCM_VERSION)
+WIRELESS_CFG   := $(WIRELESS_DIR)/.config
+WIRELESS_ENV   := $(WIRELESS_DIR)/version.env
+LIBNL_STAMP    := $(WIRELESS_DIR)/.libnl
+WPA_STAMP      := $(WIRELESS_DIR)/.wpa-supplicant
+BRCM_STAMP     := $(WIRELESS_DIR)/.firmware
+WIRELESS_STAMP := $(WIRELESS_DIR)/.staged
+
+ifeq ($(WITH_WIFI),1)
+  WIRELESS_DEP := $(WIRELESS_STAMP)
+else
+  WIRELESS_DEP :=
+endif
+
+# None of these three publishes a digest next to the file - w1.fi has a
+# detached signature, GitHub has nothing, and the Debian pool keeps its hashes
+# in a separate signed index - so all three are held to the same
+# trust-on-first-use record musl uses: written the first time a version is
+# fetched, checked every time after, and committed.
+#   $(1) directory  $(2) filename  $(3) url  $(4) record name under checksums/
+define fetch_recorded
+	set -e; d=$(1); f=$(2); m=$(abspath $(CHECKSUMS))/$(4).sha256; \
+	mkdir -p "$$d" $(CHECKSUMS); \
+	if [ ! -f "$$d/$$f" ]; then \
+	  echo "  FETCH    $$f"; \
+	  $(CURL) -o "$$d/$$f.part" "$(3)" || { \
+	    echo "  FAIL     could not fetch $(3) - not published, or the transfer" >&2; \
+	    echo "           failed; curl said why above" >&2; exit 1; }; \
+	  mv -f "$$d/$$f.part" "$$d/$$f"; \
+	fi; \
+	if [ -f "$$m" ]; then \
+	  echo "  VERIFY   $$f"; \
+	  ( cd "$$d" && $(SHA256) --check --quiet "$$m" ) || { \
+	    echo "  FAIL     $$f does not match $$m; delete $$d/$$f and retry" >&2; exit 1; }; \
+	else \
+	  ( cd "$$d" && $(SHA256) "$$f" ) > "$$m"; \
+	  echo "  RECORD   $(CHECKSUMS)/$(4).sha256 - first fetch of this version, commit it"; \
+	fi
+endef
+
+.PHONY: wireless
+wireless: $(WIRELESS_DEP) ## Build the wifi firmware, libnl and wpa_supplicant
+ifeq ($(WITH_WIFI),1)
+	@source $(WIRELESS_ENV); printf '  READY    wireless -> %s (libnl %s, wpa_supplicant %s, firmware %s)\n' \
+	   $(WIRELESS_STAGE) "$$LIBNL_VER" "$$WPA_VER" "$$BRCM_VER"
+else
+	@echo "  SKIP     WITH_WIFI=0: no firmware, no supplicant, ethernet only"
+endif
+
+$(WIRELESS_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(WIRELESS_SIG)' | cmp -s - $@ || printf '%s\n' '$(WIRELESS_SIG)' > $@
+
+# All three versions are resolved in one go and cached together, because they
+# are fetched together and there is no sense in one of them drifting alone.
+#
+# The libnl tag is libnl3_11_0 where the tarball is libnl-3.11.0, so the
+# version comes from the asset name in the release JSON rather than from the
+# tag - guessing that mapping is exactly how a build breaks on the next
+# release. wpa_supplicant and the firmware are read off their index pages.
+$(WIRELESS_ENV): $(WIRELESS_CFG)
+	@mkdir -p $(@D)
+	@echo "  RESOLVE  wireless (libnl, wpa_supplicant, brcm firmware)"
+	@set -e; \
+	 if [ -n '$(LIBNL_VERSION)' ]; then lv='$(LIBNL_VERSION)'; else \
+	   lv=$$($(CURL) $(LIBNL_API) 2>/dev/null \
+	         | grep -oE 'libnl-[0-9][0-9.]*\.tar\.gz' \
+	         | sed 's|^libnl-||; s|\.tar\.gz$$||' | sort -uV | tail -1 || true); \
+	 fi; \
+	 if [ -n '$(WPA_VERSION)' ]; then wv='$(WPA_VERSION)'; else \
+	   wv=$$($(CURL) "$(WPA_BASE)/" 2>/dev/null \
+	         | grep -oE 'wpa_supplicant-[0-9][0-9.]*\.tar\.gz' \
+	         | sed 's|^wpa_supplicant-||; s|\.tar\.gz$$||' | sort -uV | tail -1 || true); \
+	 fi; \
+	 if [ -n '$(BRCM_VERSION)' ]; then bv='$(BRCM_VERSION)'; else \
+	   bv=$$($(CURL) "$(BRCM_BASE)/" 2>/dev/null \
+	         | grep -oE 'firmware-brcm80211_[^"]+_all\.deb' \
+	         | sed 's|^firmware-brcm80211_||; s|_all\.deb$$||' | sort -uV | tail -1 || true); \
+	 fi; \
+	 for pair in "libnl:$$lv" "wpa_supplicant:$$wv" "brcm firmware:$$bv"; do \
+	   [ -n "$${pair#*:}" ] || { \
+	     echo "Could not resolve a version for $${pair%%:*}. Pin one with" >&2; \
+	     echo "LIBNL_VERSION=, WPA_VERSION= or BRCM_VERSION=." >&2; exit 1; }; \
+	 done; \
+	 { printf "LIBNL_VER='%s'\n" "$$lv"; \
+	   printf "WPA_VER='%s'\n"   "$$wv"; \
+	   printf "BRCM_VER='%s'\n"  "$$bv"; } > $@.part
+	@mv -f $@.part $@
+	@source $@; printf '  WIRELESS libnl %s, wpa_supplicant %s, firmware %s\n' \
+	   "$$LIBNL_VER" "$$WPA_VER" "$$BRCM_VER"
+
+# Only two of libnl's libraries are built, and that is not an optimisation.
+# `make` builds lib/route as well, whose parsers are generated with bison, and
+# the tarball ships the flex output but not the bison output - so a full build
+# needs bison 3 on the host, which macOS does not have (it ships 2.3, from
+# 2006, which rejects %code and stops). wpa_supplicant needs libnl-3 and
+# libnl-genl-3 and nothing else, so those two targets are named directly and
+# lib/route is never reached.
+#
+# Only the runtime files are staged: the .so.200 soname symlink and the real
+# object behind it. The bare .so is a link-time convenience and the headers are
+# for building against, and this tree becomes a root filesystem.
+#
+# A stub pkg-config is put on PATH when the host has none. libnl 3.12's
+# configure stops outright without one, and it is not for anything libnl needs:
+# it asks pkg-config only about optional test libraries, so a stub that answers
+# "not installed" to every question gives the same configuration as a host with
+# a real pkg-config and no libcheck. A real one is used whenever there is one.
+$(LIBNL_STAMP): $(WIRELESS_ENV) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
+	@source $(WIRELESS_ENV); t=libnl-$$LIBNL_VER.tar.gz; \
+	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(LIBNL_REPO)/releases/download/libnl$$(echo $$LIBNL_VER | tr . _)/$$t,libnl-$$LIBNL_VER); \
+	 s=$(WIRELESS_DIR)/libnl-$$LIBNL_VER; \
+	 echo "  UNPACK   $$t"; \
+	 rm -rf $$s; mkdir -p $(WIRELESS_DIR); tar -xf $(DL_WIRELESS)/$$t -C $(WIRELESS_DIR); \
+	 echo "  CONFIG   libnl $$LIBNL_VER (aarch64, dynamic against $(SYSROOT))"; \
+	 if ! command -v pkg-config >/dev/null 2>&1; then \
+	   p=$(abspath $(WIRELESS_DIR))/pkg-config-stub; mkdir -p $$p; \
+	   printf '%s\n' '#!/bin/sh' \
+	     'case "$$1" in --atleast-pkgconfig-version) exit 0;; --version) echo 0.29.2; exit 0;; esac' \
+	     'exit 1' > $$p/pkg-config; chmod 0755 $$p/pkg-config; \
+	   PATH=$$p:$$PATH; export PATH; \
+	 fi; \
+	 ( cd $$s && ./configure --host=aarch64-linux --prefix=/usr --disable-static --disable-cli \
+	     CC=$(CROSS)gcc AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
+	     CFLAGS="-Os --sysroot=$(abspath $(SYSROOT))" \
+	     LDFLAGS="--sysroot=$(abspath $(SYSROOT)) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
+	   ) > $$s/configure.log 2>&1 || { \
+	   tail -20 $$s/configure.log >&2; \
+	   echo "  FAIL     configure (full log: $$s/configure.log)" >&2; exit 1; }; \
+	 echo "  BUILD    libnl-3 and libnl-genl-3 (-j$(JOBS))"; \
+	 $(MAKE) --no-print-directory -C $$s -j$(JOBS) \
+	   lib/libnl-3.la lib/libnl-genl-3.la > $$s/build.log 2>&1 || { \
+	   tail -30 $$s/build.log >&2; \
+	   echo "  FAIL     libnl (full log: $$s/build.log)" >&2; exit 1; }; \
+	 mkdir -p $(WIRELESS_STAGE)/usr/lib; \
+	 cp -P $$s/lib/.libs/libnl-3.so.[0-9]* $$s/lib/.libs/libnl-genl-3.so.[0-9]* \
+	   $(WIRELESS_STAGE)/usr/lib/
+	@touch $@
+
+# CFLAGS and LIBS reach wpa_supplicant's Makefile through the environment and
+# not on the command line, and that distinction is load-bearing: a variable set
+# on make's command line cannot be appended to, so `make CFLAGS=...` would
+# discard every += in the Makefile - including the ones that add the nl80211
+# driver's own flags - and the build would fail in a way that reads like a
+# missing header. From the environment, += still works.
+#
+# -I points at the unpacked libnl instead of a sysroot include path because
+# libnl's headers are only installed by `make install`, which is exactly the
+# thing not being run above. The .config asks for internal TLS and libtommath
+# so that nothing here needs OpenSSL: that covers WPA and WPA2 with a
+# passphrase, which is what a Pi on a home or office network needs.
+$(WPA_STAMP): $(LIBNL_STAMP) Makefile
+	@source $(WIRELESS_ENV); t=wpa_supplicant-$$WPA_VER.tar.gz; \
+	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(WPA_BASE)/$$t,wpa_supplicant-$$WPA_VER); \
+	 s=$(WIRELESS_DIR)/wpa_supplicant-$$WPA_VER; l=$(abspath $(WIRELESS_DIR))/libnl-$$LIBNL_VER; \
+	 echo "  UNPACK   $$t"; \
+	 rm -rf $$s; tar -xf $(DL_WIRELESS)/$$t -C $(WIRELESS_DIR); \
+	 printf '%s\n' \
+	   'CONFIG_DRIVER_NL80211=y' \
+	   'CONFIG_LIBNL32=y' \
+	   'CONFIG_CTRL_IFACE=y' \
+	   'CONFIG_BACKEND=file' \
+	   'CONFIG_TLS=internal' \
+	   'CONFIG_INTERNAL_LIBTOMMATH=y' > $$s/wpa_supplicant/.config; \
+	 echo "  BUILD    wpa_supplicant $$WPA_VER (-j$(JOBS))"; \
+	 ( cd $$s/wpa_supplicant && \
+	   CC=$(CROSS)gcc \
+	   CFLAGS="-Os --sysroot=$(abspath $(SYSROOT)) -I$$l/include" \
+	   LIBS="--sysroot=$(abspath $(SYSROOT)) -L$$l/lib/.libs -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
+	   $(MAKE) --no-print-directory -j$(JOBS) wpa_supplicant wpa_cli \
+	 ) > $$s/build.log 2>&1 || { \
+	   tail -30 $$s/build.log >&2; \
+	   echo "  FAIL     wpa_supplicant (full log: $$s/build.log)" >&2; exit 1; }; \
+	 mkdir -p $(WIRELESS_STAGE)/usr/sbin; \
+	 cp $$s/wpa_supplicant/wpa_supplicant $$s/wpa_supplicant/wpa_cli $(WIRELESS_STAGE)/usr/sbin/
+	@source $(WIRELESS_ENV); \
+	 $(call assert_target_binary,$(WIRELESS_STAGE)/usr/sbin/wpa_supplicant)
+	@touch $@
+
+# The firmware comes out of a .deb, which is an ar archive of two tarballs -
+# `ar x` and `tar` are all it takes, and both are on every host this builds on.
+#
+# Two things about the contents are not obvious. The Pi-specific NVRAM files
+# are symlinks into ../cypress, so the cypress files they point at have to come
+# too, and cyfmac43455-sdio.bin - what a Pi 4, a CM4, a Pi 5 and a CM5 all end
+# up asking for - is not in the package at all: Debian creates it with
+# update-alternatives, choosing between the -standard and -minimal builds by
+# priority. That link is made here, to standard, because that is the one with
+# the higher priority in the package's own postinst.
+#
+# Only brcmfmac434* and cyfmac434* are installed. That is every chip Raspberry
+# Pi has put on a board - 43430, 43436, 43455, 43456 - and leaving the rest
+# behind turns 20 MiB of firmware for other people's hardware into 3.5 MiB.
+$(BRCM_STAMP): $(WIRELESS_ENV) Makefile
+	@source $(WIRELESS_ENV); t=firmware-brcm80211_$${BRCM_VER}_all.deb; \
+	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(BRCM_BASE)/$$t,firmware-brcm80211-$$BRCM_VER); \
+	 x=$(WIRELESS_DIR)/firmware; \
+	 echo "  UNPACK   $$t"; \
+	 rm -rf $$x; mkdir -p $$x; \
+	 ( cd $$x && ar x $(abspath $(DL_WIRELESS))/$$t data.tar.xz && tar -xf data.tar.xz ) || { \
+	   echo "  FAIL     could not unpack $$t" >&2; exit 1; }; \
+	 f=$$(find $$x -type d -name brcm -path "*firmware*" | head -1); \
+	 [ -n "$$f" ] || { echo "  FAIL     $$t has no firmware/brcm directory" >&2; exit 1; }; \
+	 f=$$(dirname $$f); \
+	 ln -sf cyfmac43455-sdio-standard.bin $$f/cypress/cyfmac43455-sdio.bin; \
+	 mkdir -p $(WIRELESS_STAGE)/lib/firmware/brcm $(WIRELESS_STAGE)/lib/firmware/cypress; \
+	 cp -R $$f/brcm/brcmfmac434* $(WIRELESS_STAGE)/lib/firmware/brcm/; \
+	 cp -R $$f/cypress/cyfmac434* $(WIRELESS_STAGE)/lib/firmware/cypress/; \
+	 echo "  FIRMWARE $$(ls $(WIRELESS_STAGE)/lib/firmware/brcm | wc -l | tr -d ' ') files -> $(WIRELESS_STAGE)/lib/firmware"
+	@touch $@
+
+# What has to be true of the staged tree, asked of the tree rather than of the
+# steps that filled it. A dangling firmware symlink is the failure mode worth
+# catching here: it survives the build, ships, and turns into a wifi chip that
+# will not start on hardware nobody tested.
+$(WIRELESS_STAMP): $(LIBNL_STAMP) $(WPA_STAMP) $(BRCM_STAMP)
+	@set -e; s=$(WIRELESS_STAGE); \
+	 for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli \
+	          lib/firmware/brcm/brcmfmac43430-sdio.bin \
+	          lib/firmware/brcm/brcmfmac43455-sdio.bin; do \
+	   [ -e "$$s/$$f" ] || { echo "  FAIL     $$s/$$f is missing" >&2; exit 1; }; \
+	 done; \
+	 ls $$s/usr/lib/libnl-3.so.[0-9]* >/dev/null 2>&1 \
+	   || { echo "  FAIL     libnl-3 was not staged" >&2; exit 1; }; \
+	 d=$$(find $$s/lib/firmware -type l ! -exec test -e {} \; -print | head -3); \
+	 [ -z "$$d" ] || { echo "  FAIL     dangling firmware links: $$d" >&2; exit 1; }
+	@touch $@
+
+.PHONY: wireless-info
+wireless-info: $(WIRELESS_DEP) ## Versions, sizes and what the firmware covers
+ifeq ($(WITH_WIFI),1)
+	@source $(WIRELESS_ENV); \
+	 echo "  libnl     $$LIBNL_VER"; \
+	 echo "  wpa       $$WPA_VER"; \
+	 echo "  firmware  $$BRCM_VER"; \
+	 echo "  staged    $$(du -sk $(WIRELESS_STAGE) | cut -f1) KiB in $(WIRELESS_STAGE)"; \
+	 echo "  chips     $$(ls $(WIRELESS_STAGE)/lib/firmware/brcm | sed -n 's|^brcmfmac\([0-9a-z]*\)-sdio\..*|\1|p' | sort -u | tr '\n' ' ')"
+else
+	@echo "  WITH_WIFI=0 - this image has no wifi in it"
+endif
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -1262,6 +1551,14 @@ KEYMAP_GEN   := tools/generate_keymaps.py
 KEYMAP_DIR   := $(BUILD_DIR)/keymaps
 KEYMAP_STAMP := $(KEYMAP_DIR)/.generated
 PYTHON       ?= python3
+
+# WITH_WIFI changes what goes into the tree but touches no file, so on its own
+# it would not invalidate anything: make would find the stamp newer than every
+# prerequisite and leave the previous build's wifi in place. This records it,
+# the way the other steps record the versions they were asked for, and the
+# rootfs depends on the record.
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)
+ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
 IMG_DIR      := $(BUILD_DIR)/image
@@ -1320,7 +1617,12 @@ rootfs: $(ROOTFS_STAMP) ## Stage the root filesystem tree under build/rootfs
 	@printf '  READY    rootfs %s -> %s (%s MiB, %s files)\n' "$(SEPIAOS_VERSION)" $(ROOTFS_DIR) \
 	   "$$(du -sm $(ROOTFS_DIR) | cut -f1)" "$$(find $(ROOTFS_DIR) | wc -l | tr -d ' ')"
 
-$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) $(OVERLAY_SRC) Makefile
+$(ROOTFS_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(ROOTFS_SIG)' | cmp -s - $@ || printf '%s\n' '$(ROOTFS_SIG)' > $@
+
+$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) \
+                 $(WIRELESS_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
 	@rm -rf $(ROOTFS_DIR)
@@ -1335,15 +1637,19 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	@cp -R $(SYSROOT)/lib/ld-musl-aarch64.so.1 $(ROOTFS_DIR)/lib/
 	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
 	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
+	@$(if $(WIRELESS_DEP),cp -R $(WIRELESS_STAGE)/. $(ROOTFS_DIR)/,:)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
 	@$(call generate_etc)
 	@chmod 0755 $(ROOTFS_DIR) $(ROOTFS_DIR)/etc/init.d/rcS $(ROOTFS_DIR)/etc/init.d/rcK \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-gettys $(ROOTFS_DIR)/usr/sbin/sepia-firstboot \
-	            $(ROOTFS_DIR)/usr/sbin/resize2fs $(ROOTFS_DIR)/usr/bin/sepia-keymap
+	            $(ROOTFS_DIR)/usr/sbin/resize2fs $(ROOTFS_DIR)/usr/bin/sepia-keymap \
+	            $(ROOTFS_DIR)/usr/sbin/sepia-network \
+	            $(ROOTFS_DIR)/usr/share/udhcpc/default.script
+	@$(if $(WIRELESS_DEP),chmod 0755 $(ROOTFS_DIR)/usr/sbin/wpa_supplicant $(ROOTFS_DIR)/usr/sbin/wpa_cli,:)
 	@chmod 0700 $(ROOTFS_DIR)/root
-	@chmod 0600 $(ROOTFS_DIR)/etc/shadow
+	@chmod 0600 $(ROOTFS_DIR)/etc/shadow $(ROOTFS_DIR)/etc/network.conf
 	@chmod 1777 $(ROOTFS_DIR)/tmp $(ROOTFS_DIR)/var/tmp
 	@chmod 0555 $(ROOTFS_DIR)/proc $(ROOTFS_DIR)/sys
 	@$(call assert_rootfs)
@@ -1389,6 +1695,10 @@ define assert_rootfs
 	         sbin/loadkmap usr/sbin/resize2fs etc/inittab etc/init.d/rcS \
 	         etc/passwd etc/shadow usr/bin/sepia-keymap \
 	         usr/share/keymaps/english_us.kmap \
+	         etc/network.conf usr/sbin/sepia-network sbin/udhcpc \
+	         $(if $(WIRELESS_DEP),usr/sbin/wpa_supplicant usr/lib/libnl-3.so.200 \
+	         lib/firmware/brcm/brcmfmac43455-sdio.bin) \
+	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
 	done; \
@@ -1681,6 +1991,32 @@ QEMU_STAMP := $(QEMU_DIR)/.extracted
 QEMU_LOG    = $(QEMU_DIR)/boot-$(QEMU_BOARD).log
 GROW_IMG    = $(QEMU_DIR)/grow-$(QEMU_BOARD).img
 GROW_LOG    = $(QEMU_DIR)/grow-$(QEMU_BOARD).log
+NET_LOG     = $(QEMU_DIR)/net-$(QEMU_BOARD).log
+
+# QEMU's user-mode network hands out the same lease from the same addresses
+# every time, which is the only reason a DHCP client is checkable at all
+# without a DHCP server to run: 10.0.2.15/24 to the guest, 10.0.2.2 as the
+# gateway, 10.0.2.3 as the DNS proxy.
+#
+# The card gets its network on a USB device, and that is not a shortcut: QEMU
+# emulates neither the Pi 4's GENET (it says so - "brcm,bcm2711-genet-v5 has
+# been disabled!") nor the LAN9514 hanging off the Pi 3's USB hub, so a Pi's
+# own ethernet does not exist here on any board. -device usb-net is a CDC
+# Ethernet adapter, the guest calls it usb0, and its driver is a module - which
+# makes this a test of the driver autoloading as well as of the DHCP.
+#
+# Which module that is deliberately goes unchecked. QEMU's device offers an
+# RNDIS control interface and a CDC data interface, so cdc_ether, cdc_subset
+# and rndis_host all match something on it and whichever is asked for first
+# wins - runs here have ended up on two different ones. What matters is that a
+# module was loaded at all, and only a loaded module can produce a usb0.
+NET_ADDRESS := 10\.0\.2\.15/24
+NET_GATEWAY := 10\.0\.2\.2
+# Deferred, not immediate: $(comma) is defined further down with the rest of
+# the QEMU machinery, and := here would expand it while it is still empty -
+# which produces `-netdev userid=n0`, and a QEMU that exits before it has
+# opened the serial log the check then reads.
+NET_DEVICE   = -netdev user$(comma)id=n0 -device usb-net$(comma)netdev=n0
 
 QEMU_APPEND = console=$(QEMU_CONSOLE),115200 earlycon=$(QEMU_EARLYCON) \
               root=$(QEMU_ROOTDEV) rootfstype=ext4 rootwait
@@ -1696,8 +2032,8 @@ ifneq ($(filter grow-check test,$(MAKECMDGOALS)),)
 endif
 
 .PHONY: test
-test: image-check boot-check grow-check ## Test the image on one board: contents, login prompt, first-boot resize
-	@echo "  PASS     $(IMAGE) boots on $(QEMU_BOARD) and grows"
+test: image-check boot-check grow-check net-check ## Test the image on one board: contents, login prompt, first-boot resize, network
+	@echo "  PASS     $(IMAGE) boots on $(QEMU_BOARD), grows and reaches the network"
 
 # What CI runs. Every board QEMU can emulate gets the same image booted on it,
 # which is the claim a single universal card makes and so the claim worth
@@ -1721,6 +2057,43 @@ boot-check: $(QEMU_STAMP) ## Boot the image under QEMU as a Pi 3 and check it re
 	@$(call assert_booted,$(QEMU_LOG))
 	@echo "  OK       reached a login prompt"
 
+# Networking, checked the same way as the boot: attach a network device, let
+# the image do whatever /etc/network.conf says, and read the serial log back.
+# What this proves is the whole path - a driver loaded for a device nothing
+# autoloads for, an interface found without its name being assumed, a lease,
+# an address and a default route - and what it does not prove is name
+# resolution or that anything is reachable, because QEMU's user-mode network
+# answers for both and would say yes regardless.
+.PHONY: net-check
+net-check: $(QEMU_STAMP) ## Boot with a network attached and check DHCP configures it
+	@$(call require_qemu)
+	@echo "  NET      $(QEMU_BOARD) as $(QEMU_MACHINE), QEMU user-mode network (max $(QEMU_TIMEOUT)s)"
+	@rm -f $(NET_LOG)
+	@$(call run_qemu,$(NET_LOG),-no-reboot -drive file=$(IMAGE)$(comma)format=raw$(comma)if=sd$(comma)snapshot=on $(NET_DEVICE),login:)
+	@$(call assert_networked,$(NET_LOG))
+	@echo "  OK       an address by DHCP, and a route out"
+
+define assert_networked
+	l=$(1); fail=0; \
+	check() { \
+	  if grep -aqE "$$1" "$$l"; then printf '  OK       %s\n' "$$2"; \
+	  else printf '  FAIL     %s\n' "$$2"; fail=1; fi; }; \
+	check 'usb0: register .* at usb-' \
+	      'a driver was loaded for a device nothing autoloads for'; \
+	check 'sepia-network: usb0 $(NET_ADDRESS) via $(NET_GATEWAY) \(dhcp\)' \
+	      'DHCP gave usb0 an address and a default route'; \
+	check 'sepia-gettys: login prompt' \
+	      'the boot carried on to a login prompt'; \
+	[ "$$fail" = 0 ] || { echo "  full log: $$l" >&2; exit 1; }
+endef
+
+# It waits for the login prompt rather than for the swap line, and that is not
+# interchangeable: everything this asserts about the resize is printed before
+# the getty starts, but bringing the network up sits between the two and can
+# take ten seconds on a machine with no network device. Stopping at the swap
+# line killed the guest in that gap, and the check then failed on the getty it
+# had not waited for.
+#
 # snapshot=on is deliberately absent here and present above: this run has to
 # write, because the whole point is the reboot between the two passes of
 # sepia-firstboot. It works on a copy, so `make grow-check` twice in a row
@@ -1733,7 +2106,7 @@ grow-check: $(QEMU_STAMP) ## Boot a copy on a larger card and check the first-bo
 	@rm -f $(GROW_LOG) $(GROW_IMG)
 	@cp $(IMAGE) $(GROW_IMG)
 	@dd if=/dev/zero of=$(GROW_IMG) bs=1 count=0 seek=$$(( $(GROW_SIZE_MIB) * 1048576 )) 2>/dev/null
-	@$(call run_qemu,$(GROW_LOG),-drive file=$(GROW_IMG)$(comma)format=raw$(comma)if=sd,swap active|no swap|leaves nothing)
+	@$(call run_qemu,$(GROW_LOG),-drive file=$(GROW_IMG)$(comma)format=raw$(comma)if=sd,sepia-gettys: login prompt|no swap|leaves nothing)
 	@$(call assert_grown,$(GROW_LOG),$(GROW_IMG))
 	@echo "  OK       grew to $(GROW_SIZE_MIB) MiB with swap, and came back up"
 
