@@ -1242,6 +1242,27 @@ e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Show the e2fsprogs build
 
 WITH_WIFI ?= 1
 
+# musl's headers, ahead of the compiler's own. GCC searches its internal
+# include/ and include-fixed/ *before* the sysroot, and include-fixed holds
+# whatever fixincludes rewrote when the toolchain was built - against glibc,
+# because both of these toolchains are glibc ones. Arm's Linux toolchain has a
+# glibc <pthread.h> in there, so the first thing here that includes <pthread.h>
+# picks it up instead of musl's and stops at `bits/endian.h: No such file or
+# directory` - a header musl does not have and never will.
+#
+# -isystem is searched before the built-in directories, so this puts musl's
+# /usr/include first while leaving it a system directory (warnings inside it
+# stay suppressed, which plain -I would undo). The compiler-provided headers
+# musl does not ship - stddef.h, stdarg.h, float.h - are still found where they
+# always were, one directory later.
+#
+# It is only needed for the wireless step because nothing built before it
+# includes <pthread.h>, and only on Linux because messense's macOS toolchain
+# ships no fixincludes headers at all: its include-fixed/ holds a README and an
+# empty bits/. Harmless on both, so it is not made conditional - a difference
+# that only bites on one host is exactly the difference worth not having.
+MUSL_INCLUDES = -isystem $(abspath $(SYSROOT))/usr/include
+
 # Empty means "latest", resolved once and cached like every other version here.
 LIBNL_VERSION ?=
 WPA_VERSION   ?=
@@ -1396,7 +1417,7 @@ $(LIBNL_STAMP): $(WIRELESS_ENV) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
 	 ( cd $$s && ./configure --host=aarch64-linux --prefix=/usr --disable-static --disable-cli \
 	     YACC=false FLEX=false \
 	     CC=$(CROSS)gcc AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
-	     CFLAGS="-Os --sysroot=$(abspath $(SYSROOT))" \
+	     CFLAGS="-Os $(MUSL_INCLUDES) --sysroot=$(abspath $(SYSROOT))" \
 	     LDFLAGS="--sysroot=$(abspath $(SYSROOT)) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
 	   ) > $$s/configure.log 2>&1 || { \
 	   tail -20 $$s/configure.log >&2; \
@@ -1439,7 +1460,7 @@ $(WPA_STAMP): $(LIBNL_STAMP) Makefile
 	 echo "  BUILD    wpa_supplicant $$WPA_VER (-j$(JOBS))"; \
 	 ( cd $$s/wpa_supplicant && \
 	   CC=$(CROSS)gcc \
-	   CFLAGS="-Os --sysroot=$(abspath $(SYSROOT)) -I$$l/include" \
+	   CFLAGS="-Os $(MUSL_INCLUDES) --sysroot=$(abspath $(SYSROOT)) -I$$l/include" \
 	   LIBS="--sysroot=$(abspath $(SYSROOT)) -L$$l/lib/.libs -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
 	   $(MAKE) --no-print-directory -j$(JOBS) wpa_supplicant wpa_cli \
 	 ) > $$s/build.log 2>&1 || { \
