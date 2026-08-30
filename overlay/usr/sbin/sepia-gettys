@@ -80,6 +80,43 @@ while read -r name flag dev; do
 done < /run/sepia-consoles
 rm -f /run/sepia-consoles
 
+# Alt+F1 through Alt+F9: a login prompt on each of the first nine virtual
+# terminals.
+#
+# The loop above gives Alt+F1 and nothing more. It is driven by /proc/consoles,
+# which lists the consoles the kernel prints to - the VT layer appears there
+# once, as tty0, and /dev/console is what it resolves to. The other eight are
+# not consoles at all, so they have to be named here rather than discovered.
+#
+# Only when there is a screen. A board on a serial cable with nothing plugged
+# into HDMI has no VT to switch between, and nine gettys respawning on terminals
+# nobody can reach is nine processes achieving nothing; $vts is empty in exactly
+# that case, because the loop above only fills it for a tty[0-9] console.
+#
+# tty10 is left free on purpose. Alt+F10 is meant for a graphical session later,
+# and a getty sitting on that VT would be one more thing to evict first.
+VT_FIRST=2
+VT_LAST=9
+if [ -n "$vts" ]; then
+	n=$VT_FIRST
+	while [ "$n" -le "$VT_LAST" ]; do
+		tty=tty$n
+		# devtmpfs makes all 63 of these, so the mknod is only for a kernel
+		# that did not. The VT major is 4 and the minor is the VT number.
+		if [ ! -c "/dev/$tty" ] && ! mknod "/dev/$tty" c 4 "$n" 2>/dev/null; then
+			echo "sepia-gettys: cannot create /dev/$tty; no login prompt on Alt+F$n"
+			n=$((n + 1))
+			continue
+		fi
+		if ! grep -q "^$tty::" "$new"; then
+			echo "$tty::$GETTY $tty 0 vt100" >> "$new"
+			found="$found $tty"
+			vts="$vts $tty"
+		fi
+		n=$((n + 1))
+	done
+fi
+
 if [ -z "$found" ]; then
 	echo "sepia-gettys: no usable console - there will be no login prompt"
 	rm -f "$new"
