@@ -1,0 +1,20 @@
+Title:		kmaps.tcz
+Description:    Keyboard's maps for busybox terminal.
+Version:        1.15.2-3
+Author:         Various
+Original-site:  ftp://ftp.altlinux.com/pub/people/legion/kbd
+Copying-policy: GPL
+Size:		152K
+Extension_by:   Curaga
+Tags:	        All keymaps kbd converted kmaps
+Comments:       All keymaps available in kbd converted to the
+		binary kmap format used in Busybox.
+Change-log:     2008/07/05 - First version
+                2010/01/31 - Update to 1.15.1
+                2010/02/12 - Added thai keymaps
+                2010/06/02 - Updated dvorak and dvorak-r
+                2010/12/14 - Update to 1.15.2. NOTE: changed structure!
+                2010/12/16 - Restored dvorak.kmap from Jun 2nd
+		2010/12/22 - Updated conversion script w/ feedback, re-converted 1.15.2
+		2023/09/30 - Extracts the br-abnt2.map file from kbd.tcz of TC 14.x x86_64. I rename the br-abnt2.map to br-abnt2_AspireOneD250-1185.map, and change with vim.
+Current:	2023/10/01 - Extracts the br-abnt2.map file from kbd.tcz of TC 14.x x86_64. I rename the br-abnt2.map to br-abnt2_Lenovo100e2ndGen.map, and change with vim.

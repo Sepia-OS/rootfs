@@ -65,13 +65,14 @@ jobs:
       # both for the module fetch and to resolve the musl version. zstd is here
       # for actions/cache, which otherwise falls back to gzip and says so, and
       # python3 for tools/generate_keymaps.py - the one part of the build that
-      # needs an interpreter.
+      # needs an interpreter - and squashfs-tools for vendor/keymaps/kmaps.tcz,
+      # since a .tcz is a squashfs image and unsquashfs is what opens one.
       - name: Install build tools
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             build-essential make git curl ca-certificates \
-            jq xz-utils bzip2 zstd mtools qemu-system-arm python3
+            jq xz-utils bzip2 zstd mtools qemu-system-arm python3 squashfs-tools
 
       - uses: actions/checkout@v5
 

@@ -145,21 +145,49 @@ ask_keymap() {
 	[ -n "$maps" ] || { say "no keymaps installed to choose from"; return 0; }
 	current=$(cat /etc/keymap 2>/dev/null)
 
-	out ""
-	out "  Keyboard layout"
-	i=0
-	for m in $maps; do
-		i=$((i + 1))
-		out "$(printf '    %2d) %s' "$i" "$m")"
-	done
-	outn "$(printf '  Choose 1-%d [keep %s]: ' "$i" "${current:-english_us}")"
-	answer=$(ask "$NEXT_WAIT") || answer=
+	total=$(printf '%s\n' $maps | wc -l | tr -d ' ')
 
-	case "$answer" in
-		''|*[!0-9]*) say "keyboard: unchanged"; return 0 ;;
-	esac
-	if [ "$answer" -lt 1 ] || [ "$answer" -gt "$i" ]; then
-		say "keyboard: $answer is not one of 1-$i, leaving it unchanged"
+	# Paged, for the same reason `sepia-keymap list` is: there are well over a
+	# hundred layouts installed and only about forty rows to put them in, so an
+	# unpaged list would scroll its own numbers off the screen and leave a
+	# prompt asking the user to pick one of a set they can no longer see.
+	#
+	# Enter takes the next page and wraps round at the end, a number picks that
+	# layout, and anything else - including the timeout - keeps what is already
+	# configured. PAGE is deliberately smaller than the screen: the heading, the
+	# prompt and the lines rcS has already printed all need room.
+	PAGE=20
+	first=1
+	while :; do
+		out ""
+		out "  Keyboard layout"
+		i=0
+		for m in $maps; do
+			i=$((i + 1))
+			if [ "$i" -ge "$first" ] && [ "$i" -lt $((first + PAGE)) ]; then
+				out "$(printf '    %3d) %s' "$i" "$m")"
+			fi
+		done
+		last=$((first + PAGE - 1))
+		[ "$last" -gt "$total" ] && last=$total
+		outn "$(printf '  %d-%d of %d. Choose a number, Enter for more, k to keep %s: ' \
+			"$first" "$last" "$total" "${current:-english_us}")"
+		answer=$(ask "$NEXT_WAIT") || answer=
+
+		case "$answer" in
+			'')
+				# Next page, wrapping, so it is never a dead end.
+				first=$((first + PAGE))
+				[ "$first" -gt "$total" ] && first=1
+				continue
+				;;
+			*[!0-9]*) say "keyboard: unchanged"; return 0 ;;
+		esac
+		break
+	done
+
+	if [ "$answer" -lt 1 ] || [ "$answer" -gt "$total" ]; then
+		say "keyboard: $answer is not one of 1-$total, leaving it unchanged"
 		return 0
 	fi
 	name=$(printf '%s\n' $maps | sed -n "${answer}p")

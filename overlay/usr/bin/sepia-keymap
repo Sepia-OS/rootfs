@@ -26,7 +26,7 @@ usage() {
 	cat <<USAGE
 usage: $self <command> [layout]
 
-  list                 show the layouts that are installed
+  list                 show the layouts that are installed, a page at a time
   show                 show which layout is configured, and where from
   set <layout>         use it now, and again every time you log in
   set-system <layout>  use it now, and for everyone on every boot
@@ -94,15 +94,58 @@ cmd=${1:-}
 case "$cmd" in
 	list)
 		current=$(configured || true)
-		found=0
-		for name in $(layouts); do
-			found=1
+		all=$(layouts)
+		[ -n "$all" ] || die "no layouts installed in $KEYMAP_DIR"
+		total=$(printf '%s\n' "$all" | wc -l | tr -d ' ')
+
+		# Paged, because there are well over a hundred of these and a plain
+		# list scrolls all but the last screen of them away on a VT that
+		# cannot be scrolled back.
+		#
+		# Only when there is somebody to page for, though. A redirected or
+		# piped list is data rather than a display - `sepia-keymap list | grep
+		# de` has to keep working, and so does a `wc -l` of it - so the pager
+		# is skipped entirely unless stdout is a terminal. The prompt is read
+		# from /dev/tty for the same reason: stdin may be something else.
+		# The terminal is opened once, on its own descriptor, and held for
+		# the whole listing rather than reopened at every prompt. Both work -
+		# measured, through a pty, paging the full list either way - so this is
+		# one open instead of one per page and nothing more than that.
+		page=0
+		if [ -t 1 ] && exec 4</dev/tty 2>/dev/null; then
+			rows=$(stty size 2>/dev/null | cut -d' ' -f1)
+			case "$rows" in
+				''|*[!0-9]*) rows=24 ;;
+			esac
+			[ "$rows" -gt 6 ] || rows=24
+			page=$((rows - 3))
+		fi
+
+		shown=0
+		stopped=0
+		for name in $all; do
 			mark=" "
 			[ "$name" = "$current" ] && mark="*"
 			echo "$mark $name"
+			shown=$((shown + 1))
+			if [ "$page" -gt 0 ] && [ "$shown" -lt "$total" ] \
+			   && [ $((shown % page)) -eq 0 ]; then
+				printf -- '-- %d of %d -- Enter for more, q to stop: ' \
+					"$shown" "$total"
+				if ! read -r reply <&4; then
+					echo
+					stopped=1
+					break
+				fi
+				case "$reply" in
+					[qQ]*) stopped=1; break ;;
+				esac
+			fi
 		done
-		[ "$found" = 1 ] || die "no layouts installed in $KEYMAP_DIR"
-		if [ -n "$current" ]; then
+
+		[ "$page" -gt 0 ] && exec 4<&-
+
+		if [ "$stopped" = 0 ] && [ -n "$current" ]; then
 			echo
 			echo "* is the one in use"
 		fi

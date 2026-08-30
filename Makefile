@@ -73,6 +73,10 @@ BOOT_SIG   = $(BOOT_REPO)|$(CHANNEL)|$(BOOT_TAG)|$(GITHUB_API)
 GITHUB_API ?= https://api.github.com
 
 SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo "sha256sum" || echo "shasum -a 256")
+# Only the vendored keymap archive needs this, and it needs it because that is
+# the checksum Tiny Core publishes. Fed from stdin rather than by name: the two
+# spellings disagree about how to print a filename but not about the digest.
+MD5    := $(shell command -v md5sum >/dev/null 2>&1 && echo "md5sum" || echo "md5")
 
 # --retry-all-errors is not decoration: busybox.net resets connections
 # mid-transfer, and plain --retry does not cover a reset once bytes are moving.
@@ -1586,6 +1590,16 @@ KEYMAP_DIR   := $(BUILD_DIR)/keymaps
 KEYMAP_STAMP := $(KEYMAP_DIR)/.generated
 PYTHON       ?= python3
 
+# The generated eleven are not the whole set. kbd's own maps, mechanically
+# converted to the busybox binary format, are vendored under vendor/keymaps as
+# the Tiny Core extension that publishes them; a .tcz is a squashfs image, so
+# unsquashfs is what opens it. They are committed rather than downloaded because
+# the upstream file has not changed since 2023 and a build should not need the
+# network for a keyboard layout.
+KEYMAP_VENDOR     := vendor/keymaps/kmaps.tcz
+KEYMAP_VENDOR_MD5 := vendor/keymaps/kmaps.tcz.md5.txt
+KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
+
 # WITH_WIFI changes what goes into the tree but touches no file, so on its own
 # it would not invalidate anything: make would find the stamp newer than every
 # prerequisite and leave the previous build's wifi in place. This records it,
@@ -1611,14 +1625,19 @@ ROOTFS_DIRS := bin boot dev etc etc/init.d home lib media mnt opt proc root run 
 # value the kernel booted with. That is not a detail: a table written into a
 # .kmap is loaded in full, so a layout built from nothing would set every key
 # it forgot to NUL and leave a keyboard that types but cannot be typed on.
-$(KEYMAP_STAMP): $(KEYMAP_GEN) Makefile
+$(KEYMAP_STAMP): $(KEYMAP_GEN) $(KEYMAP_VENDOR) $(KEYMAP_VENDOR_MD5) Makefile
 	@command -v $(PYTHON) >/dev/null 2>&1 || { \
 	  echo "$(PYTHON) is required to generate the console keymaps" >&2; \
 	  echo "(brew install python / apt-get install python3, or set PYTHON=)" >&2; \
 	  exit 1; }
+	@command -v unsquashfs >/dev/null 2>&1 || { \
+	  echo "unsquashfs is required to unpack $(KEYMAP_VENDOR)" >&2; \
+	  echo "(brew install squashfs / apt-get install squashfs-tools)" >&2; \
+	  exit 1; }
 	@echo "  KEYMAPS  $(KEYMAP_DIR)"
-	@rm -rf $(KEYMAP_DIR)
+	@rm -rf $(KEYMAP_DIR) $(KEYMAP_VENDOR_DIR)
 	@$(PYTHON) $(KEYMAP_GEN) $(KEYMAP_DIR) | sed -n 's/^ *note:/  NOTE    /p'
+	@$(call unpack_vendor_keymaps)
 	@$(call assert_keymaps)
 	@touch $@
 
@@ -1626,6 +1645,48 @@ $(KEYMAP_STAMP): $(KEYMAP_GEN) Makefile
 keymaps: $(KEYMAP_STAMP) ## Generate the console keymaps
 	@printf '  READY    %s keymaps -> %s\n' \
 	   "$$(ls $(KEYMAP_DIR)/*.kmap | wc -l | tr -d ' ')" $(KEYMAP_DIR)
+
+# Every vendored layout is named for the family directory it came out of -
+# qwertz/de-latin1.kmap becomes qwertz-de-latin1 - and that is not decoration.
+# Four basenames appear in two families each (cz, es, no and trf), and six more
+# collide with the curated set (de, dvorak, es, fr, it, uk), so a flat copy
+# would silently overwrite ten layouts including the hand-corrected German one.
+# Prefixing makes every name unique by construction, and it leaves the eleven
+# curated names short and unchanged - which matters, because /etc/keymap on an
+# already-installed card names them and assert_rootfs requires english_us.
+#
+# A collision is still a hard error rather than an overwrite: if a future
+# archive ever does clash, that should stop the build instead of quietly
+# swapping somebody's keyboard out from under them.
+define unpack_vendor_keymaps
+	set -e; \
+	have=$$($(MD5) < $(KEYMAP_VENDOR) | awk '{print $$1}'); \
+	want=$$(awk '{print $$1}' $(KEYMAP_VENDOR_MD5)); \
+	if [ "$$have" != "$$want" ]; then \
+	  echo "  FAIL     $(KEYMAP_VENDOR) does not match $(KEYMAP_VENDOR_MD5)" >&2; \
+	  echo "           expected $$want" >&2; \
+	  echo "           got      $$have" >&2; \
+	  exit 1; \
+	fi; \
+	unsquashfs -q -no-progress -d $(KEYMAP_VENDOR_DIR) $(KEYMAP_VENDOR) >/dev/null || { \
+	  echo "  FAIL     could not unpack $(KEYMAP_VENDOR)" >&2; exit 1; }; \
+	n=0; \
+	for f in $(KEYMAP_VENDOR_DIR)/usr/share/kmap/*.kmap \
+	         $(KEYMAP_VENDOR_DIR)/usr/share/kmap/*/*.kmap; do \
+	  [ -e "$$f" ] || continue; \
+	  base=$${f##*/}; dir=$${f%/*}; fam=$${dir##*/}; \
+	  if [ "$$fam" = kmap ]; then name=$$base; else name=$$fam-$$base; fi; \
+	  if [ -e "$(KEYMAP_DIR)/$$name" ]; then \
+	    echo "  FAIL     $$f would overwrite $(KEYMAP_DIR)/$$name" >&2; exit 1; \
+	  fi; \
+	  cp "$$f" "$(KEYMAP_DIR)/$$name"; \
+	  n=$$((n + 1)); \
+	done; \
+	if [ "$$n" -eq 0 ]; then \
+	  echo "  FAIL     no keymaps came out of $(KEYMAP_VENDOR)" >&2; exit 1; \
+	fi; \
+	printf '  VENDOR   %s layouts from %s (md5 verified)\n' "$$n" $(KEYMAP_VENDOR)
+endef
 
 # busybox loadkmap refuses anything whose first seven bytes are not "bkeymap",
 # and silently mis-reads a file of the wrong length, so both are checked here
