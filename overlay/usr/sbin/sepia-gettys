@@ -43,6 +43,7 @@ sed "/^$MARKER/q" "$INITTAB" > "$new" || exit 0
 awk '{print $1, ($3 ~ /C/ ? "C" : "-"), $NF}' /proc/consoles > /run/sepia-consoles
 
 found=
+vts=
 while read -r name flag dev; do
 	if [ "$flag" = C ]; then
 		tty=console
@@ -69,6 +70,13 @@ while read -r name flag dev; do
 	grep -q "^$tty::" "$new" && continue
 	echo "$tty::$GETTY $tty 0 vt100" >> "$new"
 	found="$found $tty"
+	# Only the VTs are worth clearing below, and tty[0-9] is what tells one
+	# apart from ttyAMA1 or ttyS0. A serial terminal has neither the logo nor
+	# the rows it costs, and clearing one would only throw away the boot log
+	# somebody is very likely reading over the wire.
+	case "$name" in
+		tty[0-9]*) vts="$vts $tty" ;;
+	esac
 done < /run/sepia-consoles
 rm -f /run/sepia-consoles
 
@@ -79,13 +87,41 @@ if [ -z "$found" ]; then
 fi
 
 if cmp -s "$new" "$INITTAB"; then
+	# Already what it should be, which is every boot after the one that first
+	# wrote it: init read these lines at startup and will start the gettys on
+	# its own once rcS returns, so there is nothing to signal. Not an early
+	# exit, though - the console below still has to be cleared, and this is the
+	# path that nearly always runs.
 	rm -f "$new"
-	exit 0
+	reload=
+else
+	# cat, not mv: /run is a different filesystem, and rewriting in place keeps
+	# the inode rather than replacing the file init was told to re-read.
+	cat "$new" > "$INITTAB"
+	rm -f "$new"
+	echo "sepia-gettys: login prompt on$found"
+	reload=1
 fi
 
-# cat, not mv: /run is a different filesystem, and rewriting in place keeps the
-# inode rather than replacing the file init was told to re-read.
-cat "$new" > "$INITTAB"
-rm -f "$new"
-echo "sepia-gettys: login prompt on$found"
-kill -HUP 1
+# Clear the framebuffer consoles, last thing before any login prompt can reach
+# them.
+#
+# This is not cosmetic. The kernel draws its boot logo - one raspberry per CPU -
+# and fbcon then starts the console's scrolling region *below* it, so those rows
+# are gone for the life of that console and every line of output scrolls in the
+# space that is left. ESC c is the VT's full reset, and reset_terminal() puts
+# the scrolling region back to the top of the screen, which is the only thing
+# short of a reboot that gives the rows back. `clear` does not: it blanks inside
+# the region without moving it, so the logo and the loss both survive it.
+#
+# Before the kill below rather than after, because init starts the gettys the
+# moment it is signalled; resetting afterwards would wipe a login prompt that
+# had already been printed and leave an apparently blank screen until a key was
+# pressed.
+for vt in $vts; do
+	printf '\033c' > "/dev/$vt" 2>/dev/null
+done
+
+if [ -n "$reload" ]; then
+	kill -HUP 1
+fi
