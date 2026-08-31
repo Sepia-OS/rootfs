@@ -1569,6 +1569,14 @@ endif
 
 SEPIAOS_VERSION ?= 0.1.0
 
+# What the running system shows a person - the login banner and the PRETTY_NAME
+# in os-release. It is separate from SEPIAOS_VERSION because that one also names
+# the image file and fills VERSION_ID, neither of which may carry a space or a
+# bracket, whereas this is free text. The release workflow sets it to the
+# GitHub release version, with " (pre)" appended for a pre-release; a plain
+# build leaves it equal to SEPIAOS_VERSION.
+SEPIAOS_VERSION_DISPLAY ?= $(SEPIAOS_VERSION)
+
 # Where the boot partition's cmdline.txt says the rootfs is, and where fstab
 # should look for the boot partition. These must match ../boot's CMDLINE_ROOT.
 ROOT_DEVICE ?= /dev/mmcblk0p2
@@ -1611,7 +1619,7 @@ KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 # prerequisite and leave the previous build's wifi in place. This records it,
 # the way the other steps record the versions they were asked for, and the
 # rootfs depends on the record.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -1772,14 +1780,14 @@ define generate_etc
 	  printf "$$f" '$(BOOT_DEVICE)' /boot vfat defaults,noatime 0 2; } > $$r/etc/fstab; \
 	{ echo 'NAME="SepiaOS"'; \
 	  echo 'ID=sepiaos'; \
-	  echo 'VERSION="$(SEPIAOS_VERSION)"'; \
+	  echo 'VERSION="$(SEPIAOS_VERSION_DISPLAY)"'; \
 	  echo 'VERSION_ID="$(SEPIAOS_VERSION)"'; \
-	  echo 'PRETTY_NAME="SepiaOS $(SEPIAOS_VERSION)"'; \
+	  echo 'PRETTY_NAME="SepiaOS $(SEPIAOS_VERSION_DISPLAY)"'; \
 	  echo 'HOME_URL="https://github.com/Sepia-OS"'; \
 	  echo "SEPIAOS_BOOT_RELEASE=\"$$BOOT_TAG\""; \
 	  echo "SEPIAOS_FIRMWARE=\"$$FW_TAG\""; \
 	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; } > $$r/etc/os-release; \
-	{ echo 'SepiaOS $(SEPIAOS_VERSION) \n \l'; echo; } > $$r/etc/issue; \
+	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
 
@@ -1827,7 +1835,7 @@ rootfs-check: $(ROOTFS_STAMP) ## Re-read the staged tree and check it could boot
 
 .PHONY: rootfs-info
 rootfs-info: $(ROOTFS_STAMP) ## Show what was staged into the root filesystem
-	@echo "  version  SepiaOS $(SEPIAOS_VERSION)"
+	@echo "  version  SepiaOS $(SEPIAOS_VERSION_DISPLAY)"
 	@echo "  tree     $(ROOTFS_DIR)"
 	@printf '  size     %s MiB in %s files\n' \
 	   "$$(du -sm $(ROOTFS_DIR) | cut -f1)" "$$(find $(ROOTFS_DIR) | wc -l | tr -d ' ')"
@@ -2365,6 +2373,7 @@ help: ## Show this help
 	  "E2FS_VERSION"      "pin an e2fsprogs release instead of taking the latest one" \
 	  "HOST_E2FSPROGS"    "directory of mke2fs/debugfs to use instead of building them" \
 	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
+	  "SEPIAOS_VERSION_DISPLAY" "login-banner version text (default the SEPIAOS_VERSION)" \
 	  "IMAGE_SIZE_MIB"    "shipped image size, power of two (default $(IMAGE_SIZE_MIB))" \
 	  "ROOT_PASSWORD_HASH" "sha512-crypt for root; every $$ has to be doubled" \
 	  "GROW_SIZE_MIB"     "card size grow-check pretends to have (default $(GROW_SIZE_MIB))" \

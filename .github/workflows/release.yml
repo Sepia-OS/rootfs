@@ -149,6 +149,11 @@ jobs:
     env:
       QEMU_TIMEOUT: 300
       SEPIAOS_VERSION: ${{ needs.gate.outputs.version }}
+      # What the login banner shows. The GitHub release version, with " (pre)"
+      # appended when this is a pre-release, so the running system says what it
+      # is. Kept apart from SEPIAOS_VERSION because that one also names the image
+      # file and fills VERSION_ID, which cannot hold a space or a bracket.
+      SEPIAOS_VERSION_DISPLAY: "${{ needs.gate.outputs.version }}${{ inputs.prerelease && ' (pre)' || '' }}"
       # A release build takes the latest full release of the boot partition, a
       # pre-release build the latest pre-release. Implemented literally, so a
       # release never quietly ships a pre-release boot partition. Note that
