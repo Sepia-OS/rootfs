@@ -268,10 +268,32 @@ iface_down() {
 wpa_pidfile() { echo "$RUNDIR/wpa_supplicant.pid"; }
 
 # The supplicant is a separate program with its own configuration file, and
-# that file is generated here rather than kept: it holds the passphrase in
-# clear, so it belongs in /run - a tmpfs, gone at power-off - and never on the
-# card. wpa_passphrase would hash it, but the hash is as good as the password
-# for joining the network, so this buys nothing but a false sense of it.
+# that file is generated here rather than kept: it belongs in /run - a tmpfs,
+# gone at power-off - and never on the card. What persists on the card, in
+# /etc/network.conf, is the PMK rather than the passphrase (see pmk() above):
+# equal for joining this network, but it does not leak a passphrase a person
+# may have reused elsewhere. An open network, or a passphrase too short for
+# wpa_passphrase to accept, is the exception - then WIFI_PSK is what was typed.
+# Turn an SSID and a passphrase into the 256-bit pre-shared key wpa_supplicant
+# actually uses. This is PBKDF2 over the passphrase salted with the SSID, so it
+# is one-way: storing it instead of the passphrase means the card never holds
+# the human passphrase, which people reuse across networks and services. It is
+# no weaker for joining *this* network - the PMK is what joins it either way -
+# but a stolen card no longer leaks a password worth trying elsewhere.
+#
+# wpa_passphrase only accepts an 8..63 character passphrase; for anything else
+# (too short, or an already-hex PMK pasted in) it fails, and the caller keeps
+# what the user gave verbatim.
+pmk() {
+	command -v wpa_passphrase >/dev/null 2>&1 || return 1
+	[ -n "${2:-}" ] || return 1
+	out=$(wpa_passphrase "$1" "$2" 2>/dev/null) || return 1
+	hex=$(printf '%s\n' "$out" \
+		| sed -n 's/^[[:space:]]*psk=\([0-9a-f]\{64\}\)$/\1/p')
+	[ -n "$hex" ] || return 1
+	printf '%s\n' "$hex"
+}
+
 write_wpa_conf() {
 	mkdir -p "$RUNDIR"
 	umask 077
@@ -282,7 +304,16 @@ write_wpa_conf() {
 		echo "network={"
 		printf '\tssid="%s"\n' "$WIFI_SSID"
 		if [ -n "$WIFI_PSK" ]; then
-			printf '\tpsk="%s"\n' "$WIFI_PSK"
+			# A 64-character hex string is a precomputed PMK and wpa_supplicant
+			# wants it bare; a passphrase is quoted. This is what lets the card
+			# store the PMK (see pmk() above) yet still accept a passphrase that
+			# was set before this existed, or one that was too short to hash.
+			if [ ${#WIFI_PSK} -eq 64 ] && \
+			   ! printf '%s' "$WIFI_PSK" | grep -q '[^0-9a-fA-F]'; then
+				printf '\tpsk=%s\n' "$WIFI_PSK"
+			else
+				printf '\tpsk="%s"\n' "$WIFI_PSK"
+			fi
 		else
 			# An open network. Saying so explicitly is the only way to stop
 			# the supplicant looking for a key it has not been given.
@@ -495,7 +526,15 @@ case "$cmd" in
 				;;
 			*)
 				set_conf WIFI_SSID "$1"
-				set_conf WIFI_PSK "${2:-}"
+				# Store the PMK, not the passphrase, so the human passphrase
+				# never lands on the card. If it cannot be hashed - an open
+				# network, or a passphrase outside the 8..63 wpa_passphrase
+				# accepts - keep what was given; write_wpa_conf handles both.
+				if psk=$(pmk "$1" "${2:-}"); then
+					set_conf WIFI_PSK "$psk"
+				else
+					set_conf WIFI_PSK "${2:-}"
+				fi
 				[ $# -ge 3 ] && set_conf WIFI_COUNTRY "$3"
 				set_conf WIFI dhcp
 				apply_wifi

@@ -782,11 +782,16 @@ $(BB_CONFIGURED): $(BB_UNPACKED) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
 	 sed -i.bak \
 	     -e 's|^CONFIG_EXTRA_CFLAGS=.*|CONFIG_EXTRA_CFLAGS="$(BB_CFLAGS)"|' \
 	     -e 's|^CONFIG_EXTRA_LDFLAGS=.*|CONFIG_EXTRA_LDFLAGS="$(BB_LDFLAGS)"|' \
+	     -e 's|^CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=.*|CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"|' \
 	     $$s/.config; \
 	 grep -q '^# CONFIG_STATIC is not set' $$s/.config || { \
 	   echo "  FAIL     CONFIG_STATIC is set; the README asks for a dynamic executable" >&2; exit 1; }; \
 	 $(BB_MAKE) oldconfig >> $$s/config.log 2>&1 < /dev/null || { \
-	   tail -20 $$s/config.log >&2; echo "  FAIL     oldconfig" >&2; exit 1; }
+	   tail -20 $$s/config.log >&2; echo "  FAIL     oldconfig" >&2; exit 1; }; \
+	 grep -q '^CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"' $$s/.config || { \
+	   echo "  FAIL     busybox passwd would hash new passwords as DES, not sha512" >&2; \
+	   echo "           (CONFIG_FEATURE_DEFAULT_PASSWD_ALGO is not \"sha512\" after oldconfig)" >&2; \
+	   exit 1; }
 	@touch $@
 
 # FORCE, so `make busybox` always runs the compiler. busybox's own kbuild is
@@ -1466,12 +1471,13 @@ $(WPA_STAMP): $(LIBNL_STAMP) Makefile
 	   CC=$(CROSS)gcc \
 	   CFLAGS="-Os $(MUSL_INCLUDES) --sysroot=$(abspath $(SYSROOT)) -I$$l/include" \
 	   LIBS="--sysroot=$(abspath $(SYSROOT)) -L$$l/lib/.libs -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
-	   $(MAKE) --no-print-directory -j$(JOBS) wpa_supplicant wpa_cli \
+	   $(MAKE) --no-print-directory -j$(JOBS) wpa_supplicant wpa_cli wpa_passphrase \
 	 ) > $$s/build.log 2>&1 || { \
 	   tail -30 $$s/build.log >&2; \
 	   echo "  FAIL     wpa_supplicant (full log: $$s/build.log)" >&2; exit 1; }; \
 	 mkdir -p $(WIRELESS_STAGE)/usr/sbin; \
-	 cp $$s/wpa_supplicant/wpa_supplicant $$s/wpa_supplicant/wpa_cli $(WIRELESS_STAGE)/usr/sbin/
+	 cp $$s/wpa_supplicant/wpa_supplicant $$s/wpa_supplicant/wpa_cli \
+	    $$s/wpa_supplicant/wpa_passphrase $(WIRELESS_STAGE)/usr/sbin/
 	@source $(WIRELESS_ENV); \
 	 $(call assert_target_binary,$(WIRELESS_STAGE)/usr/sbin/wpa_supplicant)
 	@touch $@
@@ -1514,7 +1520,7 @@ $(BRCM_STAMP): $(WIRELESS_ENV) Makefile
 # will not start on hardware nobody tested.
 $(WIRELESS_STAMP): $(LIBNL_STAMP) $(WPA_STAMP) $(BRCM_STAMP)
 	@set -e; s=$(WIRELESS_STAGE); \
-	 for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli \
+	 for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/wpa_passphrase \
 	          lib/firmware/brcm/brcmfmac43430-sdio.bin \
 	          lib/firmware/brcm/brcmfmac43455-sdio.bin; do \
 	   [ -e "$$s/$$f" ] || { echo "  FAIL     $$s/$$f is missing" >&2; exit 1; }; \
@@ -1742,7 +1748,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	            $(ROOTFS_DIR)/usr/sbin/resize2fs $(ROOTFS_DIR)/usr/bin/sepia-keymap \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-network \
 	            $(ROOTFS_DIR)/usr/share/udhcpc/default.script
-	@$(if $(WIRELESS_DEP),chmod 0755 $(ROOTFS_DIR)/usr/sbin/wpa_supplicant $(ROOTFS_DIR)/usr/sbin/wpa_cli,:)
+	@$(if $(WIRELESS_DEP),chmod 0755 $(ROOTFS_DIR)/usr/sbin/wpa_supplicant $(ROOTFS_DIR)/usr/sbin/wpa_cli $(ROOTFS_DIR)/usr/sbin/wpa_passphrase,:)
 	@chmod 0700 $(ROOTFS_DIR)/root
 	@chmod 0600 $(ROOTFS_DIR)/etc/shadow $(ROOTFS_DIR)/etc/network.conf
 	@chmod 1777 $(ROOTFS_DIR)/tmp $(ROOTFS_DIR)/var/tmp
@@ -1791,7 +1797,8 @@ define assert_rootfs
 	         etc/passwd etc/shadow usr/bin/sepia-keymap \
 	         usr/share/keymaps/english_us.kmap \
 	         etc/network.conf usr/sbin/sepia-network sbin/udhcpc \
-	         $(if $(WIRELESS_DEP),usr/sbin/wpa_supplicant usr/lib/libnl-3.so.200 \
+	         $(if $(WIRELESS_DEP),usr/sbin/wpa_supplicant usr/sbin/wpa_passphrase \
+	         usr/lib/libnl-3.so.200 \
 	         lib/firmware/brcm/brcmfmac43455-sdio.bin) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \

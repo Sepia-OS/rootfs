@@ -303,3 +303,60 @@ load onto and nothing to associate with. What has been checked is that
 is in the image, and that the wireless path in `sepia-network` drives a
 `mac80211_hwsim` radio. Whether a real Pi joins a real network is a question
 only a real Pi can answer.
+
+## Security
+
+### What is defended, and what is not
+
+The threat model is a device reached over the network, not one an attacker can
+pick up. Two things follow, and both are deliberate:
+
+- **Nothing listens.** There is no sshd, telnetd or any other network service;
+  the only sockets opened outward are `udhcpc` and `wpa_supplicant`. There is no
+  remote login to attack, so the network attack surface is close to nil.
+- **Physical access is out of scope, and that is not a small caveat.** The card
+  is an ordinary MBR disk: a FAT boot partition and an unencrypted ext4 root.
+  Anyone holding it can add `init=/bin/sh` to `cmdline.txt` and boot straight to
+  a root shell with no password, or simply read and rewrite the root filesystem
+  on another machine - replace `/etc/shadow`, drop a binary, take the Wi-Fi PMK.
+  No password or file permission defends against this, because the attacker is
+  not going through the OS at all.
+
+  The only real defence is cryptography the firmware enforces before Linux
+  starts: an encrypted root (LUKS, unlocked from an initramfs) so the data is
+  unreadable off the device, and/or verified boot so a tampered `cmdline.txt` or
+  kernel is refused. Both are sizeable features and are not built yet. Until
+  they are, treat a SepiaOS card the way you would treat a house key: whoever
+  holds it, owns it.
+
+### The root password
+
+The image ships with a **public** default (`root` / `sepiaos`, documented
+above). It is meant to survive exactly one login:
+
+- First boot offers to set a real password as part of setup, before any login
+  prompt appears - so the public default is normally replaced during
+  provisioning, not left waiting on the wire.
+- If that step is skipped (or the board is headless with no console to ask on),
+  `/etc/profile` refuses to hand out a shell until `passwd` has actually
+  changed it. The marker at `/etc/sepiaos-password-unchanged` is what tracks
+  this; a successful change removes it.
+
+Passwords are hashed with **sha512-crypt**. busybox defaults to DES otherwise -
+which keeps only the first eight characters and carries a 12-bit salt - so the
+build sets `CONFIG_FEATURE_DEFAULT_PASSWD_ALGO="sha512"` and asserts it, and a
+password set at first boot is hashed the same way. Regenerate the shipped
+default with `openssl passwd -6` (Homebrew's or any Linux openssl; macOS
+LibreSSL has no `-6`).
+
+### The Wi-Fi secret
+
+A device that reconnects on its own has to keep *something* that joins the
+network, and anything that joins the network is as good as the passphrase for
+that purpose. What it need not keep is the human passphrase itself, which people
+reuse. So `sepia-network` stores the **PMK** - the passphrase already hashed
+against the SSID by `wpa_passphrase` - in `/etc/network.conf` (mode `0600`,
+root only), never the passphrase. A stolen card still joins that one network;
+it no longer hands over a password worth trying elsewhere. An open network, or a
+passphrase too short for `wpa_passphrase` to accept, is the exception - then
+what was typed is what is stored.

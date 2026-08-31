@@ -134,6 +134,62 @@ ask_network() {
 	return 0
 }
 
+# The default root password is public - it is in the README, and worth exactly
+# one login. The login-time nag in /etc/profile is the backstop, but it only
+# fires once somebody reaches a login prompt; setting the password here, during
+# provisioning, closes the window before that prompt is ever shown. Skipping is
+# allowed - a blank answer or a timeout leaves the default in place and the nag
+# to catch it - so this never traps an unattended first boot.
+#
+# mkpasswd makes the hash and /etc/shadow is edited directly, rather than
+# driving `passwd`, because passwd reads from its controlling terminal and there
+# is none here - the questions come over fd 3, not a login tty. -m sha512 is
+# named rather than left to the default so this stays a sha512 hash whatever the
+# build's default algorithm happens to be.
+ask_password() {
+	[ -f /etc/sepiaos-password-unchanged ] || return 0
+
+	out ""
+	out "  Root password"
+	out "    The default password is public. Set one now, or press Enter to be"
+	out "    asked at the first login instead."
+	tries=0
+	while [ "$tries" -lt 3 ]; do
+		tries=$((tries + 1))
+		outn "  New root password (Enter to skip): "
+		pw=$(ask "$NEXT_WAIT" silent) || pw=
+		[ -n "$pw" ] || { say "root password: unchanged - you will be asked at login"; return 0; }
+		outn "  Retype it: "
+		pw2=$(ask "$NEXT_WAIT" silent) || pw2=
+		if [ "$pw" != "$pw2" ]; then
+			say "the two did not match; try again"
+			continue
+		fi
+
+		hash=$(mkpasswd -m sha512 "$pw" 2>/dev/null)
+		case "$hash" in
+			'$6$'*) ;;
+			*) say "root password: could not hash it, leaving it unchanged"; return 0 ;;
+		esac
+		# Rebuild /etc/shadow with root's hash replaced. A sha512-crypt hash
+		# has no colon in it, so the field split is safe; the temp file is on
+		# the same filesystem so the rename is atomic.
+		tmp=/etc/shadow.$$
+		if awk -F: -v h="$hash" 'BEGIN{OFS=":"} $1=="root"{$2=h} {print}' \
+		     /etc/shadow > "$tmp" 2>/dev/null && mv -f "$tmp" /etc/shadow; then
+			chmod 0600 /etc/shadow 2>/dev/null
+			rm -f /etc/sepiaos-password-unchanged
+			say "root password: set"
+		else
+			rm -f "$tmp"
+			say "root password: could not write /etc/shadow, leaving it unchanged"
+		fi
+		return 0
+	done
+	say "root password: unchanged after three tries - you will be asked at login"
+	return 0
+}
+
 ask_keymap() {
 	# Read from the directory rather than from `sepia-keymap list`: that is
 	# where the tool itself looks, and it cannot be misparsed the way its
@@ -227,7 +283,7 @@ setup() {
 	dmesg -n 1 2>/dev/null
 
 	out ""
-	out "SepiaOS first boot. Two questions, then it carries on by itself."
+	out "SepiaOS first boot. A few questions, then it carries on by itself."
 	if ! ask_network; then
 		say "no answer; keeping the defaults - ethernet on DHCP, keyboard unchanged"
 		touch "$SETUP"
@@ -235,6 +291,7 @@ setup() {
 		exec 3>&-
 		return 0
 	fi
+	ask_password
 	ask_keymap
 	out ""
 
