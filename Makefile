@@ -1810,15 +1810,22 @@ llvm-check: $(LLVM_STAMP) $(TOOLCHAIN_DEP) ## Re-read the toolchain: architectur
 # open shared object file". The tools themselves are unaffected: clang and lld
 # link libstdc++, not libc++, and they run.
 #
-# It cannot be fixed here. This repository's cross-toolchain targets glibc on
-# purpose - step 2 says why - so its libatomic.so.1 asks for libc.so.6 and
-# libpthread.so.0 and would not load on a musl card either. The fix is one word
-# in Sepia-OS/llvm: libatomic.so.1 added to CXX_RUNTIME_LIBS, beside the
-# libstdc++.so.6 and libgcc_s.so.1 it already copies out of its own musl
-# toolchain that way.
+# It is an over-link rather than a real dependency: nothing in the asset
+# references a single symbol from libatomic - libc++.so.1 has 230 undefined
+# symbols and not one of them is __atomic_*. libc++'s build probes whether a
+# libatomic *exists* (check_library_exists in libcxx/cmake/config-ix.cmake) and
+# then links -latomic whether or not anything uses it, without --as-needed, so
+# the dependency gets recorded anyway. The fix upstream is therefore to stop
+# the over-link - -DLIBCXX_HAS_ATOMIC_LIB=NO in the runtimes CMake flags - and
+# NOT to add the library to CXX_RUNTIME_LIBS: that would ship a library nothing
+# on the card ever calls into. Analysis in Sepia-OS/llvm#1.
+#
+# It cannot be fixed here either way. This repository's cross-toolchain targets
+# glibc on purpose - step 2 says why - so its libatomic.so.1 asks for libc.so.6
+# and libpthread.so.0 and would not load on a musl card at all.
 #
 # So it is reported on every run rather than being either fatal or silent, and
-# this list should be emptied the moment a release carries the library.
+# this list should be emptied the moment a release drops the dependency.
 LLVM_KNOWN_MISSING := libatomic.so.1
 
 define assert_llvm_closure
@@ -1843,7 +1850,8 @@ define assert_llvm_closure
 	  echo "  FAIL     shared libraries nothing on the card provides:$$miss" >&2; exit 1; }; \
 	if [ -n "$$warn" ]; then \
 	  echo "  WARN     known gap, still open upstream:$$warn"; \
-	  echo "           add it to CXX_RUNTIME_LIBS in Sepia-OS/llvm and re-release;"; \
+	  echo "           an over-link, not a real dependency - nothing calls into it;"; \
+	  echo "           the fix is -DLIBCXX_HAS_ATOMIC_LIB=NO in Sepia-OS/llvm#1,"; \
 	  echo "           until then a C++ program linked against libc++ will not start."; \
 	  echo "  OK       $$s is aarch64 and on the musl loader; closed but for that gap"; \
 	else \

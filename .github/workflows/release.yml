@@ -355,9 +355,13 @@ jobs:
           behavioural one. Second, one dependency is *not* satisfied —
           \`libc++.so.1\` in the toolchain asset asks for \`libatomic.so.1\`,
           which nothing on the card provides, so **a C++ program linked against
-          libc++ will not start** until \`Sepia-OS/llvm\` ships that library.
-          C and Objective-C are unaffected, and so are \`clang\` and \`lld\`
-          themselves, which link libstdc++ rather than libc++.
+          libc++ will not start**. C and Objective-C are unaffected, and so are
+          \`clang\` and \`lld\` themselves, which link libstdc++ rather than
+          libc++. That dependency is an over-link — nothing in the asset calls
+          into libatomic — so the fix is for \`Sepia-OS/llvm\` to stop recording
+          it rather than to ship the library. It is tracked as
+          https://github.com/Sepia-OS/llvm/issues/1; this note stands until a
+          toolchain release drops the dependency.
 
           ## Logging in
 

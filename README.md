@@ -82,11 +82,19 @@ supplied by the card's musl. **One dependency is currently unsatisfied**, and
 it is not this repository's to fix: `libc++.so.1` in the published asset asks
 for `libatomic.so.1`, which nothing on the card provides, so a C++ program
 linked against libc++ will not start. `clang` and `lld` themselves are
-unaffected — they link libstdc++ — and so are C and Objective-C. The fix is
-`libatomic.so.1` in `CXX_RUNTIME_LIBS` in `Sepia-OS/llvm`, beside the
-`libstdc++.so.6` and `libgcc_s.so.1` it already ships; the cross-toolchain
-*this* repository uses targets glibc, so its copy would not load on a musl card
-either. Until then `llvm-check` prints it as a warning on every run.
+unaffected — they link libstdc++ — and so are C and Objective-C.
+
+It is an **over-link rather than a real dependency**: nothing in the asset
+references a single symbol from libatomic. libc++'s build probes whether a
+libatomic *exists* and then links `-latomic` whether or not anything uses it,
+without `--as-needed`, so the dependency is recorded anyway. The fix upstream
+is to stop the over-link — `-DLIBCXX_HAS_ATOMIC_LIB=NO` — rather than to ship
+the library, which would put something on the card that is never called;
+[Sepia-OS/llvm#1](https://github.com/Sepia-OS/llvm/issues/1) has the analysis.
+It cannot be fixed here either way: the cross-toolchain *this* repository uses
+targets glibc, so its `libatomic.so.1` needs `libc.so.6` and would not load on
+a musl card at all. Until upstream re-releases, `llvm-check` prints it as a
+warning on every run.
 
 ### Create a bootable image
 
