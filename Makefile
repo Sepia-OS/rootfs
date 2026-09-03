@@ -1545,6 +1545,313 @@ else
 endif
 
 # ---------------------------------------------------------------------------
+# The on-device LLVM toolchain
+#
+# `Sepia-OS/llvm` cross-builds clang and lld against musl to run *on* the Pi,
+# and publishes the result as one `usr/` tree. This step fetches that release
+# and unpacks it, and the rootfs step below copies it onto the card - so a
+# SepiaOS device compiles for itself, which is the whole point of shipping it.
+#
+# Structurally this is step 1 again: resolve a release over the GitHub API,
+# fetch the asset keyed by tag, check it against the release's own SHA256SUMS,
+# unpack it, and assert the result before anything downstream touches it. The
+# comments there explain the choices; only the differences are repeated here.
+#
+# CHANNEL IS DELIBERATELY NOT USED. It selects a boot release, and it defaults
+# to `prerelease` because `Sepia-OS/boot` has only ever cut pre-releases.
+# `Sepia-OS/llvm` is the opposite: it keeps exactly one release at a time -
+# publishing deletes every earlier release and its tag - and the one it has is
+# a full release. Wiring CHANNEL through would make a plain `make image` fail
+# with "has no published pre-release", and inverting it would fail the other
+# way the day llvm uses its own `prerelease` input, which its release workflow
+# offers. So "latest" here means the newest published non-draft release
+# whatever its flag, which is the honest model of a repository with exactly one
+# thing to take, and `LLVM_TAG` pins when a specific one is wanted.
+#
+# Note that pinning has a shorter memory than it does for the boot partition:
+# because llvm deletes the old tag on publish, `downloads/llvm/<tag>/` is the
+# only place a superseded toolchain still exists. An LLVM_TAG that upstream has
+# replaced resolves on a machine that has it cached and 404s on a fresh one.
+#
+# WITH_LLVM=0 leaves the whole thing out and returns the build to what it was
+# before this step existed, including the 256 MiB image size.
+#
+# This sits before the rootfs step because the rootfs copies its output in.
+# ---------------------------------------------------------------------------
+
+WITH_LLVM ?= 1
+
+LLVM_REPO ?= Sepia-OS/llvm
+
+# Pin a specific toolchain release, e.g. LLVM_TAG=v23.1.0. Empty means "resolve
+# the newest one", which is resolved once and then cached in
+# build/llvm/release.env - a build does not silently move to a newer toolchain
+# halfway through. `make llvm-update` is how you move it.
+LLVM_TAG  ?=
+
+DL_LLVM    := $(DL_DIR)/llvm
+LLVM_DIR   := $(BUILD_DIR)/llvm
+
+# Resolved release metadata: tag, asset name, download URLs, and the versions
+# the release notes state. One API call.
+LLVM_ENV   := $(LLVM_DIR)/release.env
+# The unpacked `usr/` tree. The rootfs step copies this in wholesale.
+LLVM_STAGE := $(LLVM_DIR)/stage
+LLVM_STAMP := $(LLVM_DIR)/.staged
+LLVM_CFG   := $(LLVM_DIR)/.config
+
+LLVM_SIG    = $(LLVM_REPO)|$(LLVM_TAG)|$(GITHUB_API)
+
+ifeq ($(WITH_LLVM),1)
+  LLVM_DEP := $(LLVM_STAMP)
+else
+  LLVM_DEP :=
+endif
+
+# Unlike `wireless`, these are not gated on the switch. `wireless` is gated
+# because there is nothing to fetch when it is off - the whole step is a build.
+# This step is a fetch of a published release, exactly like `boot-partition`,
+# and neither that nor `boot-info` is gated by anything. It also keeps
+# `make WITH_LLVM=0 llvm-info` useful: here is the release you are choosing not
+# to ship.
+.PHONY: llvm fetch-llvm
+llvm fetch-llvm: $(LLVM_STAMP) ## Fetch, verify and unpack the on-device LLVM toolchain
+	@source $(LLVM_ENV); printf '  READY    llvm %s (clang %s) -> %s (%s MiB)\n' \
+	   "$$LLVM_TAG" "$${LLVM_VERSION:-?}" $(LLVM_STAGE) "$$(du -sm $(LLVM_STAGE) | cut -f1)"
+
+$(LLVM_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(LLVM_SIG)' | cmp -s - $@ || printf '%s\n' '$(LLVM_SIG)' > $@
+
+# The release body is mined the way $(BOOT_ENV) mines the firmware tag: it
+# states both numbers verbatim as table rows, `| LLVM | `23.1.0` |` and
+# `| Built against musl | `1.2.6` |`. The first names the toolchain in
+# /etc/os-release and in the release notes; the second is what the card's own
+# musl is compared against, because the shipped clang links against the libc
+# this repository builds and a card whose musl is older than the one llvm was
+# built against is how "symbol not found" appears at exec time. A release that
+# names neither leaves them empty, and the checks that use them say so rather
+# than failing this step, which does not need them.
+$(LLVM_ENV): $(LLVM_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(LLVM_REPO) ($(if $(LLVM_TAG),pinned $(LLVM_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(LLVM_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(LLVM_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(LLVM_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(LLVM_REPO) has no release tagged '$(LLVM_TAG)'. It keeps only the" >&2; \
+	     echo "newest release and deletes the tags of the ones before it, so a tag" >&2; \
+	     echo "that existed once may be gone. Leave LLVM_TAG empty to take the newest." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(LLVM_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(LLVM_REPO) has published no release yet. Build without the" >&2; \
+	     echo "toolchain using WITH_LLVM=0, or pin one with LLVM_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *LLVM *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[A-Za-z0-9._-]+$$ ]] || ver=''; \
+	 mus=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/.*Built against musl[^|]*| *`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$mus" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || mus=''; \
+	 { echo "LLVM_TAG='$$tag'"; \
+	   echo "LLVM_PRERELEASE='$$pre'"; \
+	   echo "LLVM_ASSET='$$ast'"; \
+	   echo "LLVM_ASSET_URL='$$asturl'"; \
+	   echo "LLVM_SUMS_URL='$$sumurl'"; \
+	   echo "LLVM_VERSION='$$ver'"; \
+	   echo "LLVM_MUSL='$$mus'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^LLVM_TAG='\(.*\)'/  LLVM     \1/p" $@
+
+# The 42 MiB tarball goes in downloads/, keyed by tag and surviving `clean`
+# like every other upstream artifact. The 180 MiB it unpacks to does not: it is
+# reconstituted from the tarball in a couple of seconds, so caching it in CI
+# would ship tens of megabytes in both directions on every run to save that,
+# and it would put a derived tree in a directory whose contract is "upstream
+# bytes, keyed by tag". The cross-toolchain is unpacked under downloads/ as a
+# documented exception because re-extracting 600 MiB on every `clean` really
+# would be absurd; this is not in that class.
+$(LLVM_STAMP): $(LLVM_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the toolchain (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(LLVM_ENV); \
+	 d=$(DL_LLVM)/$$LLVM_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/$$LLVM_ASSET" ]; then \
+	   echo "  FETCH    $$LLVM_ASSET"; \
+	   $(CURL) -o "$$d/$$LLVM_ASSET.part" "$$LLVM_ASSET_URL"; \
+	   mv -f "$$d/$$LLVM_ASSET.part" "$$d/$$LLVM_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$LLVM_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 echo "  VERIFY   $$LLVM_ASSET"; \
+	 ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$LLVM_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 echo "  UNPACK   $$LLVM_ASSET -> $(LLVM_STAGE)"; \
+	 rm -rf $(LLVM_STAGE); mkdir -p $(LLVM_STAGE); \
+	 tar -xf "$$d/$$LLVM_ASSET" -C $(LLVM_STAGE)
+	@$(call assert_llvm_stage)
+	@touch $@
+
+# Asked of the unpacked tree, before it is mixed into the rootfs, so a
+# truncated or wrong-architecture asset fails naming itself instead of turning
+# into a rootfs whose assertions fail somewhere confusing.
+#
+# Deliberately uses nothing from the cross-toolchain: this step is a download,
+# and needing $(CROSS)readelf here would drag a 600 MiB toolchain into it. ELF
+# byte 18 is e_machine, little-endian, and 0xb7 is AArch64 - the same trick
+# assert_boot_layout uses on the MBR. `llvm-check` does the deeper reading.
+#
+# The libc check is not paranoia about llvm: its own `dist` target refuses to
+# pack a libc or a loader, deliberately, because the card's musl comes from
+# step 3 and a second copy is how two libcs end up disagreeing. This asserts
+# that from the consuming side, where it is this repository's problem.
+define assert_llvm_stage
+	set -e; s=$(LLVM_STAGE); \
+	for f in usr/bin/clang usr/bin/lld usr/bin/ld.lld usr/lib/clang-config; do \
+	  [ -e "$$s/$$f" ] || { \
+	    echo "  FAIL     $$s/$$f is missing - is this a SepiaOS llvm asset?" >&2; exit 1; }; \
+	done; \
+	m=$$(od -An -tx1 -j 18 -N2 "$$s/usr/bin/lld" | tr -d ' \n'); \
+	[ "$$m" = "b700" ] || { \
+	  echo "  FAIL     usr/bin/lld has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	grep -aq 'ld-musl-aarch64.so.1' "$$s/usr/bin/lld" \
+	  || { echo "  FAIL     usr/bin/lld does not ask for the musl loader" >&2; exit 1; }; \
+	ls $$s/usr/lib/clang/*/include/stddef.h >/dev/null 2>&1 \
+	  || { echo "  FAIL     clang's own builtin headers are not in the asset" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: llvm-update
+llvm-update: ## Re-resolve the newest LLVM release and refetch
+	@rm -f $(LLVM_ENV)
+	@$(MAKE) --no-print-directory llvm
+
+.PHONY: llvm-tag
+llvm-tag: $(LLVM_ENV) ## Print the LLVM release tag in use
+	@source $(LLVM_ENV); echo "$$LLVM_TAG"
+
+.PHONY: llvm-info
+llvm-info: $(LLVM_STAMP) ## Show the fetched LLVM release and what it contains
+	@source $(LLVM_ENV); \
+	 if [ "$$LLVM_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(LLVM_REPO)"; \
+	 echo "  tag      $$LLVM_TAG$$k$(if $(LLVM_TAG), (pinned))"; \
+	 echo "  asset    $$LLVM_ASSET"; \
+	 echo "  llvm     $${LLVM_VERSION:-<not named in the release notes>}"; \
+	 echo "  musl     $${LLVM_MUSL:-<not named in the release notes>} (what it was built against)"; \
+	 echo "  staged   $(LLVM_STAGE) ($$(du -sm $(LLVM_STAGE) | cut -f1) MiB)"
+	@printf '  tools    %s in usr/bin, %s shared libraries, %s headers\n' \
+	   "$$(find $(LLVM_STAGE)/usr/bin -mindepth 1 | wc -l | tr -d ' ')" \
+	   "$$(find $(LLVM_STAGE)/usr/lib -name '*.so*' | wc -l | tr -d ' ')" \
+	   "$$(find $(LLVM_STAGE)/usr/include $(LLVM_STAGE)/usr/lib/clang -type f | wc -l | tr -d ' ')"
+	@printf '  config   %s\n' \
+	   "$$(cat $(LLVM_STAGE)/usr/lib/clang-config/*.cfg | tr '\n' ' ')"
+
+# The re-read target every other step has. It needs the cross-toolchain's
+# readelf, so like `rootfs-check` and `image-check` it is off the build path
+# and run on demand - `make llvm` must not pull a 600 MiB toolchain down.
+#
+# What it adds over assert_llvm_stage is the closure: every DT_NEEDED of every
+# staged binary has to be satisfied by the asset itself or by the one thing the
+# card supplies, musl's libc.so. That is the check that actually catches a
+# toolchain built against a libc this card does not have.
+.PHONY: llvm-check
+llvm-check: $(LLVM_STAMP) $(TOOLCHAIN_DEP) ## Re-read the toolchain: architecture, loader, library closure
+	@$(call assert_llvm_stage)
+	@$(call assert_llvm_closure)
+
+# The one gap this check knows about, and it is llvm's to close rather than
+# this repository's. libc++.so.1 in the published asset carries
+# `DT_NEEDED libatomic.so.1`, which is in neither the asset nor the card, so a
+# C++ program linked against libc++ does not start - "libatomic.so.1: cannot
+# open shared object file". The tools themselves are unaffected: clang and lld
+# link libstdc++, not libc++, and they run.
+#
+# It cannot be fixed here. This repository's cross-toolchain targets glibc on
+# purpose - step 2 says why - so its libatomic.so.1 asks for libc.so.6 and
+# libpthread.so.0 and would not load on a musl card either. The fix is one word
+# in Sepia-OS/llvm: libatomic.so.1 added to CXX_RUNTIME_LIBS, beside the
+# libstdc++.so.6 and libgcc_s.so.1 it already copies out of its own musl
+# toolchain that way.
+#
+# So it is reported on every run rather than being either fatal or silent, and
+# this list should be emptied the moment a release carries the library.
+LLVM_KNOWN_MISSING := libatomic.so.1
+
+define assert_llvm_closure
+	set -e; s=$(LLVM_STAGE); \
+	have=$$( (cd $$s/usr/lib && ls) ; echo libc.so ; echo ld-musl-aarch64.so.1 ); \
+	miss=; warn=; \
+	for f in $$s/usr/bin/* $$s/usr/lib/*.so*; do \
+	  [ -f "$$f" ] && [ ! -L "$$f" ] || continue; \
+	  head -c 4 "$$f" | grep -q 'ELF' || continue; \
+	  $(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	    || { echo "  FAIL     $${f#$$s/} is not aarch64" >&2; exit 1; }; \
+	  for n in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	              | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	    printf '%s\n' "$$have" | grep -qx "$$n" && continue; \
+	    case " $(LLVM_KNOWN_MISSING) " in \
+	      *" $$n "*) warn="$$warn $${f#$$s/}:$$n";; \
+	      *)         miss="$$miss $${f#$$s/}:$$n";; \
+	    esac; \
+	  done; \
+	done; \
+	[ -z "$$miss" ] || { \
+	  echo "  FAIL     shared libraries nothing on the card provides:$$miss" >&2; exit 1; }; \
+	if [ -n "$$warn" ]; then \
+	  echo "  WARN     known gap, still open upstream:$$warn"; \
+	  echo "           add it to CXX_RUNTIME_LIBS in Sepia-OS/llvm and re-release;"; \
+	  echo "           until then a C++ program linked against libc++ will not start."; \
+	  echo "  OK       $$s is aarch64 and on the musl loader; closed but for that gap"; \
+	else \
+	  echo "  OK       $$s is aarch64, on the musl loader, with nothing missing"; \
+	fi
+endef
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -1614,12 +1921,17 @@ KEYMAP_VENDOR     := vendor/keymaps/kmaps.tcz
 KEYMAP_VENDOR_MD5 := vendor/keymaps/kmaps.tcz.md5.txt
 KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 
-# WITH_WIFI changes what goes into the tree but touches no file, so on its own
-# it would not invalidate anything: make would find the stamp newer than every
-# prerequisite and leave the previous build's wifi in place. This records it,
-# the way the other steps record the versions they were asked for, and the
-# rootfs depends on the record.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+# WITH_WIFI and WITH_LLVM change what goes into the tree but touch no file, so
+# on their own they would not invalidate anything: make would find the stamp
+# newer than every prerequisite and leave the previous build's wifi - or
+# toolchain - in place. This records them, the way the other steps record the
+# versions they were asked for, and the rootfs depends on the record.
+#
+# The LLVM *tag* is deliberately not in here. $(LLVM_STAMP) is a real
+# prerequisite below and it moves whenever the tag moves, because
+# LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP is a genuine file chain.
+# Only the switch changes the tree while touching nothing.
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -1731,7 +2043,7 @@ $(ROOTFS_CFG): FORCE
 	@printf '%s\n' '$(ROOTFS_SIG)' | cmp -s - $@ || printf '%s\n' '$(ROOTFS_SIG)' > $@
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) \
-                 $(WIRELESS_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
+                 $(WIRELESS_DEP) $(LLVM_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
 	@rm -rf $(ROOTFS_DIR)
@@ -1747,6 +2059,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
 	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
 	@$(if $(WIRELESS_DEP),cp -R $(WIRELESS_STAGE)/. $(ROOTFS_DIR)/,:)
+	@$(call install_toolchain)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
@@ -1764,13 +2077,63 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	@$(call assert_rootfs)
 	@touch $@
 
+# The toolchain, and the three things it needs that are not in its own asset.
+# Guarded from the inside rather than with $(if $(LLVM_DEP),...) at the call
+# site the way the wireless copy is, because this is more than one command.
+#
+# The asset is unpacked after every other staged tree and before the overlay,
+# for the reason the header of this recipe gives: `cp` follows a symlink it is
+# copying onto, and this tree is full of them (clang++ -> clang, ld.lld -> lld,
+# libc++.so -> libc++.so.1). Nothing may be laid down over it afterwards except
+# the overlay, which stays the last word on everything it owns. There are no
+# name collisions today - checked, all 400-odd busybox applet links against the
+# asset's 2361 entries - but "no collision today" is exactly the fact that
+# stops being true when busybox or llvm's SHIP_BINARIES changes, so an overlap
+# is a build failure here rather than a silent overwrite.
+#
+# Then the two halves the asset deliberately does not carry:
+#
+#   musl's headers and its link-time objects. llvm's `dist` refuses to pack a
+#   libc, on purpose - the card's musl comes from step 3, and a second copy is
+#   two libcs disagreeing. But headers *are* libc: without /usr/include a
+#   #include <stdio.h> fails, without crt1.o/Scrt1.o/crti.o/crtn.o every link
+#   fails, and without musl's empty stub archives -lm and -lpthread fail. They
+#   are already built, in build/sysroot, so this is a copy rather than work.
+#   Tied to WITH_LLVM because ~9 MiB of headers on a card with no compiler is
+#   dead weight - nothing else on the card would read them.
+#
+#   /usr/bin/ld. The asset ships `lld` and `ld.lld`, and the clang in it was
+#   built with no CLANG_DEFAULT_LINKER, so its driver asks for plain `ld` -
+#   which busybox does not provide either. Every link on the device would fail
+#   with "unable to execute command: ld". lld picks its flavour from argv[0]
+#   and maps `ld` to the GNU one, so the symlink is a complete fix. The durable
+#   fix is -fuse-ld=lld in llvm's own clang config file; this stays harmless
+#   when that lands.
+define install_toolchain
+	set -e; \
+	[ -n '$(LLVM_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); s=$(abspath $(SYSROOT)); l=$(abspath $(LLVM_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$l") <(names "$$(cd $$r && pwd)")); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the toolchain would overwrite files already in the tree:" >&2; \
+	  printf '           %s\n' $$c >&2; exit 1; }; \
+	cp -R "$$l"/. $$r/; \
+	mkdir -p $$r/usr/include; \
+	cp -R $$s/usr/include/. $$r/usr/include/; \
+	cp -R $$s/usr/lib/. $$r/usr/lib/; \
+	ln -s ld.lld $$r/usr/bin/ld; \
+	printf '  TOOLS    llvm + musl headers -> %s (%s MiB)\n' "$$r" "$$(du -sm $$r | cut -f1)"
+endef
+
 # fstab names the boot partition so `mount /boot` in rcS has something to read,
 # and the swap line is appended by sepia-firstboot once the partition exists.
 # The root entry is documentation and a fsck order: the kernel has already
 # mounted / from root= on the command line by the time anything reads this.
 define generate_etc
 	set -e; r=$(ROOTFS_DIR); \
-	source $(MOD_KERNELS); source $(BOOT_ENV); \
+	source $(MOD_KERNELS); source $(BOOT_ENV); source $(MUSL_ENV); \
+	$(if $(LLVM_DEP),source $(LLVM_ENV);,LLVM_TAG=; LLVM_VERSION=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -1786,7 +2149,10 @@ define generate_etc
 	  echo 'HOME_URL="https://github.com/Sepia-OS"'; \
 	  echo "SEPIAOS_BOOT_RELEASE=\"$$BOOT_TAG\""; \
 	  echo "SEPIAOS_FIRMWARE=\"$$FW_TAG\""; \
-	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; } > $$r/etc/os-release; \
+	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; \
+	  echo "SEPIAOS_MUSL=\"$$MUSL_VER\""; \
+	  [ -z "$$LLVM_TAG" ] || { echo "SEPIAOS_LLVM_RELEASE=\"$$LLVM_TAG\""; \
+	                           echo "SEPIAOS_LLVM=\"$$LLVM_VERSION\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -1808,6 +2174,9 @@ define assert_rootfs
 	         $(if $(WIRELESS_DEP),usr/sbin/wpa_supplicant usr/sbin/wpa_passphrase \
 	         usr/lib/libnl-3.so.200 \
 	         lib/firmware/brcm/brcmfmac43455-sdio.bin) \
+	         $(if $(LLVM_DEP),usr/bin/clang usr/bin/clang++ usr/bin/lld usr/bin/ld \
+	         usr/include/stdio.h usr/include/linux/kd.h usr/lib/crt1.o usr/lib/crti.o \
+	         usr/lib/libc.a usr/lib/libm.a) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
@@ -1817,6 +2186,14 @@ define assert_rootfs
 	l=$$(readlink "$$r/lib/ld-musl-aarch64.so.1"); \
 	[ -f "$$r$$l" ] \
 	  || { echo "  FAIL     the loader points at $$l, which is not in the tree" >&2; exit 1; }; \
+	$(if $(LLVM_DEP),\
+	[ -f "$$r/usr/bin/$$(readlink $$r/usr/bin/ld)" ] \
+	  || { echo "  FAIL     usr/bin/ld does not resolve to a linker in the tree" >&2; exit 1; }; \
+	ls $$r/usr/lib/clang/*/include/stddef.h >/dev/null 2>&1 \
+	  || { echo "  FAIL     clang's builtin headers did not make it into the tree" >&2; exit 1; }; \
+	ls $$r/usr/lib/clang-config/*.cfg >/dev/null 2>&1 \
+	  || { echo "  FAIL     the clang configuration file is not in the tree" >&2; exit 1; }; \
+	,) \
 	grep -q '^# --- generated by sepia-gettys' "$$r/etc/inittab" \
 	  || { echo "  FAIL     etc/inittab has no marker for the generated getty lines" >&2; exit 1; }; \
 	grep -q '^root:\$$6\$$' "$$r/etc/shadow" \
@@ -1863,9 +2240,29 @@ rootfs-info: $(ROOTFS_STAMP) ## Show what was staged into the root filesystem
 # written to a card.
 # ---------------------------------------------------------------------------
 
-IMAGE_SIZE_MIB ?= 256
+# The default tracks WITH_LLVM rather than being a flat number, because the
+# toolchain does not fit the old card and an image without it should not pay
+# for one that does. 256 MiB leaves a 192 MiB root partition; the staged tree
+# is 62 MiB without the toolchain and ~250 MiB with it, so mke2fs simply fails
+# partway through libLLVM.so with the toolchain in. QEMU refuses any SD image
+# whose size is not a power of two, so 512 is the next rung rather than a
+# choice - it gives a 448 MiB root that lands about two thirds full.
+IMAGE_SIZE_MIB ?= $(if $(LLVM_DEP),512,256)
 ROOTFS_LABEL   ?= sepiaos-root
 
+# Neither of the two settings above touches a file, and $(IMAGE) is named
+# sepiaos-<version>.img with no size in it, so without this record
+# `make IMAGE_SIZE_MIB=512 image` reports "Nothing to be done" and hands back
+# the old card - the Makefile's own advertised example was a no-op after any
+# previous build. Kept apart from ROOTFS_SIG deliberately: folding the size in
+# there would rm -rf and re-stage a 250 MiB tree for a change only mke2fs
+# cares about.
+IMG_SIG  = SIZE=$(IMAGE_SIZE_MIB)|LABEL=$(ROOTFS_LABEL)
+IMG_CFG := $(IMG_DIR)/.config
+
+$(IMG_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(IMG_SIG)' | cmp -s - $@ || printf '%s\n' '$(IMG_SIG)' > $@
 
 ROOTFS_IMG := $(IMG_DIR)/rootfs.ext4
 IMAGE      := $(IMG_DIR)/sepiaos-$(SEPIAOS_VERSION).img
@@ -1907,7 +2304,7 @@ rootfs-image: $(ROOTFS_IMG) ## Build just the ext4 filesystem image
 # commands for a tree this size, and quicker than it sounds because debugfs
 # opens the filesystem once. sif is set_inode_field; e2fsck afterwards is what
 # says the result is a filesystem and not just bytes.
-$(ROOTFS_IMG): $(ROOTFS_STAMP) $(BOOT_IMG) $(E2FS_HOST_DEP) Makefile
+$(ROOTFS_IMG): $(ROOTFS_STAMP) $(BOOT_IMG) $(E2FS_HOST_DEP) $(IMG_CFG) Makefile
 	@mkdir -p $(@D)
 	@$(call image_geometry); \
 	 echo "  MKFS     ext4 $$((root_sectors / 2048)) MiB <- $(ROOTFS_DIR)"; \
@@ -1940,7 +2337,7 @@ endef
 # written into it with conv=notrunc. Creating it by seeking leaves a sparse
 # file, so an image that reports 256 MiB occupies only what is written until it
 # is copied to a card.
-$(IMAGE): $(ROOTFS_IMG) $(BOOT_IMG) Makefile
+$(IMAGE): $(ROOTFS_IMG) $(BOOT_IMG) $(IMG_CFG) Makefile
 	@mkdir -p $(@D)
 	@$(call image_geometry); \
 	 echo "  IMAGE    $(IMAGE_SIZE_MIB) MiB: boot $$((boot_sectors / 2048)) MiB + root $$((root_sectors / 2048)) MiB"; \
@@ -2138,6 +2535,13 @@ QEMU_BASE = qemu-system-aarch64 -machine $(QEMU_MACHINE) -display none \
 ifneq ($(filter grow-check test,$(MAKECMDGOALS)),)
   ifneq ($(shell echo $$(( $(GROW_SIZE_MIB) & ($(GROW_SIZE_MIB) - 1) ))),0)
     $(error GROW_SIZE_MIB must be a power of two - QEMU rejects any other SD image size, got $(GROW_SIZE_MIB))
+  endif
+  # The pad below is `dd bs=1 count=0 seek=`, which truncates as readily as it
+  # extends: a GROW_SIZE_MIB under IMAGE_SIZE_MIB would silently cut the image
+  # in half and then test the wreckage. The margin used to be 16x and is 8x now
+  # that the toolchain ships, which is close enough to be worth stating.
+  ifneq ($(shell test $(GROW_SIZE_MIB) -le $(IMAGE_SIZE_MIB) && echo bad),)
+    $(error GROW_SIZE_MIB ($(GROW_SIZE_MIB)) must be larger than IMAGE_SIZE_MIB ($(IMAGE_SIZE_MIB)) - there would be nothing to grow into)
   endif
 endif
 
@@ -2370,6 +2774,9 @@ help: ## Show this help
 	  "MUSL_VERSION"      "pin a musl release instead of taking the latest one" \
 	  "BUSYBOX_VERSION"   "pin a busybox release instead of taking the latest one" \
 	  "FIRMWARE_TAG"      "pin the kernel modules' firmware tag (default: the boot release's)" \
+	  "WITH_LLVM"         "ship the on-device clang/lld toolchain (default $(WITH_LLVM))" \
+	  "LLVM_TAG"          "pin an LLVM release instead of taking the newest one" \
+	  "LLVM_REPO"         "where the toolchain comes from (default $(LLVM_REPO))" \
 	  "E2FS_VERSION"      "pin an e2fsprogs release instead of taking the latest one" \
 	  "HOST_E2FSPROGS"    "directory of mke2fs/debugfs to use instead of building them" \
 	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
@@ -2393,9 +2800,13 @@ help: ## Show this help
 	@echo "  make busybox                           latest busybox, dynamic against musl"
 	@echo "  make modules                           the boot kernel's modules, both trees"
 	@echo "  make FIRMWARE_TAG=1.20260521 modules   modules from a specific firmware tag"
+	@echo "  make llvm                              the newest on-device clang and lld"
+	@echo "  make LLVM_TAG=v23.1.0 llvm             a specific toolchain release"
+	@echo "  make llvm-update                       move onto a newer one"
 	@echo "  make rootfs                            stage the root filesystem tree"
 	@echo "  make image                             the bootable card image"
-	@echo "  make IMAGE_SIZE_MIB=512 image          a roomier one"
+	@echo "  make WITH_LLVM=0 image                 without the toolchain, back to 256 MiB"
+	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"
 	@echo "  make smoke                             boot it as all four emulable boards"

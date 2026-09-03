@@ -53,7 +53,9 @@ jobs:
   build:
     name: build and boot
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 120 rather than 90 since the on-device LLVM toolchain went in: a 42 MiB
+    # download, a 180 MiB unpack, and an ext4 twice the size to build and boot.
+    timeout-minutes: 120
     # QEMU's raspi4b machine arrived in QEMU 9.0. Debian 12 ships 7.2 and
     # Ubuntu 24.04 ships 8.2, so on the bare runner pi4 and cm4 could not be
     # booted at all. Trixie ships QEMU 10.x. Before changing this image, check
@@ -90,6 +92,14 @@ jobs:
           key: downloads-${{ runner.os }}-${{ hashFiles('Makefile') }}
           restore-keys: downloads-${{ runner.os }}-
 
+      # Ahead of `make image` on purpose. The toolchain is a prerequisite of
+      # the rootfs staging, which is the last thing the image build does, so a
+      # toolchain that cannot be resolved or verified would otherwise surface
+      # forty minutes in, after musl, busybox, the modules and the wireless
+      # stack. Same documented target the build reaches later, reached sooner.
+      - name: Resolve and fetch the on-device toolchain
+        run: make llvm
+
       - name: Build the image
         run: make image
 
@@ -98,9 +108,16 @@ jobs:
           make image-info
           make rootfs-info
           make modules-info
+          make llvm-info
 
       - name: Read the image back
         run: make image-check
+
+      # The library closure of the shipped clang and lld against what the card
+      # carries. Needs the cross-toolchain's readelf, so it is off the build
+      # path and asked for here rather than being part of `make llvm`.
+      - name: Read the toolchain back
+        run: make llvm-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

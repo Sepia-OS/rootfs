@@ -20,12 +20,17 @@ on:
         required: true
         type: string
       prerelease:
-        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release.'
+        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release. It does NOT select an LLVM toolchain - see llvm_tag.'
         required: false
         default: true
         type: boolean
       boot_tag:
         description: 'Pin a specific Sepia-OS/boot release instead of taking the latest one on that channel (optional)'
+        required: false
+        default: ''
+        type: string
+      llvm_tag:
+        description: 'Pin a specific Sepia-OS/llvm release instead of taking the newest one (optional). Note that llvm keeps only its newest release and deletes older tags, so a pin can stop resolving.'
         required: false
         default: ''
         type: string
@@ -146,6 +151,9 @@ jobs:
       boot_release: ${{ steps.facts.outputs.boot_release }}
       firmware: ${{ steps.facts.outputs.firmware }}
       kernels: ${{ steps.facts.outputs.kernels }}
+      musl: ${{ steps.facts.outputs.musl }}
+      llvm: ${{ steps.facts.outputs.llvm }}
+      llvm_release: ${{ steps.facts.outputs.llvm_release }}
     env:
       QEMU_TIMEOUT: 300
       SEPIAOS_VERSION: ${{ needs.gate.outputs.version }}
@@ -160,6 +168,17 @@ jobs:
       # Sepia-OS/boot must actually have a full release for the former to work.
       CHANNEL: ${{ inputs.prerelease && 'prerelease' || 'release' }}
       BOOT_TAG: ${{ inputs.boot_tag }}
+      # The on-device clang and lld come from Sepia-OS/llvm, and deliberately
+      # not through CHANNEL. That repository keeps exactly one release at a
+      # time - publishing deletes every earlier release and its tag - so there
+      # is no pre-release line and no release line to choose between, only the
+      # one thing it currently has. Feeding the prerelease input through would
+      # make the default dispatch fail with "has no published pre-release", and
+      # inverting it would fail the other way the day llvm cuts one. So the
+      # Makefile takes the newest published release whatever its flag, and this
+      # is only the pin. WITH_LLVM is not set here on purpose: the Makefile
+      # defaults it on, so the release ships exactly the card CI boots.
+      LLVM_TAG: ${{ inputs.llvm_tag }}
       # The Makefile asks api.github.com which boot release to build against.
       # Unauthenticated that is 60 requests an hour *per IP*, and hosted
       # runners share their egress addresses with every other job on the
@@ -187,11 +206,26 @@ jobs:
           key: downloads-${{ runner.os }}-${{ hashFiles('Makefile') }}
           restore-keys: downloads-${{ runner.os }}-
 
+      # Ahead of `make image` on purpose, even though that would fetch it
+      # anyway. The toolchain is a prerequisite of the rootfs staging, which is
+      # the last thing the image build does, so a mistyped llvm_tag would
+      # otherwise surface forty minutes in - after musl, busybox, the modules
+      # and the wireless stack have all been built. This is the same documented
+      # target the build reaches later; it just reaches it in seconds.
+      - name: Resolve and fetch the on-device toolchain
+        run: make llvm
+
       - name: Build the image
         run: make image
 
       - name: Read the image back
         run: make image-check
+
+      # The library closure of the shipped clang and lld, against what the card
+      # actually carries. It needs the cross-toolchain's readelf, so it is off
+      # the build path and asked for here rather than being part of `make llvm`.
+      - name: Read the toolchain back
+        run: make llvm-check
 
       - name: Boot it as every board QEMU can emulate
         run: make smoke
@@ -209,6 +243,9 @@ jobs:
             echo "boot_release=${SEPIAOS_BOOT_RELEASE}"
             echo "firmware=${SEPIAOS_FIRMWARE}"
             echo "kernels=${SEPIAOS_KERNELS}"
+            echo "musl=${SEPIAOS_MUSL}"
+            echo "llvm=${SEPIAOS_LLVM}"
+            echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "image=$(make -s print-IMAGE)"
           } >> "$GITHUB_OUTPUT"
 
@@ -246,12 +283,17 @@ jobs:
   # "tag exists but the release does not" half-state cannot happen. GitHub
   # attaches the source archives of that tag to the release by itself, which is
   # the "with the sources" half of the requirement.
+  #
+  # This job sits with no output for a long time uploading the asset, which is
+  # measured rather than a hang - and the measurement moved when the toolchain
+  # went in: the card is 512 MiB instead of 256 and the compressed asset is
+  # roughly 100 MiB instead of 21, so the timeout is 60 rather than 30.
   # -------------------------------------------------------------------------
   publish:
     name: publish the release
     needs: [gate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -270,12 +312,16 @@ jobs:
           BOOT_RELEASE: ${{ needs.build.outputs.boot_release }}
           FIRMWARE: ${{ needs.build.outputs.firmware }}
           KERNELS: ${{ needs.build.outputs.kernels }}
+          MUSL: ${{ needs.build.outputs.musl }}
+          LLVM: ${{ needs.build.outputs.llvm }}
+          LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           cat > notes.md <<EOF
           A complete SepiaOS card for Pi Zero 2 W, Pi 3, Pi 4, CM4, Pi 5 and
           CM5: the boot partition, and a root filesystem of musl and busybox
-          with the kernel modules that match the shipped kernel.
+          with the kernel modules that match the shipped kernel — and an LLVM
+          toolchain, so the card compiles for itself.
 
           | | |
           |---|---|
@@ -284,9 +330,34 @@ jobs:
           | Boot partition | \`${BOOT_RELEASE}\` |
           | Raspberry Pi firmware | \`${FIRMWARE}\` |
           | Kernels | \`${KERNELS}\` |
+          | musl | \`${MUSL}\` |
+          | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
 
           Booted to a login prompt under QEMU as a Pi Zero 2 W, a Pi 3, a Pi 4
           and a CM4 before publishing.
+
+          ## Compiling on the card
+
+          \`clang\`, \`clang++\`, \`lld\` and the LLVM binutils equivalents are in
+          \`/usr/bin\`, with libc++, libc++abi, libunwind, compiler-rt's builtins
+          and the GNUstep Objective-C runtime beside them. musl's headers and
+          its link-time objects are on the card too, which is what makes
+          \`clang hello.c\` work rather than only \`clang -c\`, and
+          \`/usr/bin/ld\` points at \`lld\` so the driver's default linker name
+          resolves. Clang defaults to compiler-rt, libc++ and libunwind through
+          a configuration file in \`/usr/lib/clang-config\`, so no flags are
+          needed.
+
+          **Two honest caveats.** First, nothing has run \`clang\` on this card:
+          QEMU's serial console is output-only, so what CI checks is that every
+          shipped binary is aarch64, asks for the musl loader, and has its
+          shared-library dependencies satisfied. That is a layout proof, not a
+          behavioural one. Second, one dependency is *not* satisfied —
+          \`libc++.so.1\` in the toolchain asset asks for \`libatomic.so.1\`,
+          which nothing on the card provides, so **a C++ program linked against
+          libc++ will not start** until \`Sepia-OS/llvm\` ships that library.
+          C and Objective-C are unaffected, and so are \`clang\` and \`lld\`
+          themselves, which link libstdc++ rather than libc++.
 
           ## Logging in
 

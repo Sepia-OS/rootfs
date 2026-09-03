@@ -44,11 +44,55 @@ Two module trees are needed, because the boot partition carries two kernels:
 CM4, and `<version>-v8-16k+` for `kernel_2712.img`, which serves Pi 5 and
 CM5.
 
+### Retrieve the on-device LLVM toolchain
+
+The latest release of https://github.com/Sepia-OS/llvm shall be retrieved and
+unpacked into the root file system, so that a SepiaOS device can compile for
+itself. That repository cross-builds `clang` and `lld` against musl to run *on*
+the Pi and publishes the result as one `usr/` tree with a `SHA256SUMS` beside
+it; the asset is verified against that digest before anything is unpacked.
+
+**This does not follow `CHANNEL`.** `CHANNEL` picks a boot release, and it
+defaults to `prerelease` because `Sepia-OS/boot` has only ever cut
+pre-releases. `Sepia-OS/llvm` keeps exactly one release at a time — publishing
+deletes every earlier release and its tag — so there is no pre-release line and
+no release line to choose between. "Latest" here means the newest published
+release whatever its flag, and `LLVM_TAG` pins a specific one. Note that
+pinning has a short memory for the same reason: a tag upstream has replaced
+resolves only on a machine that still has it in `downloads/`.
+
+Two things the asset deliberately does not carry are added alongside it,
+because without them the shipped compiler cannot compile:
+
+- **musl's headers and its link-time objects.** The asset refuses to carry a
+  libc — the card's musl comes from the step above, and a second copy is two
+  libcs disagreeing with each other — but headers *are* libc. `/usr/include`,
+  `crt1.o`, `Scrt1.o`, `crti.o`, `crtn.o` and musl's stub archives are copied
+  from the sysroot this build already has.
+- **`/usr/bin/ld`.** The asset ships `lld` and `ld.lld`, and its `clang` was
+  built with no default linker name, so its driver asks for plain `ld` — which
+  busybox does not provide either. `lld` picks its flavour from `argv[0]` and
+  maps `ld` to the GNU one, so a symlink is the whole fix.
+
+`WITH_LLVM=0` leaves all of it out.
+
+`make llvm-check` reads the unpacked toolchain back: every binary aarch64, on
+the musl loader, with every shared library it names either in the asset or
+supplied by the card's musl. **One dependency is currently unsatisfied**, and
+it is not this repository's to fix: `libc++.so.1` in the published asset asks
+for `libatomic.so.1`, which nothing on the card provides, so a C++ program
+linked against libc++ will not start. `clang` and `lld` themselves are
+unaffected — they link libstdc++ — and so are C and Objective-C. The fix is
+`libatomic.so.1` in `CXX_RUNTIME_LIBS` in `Sepia-OS/llvm`, beside the
+`libstdc++.so.6` and `libgcc_s.so.1` it already ships; the cross-toolchain
+*this* repository uses targets glibc, so its copy would not load on a musl card
+either. Until then `llvm-check` prints it as a warning on every run.
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
-populated with musl libc, busybox and the kernel modules from the previous
-steps. The rootfs shall be created with `ext4` file system.
+populated with musl libc, busybox, the kernel modules and the LLVM toolchain
+from the previous steps. The rootfs shall be created with `ext4` file system.
 
 The bootable image is created using the boot partition, musl libc and
 busybox. It boots to a login screen. As soon as a user logs in, a shell
@@ -222,6 +266,15 @@ When the build succeeded the a release shall be created
 (either pre-release or release) with the sources and the
 image that can be downloaded and written to an SD card by
 the user who downlaoded it.
+
+The released card carries the LLVM toolchain, because `WITH_LLVM` defaults to
+on and the release workflow does not override it — so what is published is the
+same card every CI run builds and boots, rather than a configuration that is
+first exercised inside the release build itself. The `prerelease` input still
+selects the boot partition's channel and deliberately does **not** select an
+LLVM channel; `llvm_tag` pins a toolchain the way `boot_tag` pins a boot
+partition. The release notes quote the LLVM and musl versions out of the built
+tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 
 ## Networking
 
