@@ -1600,7 +1600,12 @@ LLVM_STAGE := $(LLVM_DIR)/stage
 LLVM_STAMP := $(LLVM_DIR)/.staged
 LLVM_CFG   := $(LLVM_DIR)/.config
 
-LLVM_SIG    = $(LLVM_REPO)|$(LLVM_TAG)|$(GITHUB_API)
+# The trailing token is the *format* of release.env rather than an input to
+# it: bump it whenever a field is added, so an env file resolved by an older
+# Makefile is re-resolved instead of being sourced with the new field silently
+# empty. LLVM_ASSET_ID arrived that way, and the cache check below is only as
+# good as that field being present.
+LLVM_SIG    = $(LLVM_REPO)|$(LLVM_TAG)|$(GITHUB_API)|env2
 
 ifeq ($(WITH_LLVM),1)
   LLVM_DEP := $(LLVM_STAMP)
@@ -1672,11 +1677,15 @@ $(LLVM_ENV): $(LLVM_CFG)
 	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
 	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
 	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
 	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
 	 if [ -z "$$ast" ]; then \
 	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
 	 if [ -z "$$sumurl" ]; then \
 	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
 	 for v in "$$tag" "$$ast"; do \
 	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
 	 done; \
@@ -1693,6 +1702,7 @@ $(LLVM_ENV): $(LLVM_CFG)
 	   echo "LLVM_PRERELEASE='$$pre'"; \
 	   echo "LLVM_ASSET='$$ast'"; \
 	   echo "LLVM_ASSET_URL='$$asturl'"; \
+	   echo "LLVM_ASSET_ID='$$astid'"; \
 	   echo "LLVM_SUMS_URL='$$sumurl'"; \
 	   echo "LLVM_VERSION='$$ver'"; \
 	   echo "LLVM_MUSL='$$mus'"; } > $@.part
@@ -1707,6 +1717,25 @@ $(LLVM_ENV): $(LLVM_CFG)
 # bytes, keyed by tag". The cross-toolchain is unpacked under downloads/ as a
 # documented exception because re-extracting 600 MiB on every `clean` really
 # would be absurd; this is not in that class.
+# The cache is keyed by the release asset's GitHub id, not by tag. llvm keeps
+# one release at a time and republishes under the *same* tag, so a stale
+# tarball and a stale SHA256SUMS under that tag agree with each other: a test
+# of "is the file there?" skips both fetches, verifies old against old, and
+# unpacks the superseded toolchain while printing VERIFY and READY. CI hit
+# exactly that - actions/cache restores downloads/, and its `restore-keys`
+# fallback means a changed Makefile does not invalidate it - and unpacked a
+# 186 MiB toolchain where the current release is 196 MiB.
+#
+# The asset id changes on every upload even when the tag does not, so
+# comparing it against the marker left by the last successful unpack is what
+# distinguishes "already have these bytes" from "have some other release's
+# bytes". A digest fetched alongside stale bytes cannot make that distinction,
+# which is why the check is not simply "refetch SHA256SUMS".
+#
+# The marker is written only after VERIFY passes, so an interrupted download
+# is refetched rather than trusted. A genuinely corrupt one still fails there.
+# A cache predating the marker has no .asset-id at all, which counts as a
+# mismatch and refetches once - that is what unsticks a restored downloads/.
 $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@command -v xz >/dev/null 2>&1 || { \
 	  echo "xz is required to unpack the toolchain (brew install xz / apt-get install xz-utils)" >&2; \
@@ -1714,19 +1743,26 @@ $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@mkdir -p $(@D)
 	@source $(LLVM_ENV); \
 	 d=$(DL_LLVM)/$$LLVM_TAG; mkdir -p "$$d"; \
-	 if [ ! -f "$$d/$$LLVM_ASSET" ]; then \
-	   echo "  FETCH    $$LLVM_ASSET"; \
-	   $(CURL) -o "$$d/$$LLVM_ASSET.part" "$$LLVM_ASSET_URL"; \
-	   mv -f "$$d/$$LLVM_ASSET.part" "$$d/$$LLVM_ASSET"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$LLVM_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$LLVM_ASSET"; \
 	 fi; \
 	 if [ ! -f "$$d/SHA256SUMS" ]; then \
 	   echo "  FETCH    SHA256SUMS"; \
 	   $(CURL) -o "$$d/SHA256SUMS.part" "$$LLVM_SUMS_URL"; \
 	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
 	 fi; \
+	 if [ ! -f "$$d/$$LLVM_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$LLVM_ASSET"; \
+	   $(CURL) -o "$$d/$$LLVM_ASSET.part" "$$LLVM_ASSET_URL"; \
+	   mv -f "$$d/$$LLVM_ASSET.part" "$$d/$$LLVM_ASSET"; \
+	 fi; \
 	 echo "  VERIFY   $$LLVM_ASSET"; \
 	 ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
 	   echo "  FAIL     $$LLVM_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$LLVM_ASSET_ID" > "$$d/.asset-id"; \
 	 echo "  UNPACK   $$LLVM_ASSET -> $(LLVM_STAGE)"; \
 	 rm -rf $(LLVM_STAGE); mkdir -p $(LLVM_STAGE); \
 	 tar -xf "$$d/$$LLVM_ASSET" -C $(LLVM_STAGE)
@@ -1803,30 +1839,14 @@ llvm-check: $(LLVM_STAMP) $(TOOLCHAIN_DEP) ## Re-read the toolchain: architectur
 	@$(call assert_llvm_stage)
 	@$(call assert_llvm_closure)
 
-# The one gap this check knows about, and it is llvm's to close rather than
-# this repository's. libc++.so.1 in the published asset carries
-# `DT_NEEDED libatomic.so.1`, which is in neither the asset nor the card, so a
-# C++ program linked against libc++ does not start - "libatomic.so.1: cannot
-# open shared object file". The tools themselves are unaffected: clang and lld
-# link libstdc++, not libc++, and they run.
-#
-# It is an over-link rather than a real dependency: nothing in the asset
-# references a single symbol from libatomic - libc++.so.1 has 230 undefined
-# symbols and not one of them is __atomic_*. libc++'s build probes whether a
-# libatomic *exists* (check_library_exists in libcxx/cmake/config-ix.cmake) and
-# then links -latomic whether or not anything uses it, without --as-needed, so
-# the dependency gets recorded anyway. The fix upstream is therefore to stop
-# the over-link - -DLIBCXX_HAS_ATOMIC_LIB=NO in the runtimes CMake flags - and
-# NOT to add the library to CXX_RUNTIME_LIBS: that would ship a library nothing
-# on the card ever calls into. Analysis in Sepia-OS/llvm#1.
-#
-# It cannot be fixed here either way. This repository's cross-toolchain targets
-# glibc on purpose - step 2 says why - so its libatomic.so.1 asks for libc.so.6
-# and libpthread.so.0 and would not load on a musl card at all.
-#
-# So it is reported on every run rather than being either fatal or silent, and
-# this list should be emptied the moment a release drops the dependency.
-LLVM_KNOWN_MISSING := libatomic.so.1
+# Shared libraries the asset names that nothing on the card provides, listed
+# here to warn rather than fail. Empty, and it should stay that way: a name in
+# this list means a program linked against it does not start, which is a defect
+# in the published toolchain, not a configuration of this repository. It exists
+# because such a gap is llvm's to close and this repository still has to build
+# in the meantime. `libatomic.so.1` lived here until Sepia-OS/llvm#1 removed the
+# over-link that recorded it.
+LLVM_KNOWN_MISSING :=
 
 define assert_llvm_closure
 	set -e; s=$(LLVM_STAGE); \
@@ -1850,9 +1870,8 @@ define assert_llvm_closure
 	  echo "  FAIL     shared libraries nothing on the card provides:$$miss" >&2; exit 1; }; \
 	if [ -n "$$warn" ]; then \
 	  echo "  WARN     known gap, still open upstream:$$warn"; \
-	  echo "           an over-link, not a real dependency - nothing calls into it;"; \
-	  echo "           the fix is -DLIBCXX_HAS_ATOMIC_LIB=NO in Sepia-OS/llvm#1,"; \
-	  echo "           until then a C++ program linked against libc++ will not start."; \
+	  echo "           listed in LLVM_KNOWN_MISSING, so it warns instead of failing;"; \
+	  echo "           anything linked against it will not start on the card."; \
 	  echo "  OK       $$s is aarch64 and on the musl loader; closed but for that gap"; \
 	else \
 	  echo "  OK       $$s is aarch64, on the musl loader, with nothing missing"; \
