@@ -1707,6 +1707,13 @@ $(LLVM_ENV): $(LLVM_CFG)
 # bytes, keyed by tag". The cross-toolchain is unpacked under downloads/ as a
 # documented exception because re-extracting 600 MiB on every `clean` really
 # would be absurd; this is not in that class.
+# SHA256SUMS is fetched before the asset, and the cached asset is checked
+# against it rather than merely being present. llvm keeps one release at a time
+# and reuses its tag, so a stale tarball and a stale SHA256SUMS under the same
+# tag agree with each other: the old "is the file there?" test skipped both
+# fetches, verified old against old, and unpacked the superseded toolchain
+# while reporting success. Checking the digest instead makes a superseded asset
+# refetch itself. A genuinely corrupt download still fails, at the VERIFY below.
 $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@command -v xz >/dev/null 2>&1 || { \
 	  echo "xz is required to unpack the toolchain (brew install xz / apt-get install xz-utils)" >&2; \
@@ -1714,15 +1721,17 @@ $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@mkdir -p $(@D)
 	@source $(LLVM_ENV); \
 	 d=$(DL_LLVM)/$$LLVM_TAG; mkdir -p "$$d"; \
-	 if [ ! -f "$$d/$$LLVM_ASSET" ]; then \
-	   echo "  FETCH    $$LLVM_ASSET"; \
-	   $(CURL) -o "$$d/$$LLVM_ASSET.part" "$$LLVM_ASSET_URL"; \
-	   mv -f "$$d/$$LLVM_ASSET.part" "$$d/$$LLVM_ASSET"; \
-	 fi; \
 	 if [ ! -f "$$d/SHA256SUMS" ]; then \
 	   echo "  FETCH    SHA256SUMS"; \
 	   $(CURL) -o "$$d/SHA256SUMS.part" "$$LLVM_SUMS_URL"; \
 	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$LLVM_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$LLVM_ASSET"; \
+	   $(CURL) -o "$$d/$$LLVM_ASSET.part" "$$LLVM_ASSET_URL"; \
+	   mv -f "$$d/$$LLVM_ASSET.part" "$$d/$$LLVM_ASSET"; \
 	 fi; \
 	 echo "  VERIFY   $$LLVM_ASSET"; \
 	 ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
@@ -1766,6 +1775,8 @@ endef
 
 .PHONY: llvm-update
 llvm-update: ## Re-resolve the newest LLVM release and refetch
+	@[ ! -f $(LLVM_ENV) ] || { source $(LLVM_ENV); \
+	   rm -f $(DL_LLVM)/$$LLVM_TAG/SHA256SUMS; }
 	@rm -f $(LLVM_ENV)
 	@$(MAKE) --no-print-directory llvm
 
@@ -1803,30 +1814,14 @@ llvm-check: $(LLVM_STAMP) $(TOOLCHAIN_DEP) ## Re-read the toolchain: architectur
 	@$(call assert_llvm_stage)
 	@$(call assert_llvm_closure)
 
-# The one gap this check knows about, and it is llvm's to close rather than
-# this repository's. libc++.so.1 in the published asset carries
-# `DT_NEEDED libatomic.so.1`, which is in neither the asset nor the card, so a
-# C++ program linked against libc++ does not start - "libatomic.so.1: cannot
-# open shared object file". The tools themselves are unaffected: clang and lld
-# link libstdc++, not libc++, and they run.
-#
-# It is an over-link rather than a real dependency: nothing in the asset
-# references a single symbol from libatomic - libc++.so.1 has 230 undefined
-# symbols and not one of them is __atomic_*. libc++'s build probes whether a
-# libatomic *exists* (check_library_exists in libcxx/cmake/config-ix.cmake) and
-# then links -latomic whether or not anything uses it, without --as-needed, so
-# the dependency gets recorded anyway. The fix upstream is therefore to stop
-# the over-link - -DLIBCXX_HAS_ATOMIC_LIB=NO in the runtimes CMake flags - and
-# NOT to add the library to CXX_RUNTIME_LIBS: that would ship a library nothing
-# on the card ever calls into. Analysis in Sepia-OS/llvm#1.
-#
-# It cannot be fixed here either way. This repository's cross-toolchain targets
-# glibc on purpose - step 2 says why - so its libatomic.so.1 asks for libc.so.6
-# and libpthread.so.0 and would not load on a musl card at all.
-#
-# So it is reported on every run rather than being either fatal or silent, and
-# this list should be emptied the moment a release drops the dependency.
-LLVM_KNOWN_MISSING := libatomic.so.1
+# Shared libraries the asset names that nothing on the card provides, listed
+# here to warn rather than fail. Empty, and it should stay that way: a name in
+# this list means a program linked against it does not start, which is a defect
+# in the published toolchain, not a configuration of this repository. It exists
+# because such a gap is llvm's to close and this repository still has to build
+# in the meantime. `libatomic.so.1` lived here until Sepia-OS/llvm#1 removed the
+# over-link that recorded it.
+LLVM_KNOWN_MISSING :=
 
 define assert_llvm_closure
 	set -e; s=$(LLVM_STAGE); \
@@ -1850,9 +1845,8 @@ define assert_llvm_closure
 	  echo "  FAIL     shared libraries nothing on the card provides:$$miss" >&2; exit 1; }; \
 	if [ -n "$$warn" ]; then \
 	  echo "  WARN     known gap, still open upstream:$$warn"; \
-	  echo "           an over-link, not a real dependency - nothing calls into it;"; \
-	  echo "           the fix is -DLIBCXX_HAS_ATOMIC_LIB=NO in Sepia-OS/llvm#1,"; \
-	  echo "           until then a C++ program linked against libc++ will not start."; \
+	  echo "           listed in LLVM_KNOWN_MISSING, so it warns instead of failing;"; \
+	  echo "           anything linked against it will not start on the card."; \
 	  echo "  OK       $$s is aarch64 and on the musl loader; closed but for that gap"; \
 	else \
 	  echo "  OK       $$s is aarch64, on the musl loader, with nothing missing"; \

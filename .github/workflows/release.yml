@@ -352,16 +352,9 @@ jobs:
           QEMU's serial console is output-only, so what CI checks is that every
           shipped binary is aarch64, asks for the musl loader, and has its
           shared-library dependencies satisfied. That is a layout proof, not a
-          behavioural one. Second, one dependency is *not* satisfied —
-          \`libc++.so.1\` in the toolchain asset asks for \`libatomic.so.1\`,
-          which nothing on the card provides, so **a C++ program linked against
-          libc++ will not start**. C and Objective-C are unaffected, and so are
-          \`clang\` and \`lld\` themselves, which link libstdc++ rather than
-          libc++. That dependency is an over-link — nothing in the asset calls
-          into libatomic — so the fix is for \`Sepia-OS/llvm\` to stop recording
-          it rather than to ship the library. It is tracked as
-          https://github.com/Sepia-OS/llvm/issues/1; this note stands until a
-          toolchain release drops the dependency.
+          behavioural one. Second, every shared library the toolchain names is
+          satisfied on this card, which CI asserts — but that is a statement
+          about the dynamic linker, not about the compiler working.
 
           ## Logging in
 
