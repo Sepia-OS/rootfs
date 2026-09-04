@@ -1600,7 +1600,12 @@ LLVM_STAGE := $(LLVM_DIR)/stage
 LLVM_STAMP := $(LLVM_DIR)/.staged
 LLVM_CFG   := $(LLVM_DIR)/.config
 
-LLVM_SIG    = $(LLVM_REPO)|$(LLVM_TAG)|$(GITHUB_API)
+# The trailing token is the *format* of release.env rather than an input to
+# it: bump it whenever a field is added, so an env file resolved by an older
+# Makefile is re-resolved instead of being sourced with the new field silently
+# empty. LLVM_ASSET_ID arrived that way, and the cache check below is only as
+# good as that field being present.
+LLVM_SIG    = $(LLVM_REPO)|$(LLVM_TAG)|$(GITHUB_API)|env2
 
 ifeq ($(WITH_LLVM),1)
   LLVM_DEP := $(LLVM_STAMP)
@@ -1672,11 +1677,15 @@ $(LLVM_ENV): $(LLVM_CFG)
 	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
 	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
 	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
 	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
 	 if [ -z "$$ast" ]; then \
 	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
 	 if [ -z "$$sumurl" ]; then \
 	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
 	 for v in "$$tag" "$$ast"; do \
 	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
 	 done; \
@@ -1693,6 +1702,7 @@ $(LLVM_ENV): $(LLVM_CFG)
 	   echo "LLVM_PRERELEASE='$$pre'"; \
 	   echo "LLVM_ASSET='$$ast'"; \
 	   echo "LLVM_ASSET_URL='$$asturl'"; \
+	   echo "LLVM_ASSET_ID='$$astid'"; \
 	   echo "LLVM_SUMS_URL='$$sumurl'"; \
 	   echo "LLVM_VERSION='$$ver'"; \
 	   echo "LLVM_MUSL='$$mus'"; } > $@.part
@@ -1707,13 +1717,25 @@ $(LLVM_ENV): $(LLVM_CFG)
 # bytes, keyed by tag". The cross-toolchain is unpacked under downloads/ as a
 # documented exception because re-extracting 600 MiB on every `clean` really
 # would be absurd; this is not in that class.
-# SHA256SUMS is fetched before the asset, and the cached asset is checked
-# against it rather than merely being present. llvm keeps one release at a time
-# and reuses its tag, so a stale tarball and a stale SHA256SUMS under the same
-# tag agree with each other: the old "is the file there?" test skipped both
-# fetches, verified old against old, and unpacked the superseded toolchain
-# while reporting success. Checking the digest instead makes a superseded asset
-# refetch itself. A genuinely corrupt download still fails, at the VERIFY below.
+# The cache is keyed by the release asset's GitHub id, not by tag. llvm keeps
+# one release at a time and republishes under the *same* tag, so a stale
+# tarball and a stale SHA256SUMS under that tag agree with each other: a test
+# of "is the file there?" skips both fetches, verifies old against old, and
+# unpacks the superseded toolchain while printing VERIFY and READY. CI hit
+# exactly that - actions/cache restores downloads/, and its `restore-keys`
+# fallback means a changed Makefile does not invalidate it - and unpacked a
+# 186 MiB toolchain where the current release is 196 MiB.
+#
+# The asset id changes on every upload even when the tag does not, so
+# comparing it against the marker left by the last successful unpack is what
+# distinguishes "already have these bytes" from "have some other release's
+# bytes". A digest fetched alongside stale bytes cannot make that distinction,
+# which is why the check is not simply "refetch SHA256SUMS".
+#
+# The marker is written only after VERIFY passes, so an interrupted download
+# is refetched rather than trusted. A genuinely corrupt one still fails there.
+# A cache predating the marker has no .asset-id at all, which counts as a
+# mismatch and refetches once - that is what unsticks a restored downloads/.
 $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@command -v xz >/dev/null 2>&1 || { \
 	  echo "xz is required to unpack the toolchain (brew install xz / apt-get install xz-utils)" >&2; \
@@ -1721,6 +1743,10 @@ $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	@mkdir -p $(@D)
 	@source $(LLVM_ENV); \
 	 d=$(DL_LLVM)/$$LLVM_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$LLVM_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$LLVM_ASSET"; \
+	 fi; \
 	 if [ ! -f "$$d/SHA256SUMS" ]; then \
 	   echo "  FETCH    SHA256SUMS"; \
 	   $(CURL) -o "$$d/SHA256SUMS.part" "$$LLVM_SUMS_URL"; \
@@ -1736,6 +1762,7 @@ $(LLVM_STAMP): $(LLVM_ENV) Makefile
 	 echo "  VERIFY   $$LLVM_ASSET"; \
 	 ( cd "$$d" && grep -F "$$LLVM_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
 	   echo "  FAIL     $$LLVM_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$LLVM_ASSET_ID" > "$$d/.asset-id"; \
 	 echo "  UNPACK   $$LLVM_ASSET -> $(LLVM_STAGE)"; \
 	 rm -rf $(LLVM_STAGE); mkdir -p $(LLVM_STAGE); \
 	 tar -xf "$$d/$$LLVM_ASSET" -C $(LLVM_STAGE)
@@ -1775,8 +1802,6 @@ endef
 
 .PHONY: llvm-update
 llvm-update: ## Re-resolve the newest LLVM release and refetch
-	@[ ! -f $(LLVM_ENV) ] || { source $(LLVM_ENV); \
-	   rm -f $(DL_LLVM)/$$LLVM_TAG/SHA256SUMS; }
 	@rm -f $(LLVM_ENV)
 	@$(MAKE) --no-print-directory llvm
 

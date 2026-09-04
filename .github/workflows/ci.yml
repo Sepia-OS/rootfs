@@ -82,9 +82,23 @@ jobs:
       # an existing workspace, which would delete the restored downloads.
       #
       # Worth caching because downloads/ holds a ~600 MiB cross-toolchain that
-      # otherwise comes off developer.arm.com on every push. Everything in there
-      # is keyed by version or tag and immutable, so a stale entry is only ever
-      # unused, never wrong - which is why the restore-key prefix is safe.
+      # otherwise comes off developer.arm.com on every push. Almost everything
+      # in there is keyed by an immutable version or tag, so a stale entry is
+      # only ever unused rather than wrong - which is what makes the loose
+      # restore-key prefix safe.
+      #
+      # downloads/llvm/<tag>/ is the exception, and it bit: Sepia-OS/llvm keeps
+      # one release at a time and republishes under the *same* tag, so a
+      # restored entry there really can be the wrong bytes. Because the
+      # restore-key prefix means a changed Makefile does not invalidate the
+      # entry, a run unpacked the superseded 186 MiB toolchain instead of the
+      # 196 MiB release and failed llvm-check on a dependency upstream had
+      # already removed. The Makefile now keys those downloads on the release
+      # asset's GitHub id rather than on the tag and refetches on a mismatch,
+      # so nothing here has to change for it. In particular do not narrow the
+      # key to compensate: dropping the restore-key fallback would refetch the
+      # cross-toolchain on every Makefile edit to fix a problem it does not
+      # have.
       - name: Cache the downloaded upstream artifacts
         uses: actions/cache@v4
         with:
