@@ -1879,6 +1879,287 @@ define assert_llvm_closure
 endef
 
 # ---------------------------------------------------------------------------
+# GNU make for the device
+#
+# `Sepia-OS/make` cross-builds GNU make against musl to run *on* the Pi and
+# publishes it as one `usr/` tree - the same shape the toolchain above arrives
+# in, verified the same way. llvm gives the card a compiler; this gives it the
+# build driver that drives one, which is the difference between a card that can
+# compile a file and a card that can build a project.
+#
+# Structurally this is the LLVM step with the names changed, so only what
+# differs is written down here:
+#
+#   - It is small: 118 KiB compressed, a 273 KiB binary and its GPLv3 licence
+#     text. So unlike the toolchain it changes nothing about the image size,
+#     and there is no reason for the default to be anything but on.
+#   - CHANNEL is not used, for the reason it is not used above: it selects a
+#     boot release and defaults to `prerelease`, while `Sepia-OS/make` has cut
+#     a full release. Wiring it through would fail a plain `make image` with
+#     "has no published pre-release". "Latest" is therefore the newest
+#     published non-draft release whatever its flag, and MAKE_TAG pins one.
+#   - Pinning has a *long* memory here, unlike llvm's. That repository's
+#     release workflow refuses to reuse a version - it stops if the release,
+#     the tag or the branch already exists - so its tags are immutable in the
+#     ordinary course of events and a download really can be keyed by tag.
+#
+# The asset-id check is kept all the same, because the *extraordinary* course
+# of events is the one that repository's own error message recommends: "delete
+# the old release first: gh release delete <tag> --cleanup-tag". After that the
+# same tag names different bytes, which is exactly the llvm failure, and CI's
+# restored downloads/ is where it would land. Three lines to close a hole this
+# project has already fallen into once.
+#
+# WITH_MAKE=0 leaves it out. Nothing else changes when it does: nothing on the
+# card depends on make being there.
+#
+# This sits before the rootfs step because the rootfs copies its output in.
+# ---------------------------------------------------------------------------
+
+WITH_MAKE ?= 1
+
+MAKE_REPO ?= Sepia-OS/make
+
+# Pin a specific release, e.g. MAKE_TAG=v4.4.1. Empty means "resolve the newest
+# one", resolved once and then cached in build/make/release.env like every
+# other upstream version this build takes. `make make-update` moves it.
+#
+# MAKE_VERSION would be the obvious name for the GNU make version that comes
+# out of the release notes - and it is a GNU make built-in, holding the version
+# of the make reading this file, which the >= 4.0 check at the top depends on.
+# The field in release.env is GNU_MAKE_VERSION for that reason, which is also
+# what the producing repository calls it.
+MAKE_TAG  ?=
+
+DL_MAKE    := $(DL_DIR)/make
+MAKE_DIR   := $(BUILD_DIR)/make
+
+MAKE_ENV   := $(MAKE_DIR)/release.env
+MAKE_STAGE := $(MAKE_DIR)/stage
+MAKE_STAMP := $(MAKE_DIR)/.staged
+MAKE_CFG   := $(MAKE_DIR)/.config
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+MAKE_SIG    = $(MAKE_REPO)|$(MAKE_TAG)|$(GITHUB_API)|env1
+
+ifeq ($(WITH_MAKE),1)
+  MAKE_DEP := $(MAKE_STAMP)
+else
+  MAKE_DEP :=
+endif
+
+# Named after the product, the way `llvm` and `busybox` are - and the way the
+# producing repository names its own aggregate goal. `fetch-make` is the alias
+# for places where `make make` reads like a typo.
+.PHONY: make fetch-make
+make fetch-make: $(MAKE_STAMP) ## Fetch, verify and unpack GNU make for the device
+	@source $(MAKE_ENV); printf '  READY    make %s (GNU make %s) -> %s (%s KiB)\n' \
+	   "$$MAKE_TAG" "$${GNU_MAKE_VERSION:-?}" $(MAKE_STAGE) "$$(du -sk $(MAKE_STAGE) | cut -f1)"
+
+$(MAKE_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(MAKE_SIG)' | cmp -s - $@ || printf '%s\n' '$(MAKE_SIG)' > $@
+
+# The release body is mined the way the boot and llvm ones are: it states both
+# numbers verbatim as table rows, `| GNU make | `4.4.1` |` and
+# `| Built against musl | `1.2.6` |`. The first names the binary in
+# /etc/os-release and in the release notes; the second is the libc it was
+# linked against, which is worth having beside the card's own musl version -
+# this binary is dynamic, so a card whose musl is older than the one it was
+# built against is how "symbol not found" appears at exec time. A release that
+# names neither leaves them empty rather than failing this step, which does not
+# need them.
+$(MAKE_ENV): $(MAKE_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(MAKE_REPO) ($(if $(MAKE_TAG),pinned $(MAKE_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(MAKE_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(MAKE_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(MAKE_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(MAKE_REPO) has no release tagged '$(MAKE_TAG)'. Leave MAKE_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(MAKE_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(MAKE_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(MAKE_REPO) has published no release yet. Build without it using" >&2; \
+	     echo "WITH_MAKE=0, or pin one with MAKE_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *GNU make *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 mus=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/.*Built against musl[^|]*| *`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$mus" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || mus=''; \
+	 { echo "MAKE_TAG='$$tag'"; \
+	   echo "MAKE_PRERELEASE='$$pre'"; \
+	   echo "MAKE_ASSET='$$ast'"; \
+	   echo "MAKE_ASSET_URL='$$asturl'"; \
+	   echo "MAKE_ASSET_ID='$$astid'"; \
+	   echo "MAKE_SUMS_URL='$$sumurl'"; \
+	   echo "GNU_MAKE_VERSION='$$ver'"; \
+	   echo "MAKE_MUSL='$$mus'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^MAKE_TAG='\(.*\)'/  MAKE     \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it - the header
+# of this section says why that is here even though this repository's tags do
+# not move. The marker is written only after VERIFY passes, so an interrupted
+# download is refetched rather than trusted.
+$(MAKE_STAMP): $(MAKE_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(MAKE_ENV); \
+	 d=$(DL_MAKE)/$$MAKE_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$MAKE_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$MAKE_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$MAKE_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$MAKE_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$MAKE_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$MAKE_ASSET"; \
+	   $(CURL) -o "$$d/$$MAKE_ASSET.part" "$$MAKE_ASSET_URL"; \
+	   mv -f "$$d/$$MAKE_ASSET.part" "$$d/$$MAKE_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$MAKE_ASSET"; \
+	 ( cd "$$d" && grep -F "$$MAKE_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$MAKE_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$MAKE_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$MAKE_ASSET -> $(MAKE_STAGE)"; \
+	 rm -rf $(MAKE_STAGE); mkdir -p $(MAKE_STAGE); \
+	 tar -xf "$$d/$$MAKE_ASSET" -C $(MAKE_STAGE)
+	@$(call assert_make_stage)
+	@touch $@
+
+# Asked of the unpacked tree before it is mixed into the rootfs, so a truncated
+# or wrong-architecture asset fails naming itself. Deliberately uses nothing
+# from the cross-toolchain - this step is a download, and needing $(CROSS)readelf
+# would drag 600 MiB into it. ELF byte 18 is e_machine, little-endian, and 0xb7
+# is AArch64; `make-check` does the deeper reading.
+#
+# The licence is checked because GNU make is GPLv3 and this build redistributes
+# a binary of it: shipping the program without its licence text is a licence
+# violation, not an untidiness. Upstream packs it at
+# usr/share/licenses/make/COPYING and this is the consuming side saying so.
+#
+# The libc check mirrors the toolchain's. That repository's `dist` refuses to
+# pack a libc or a loader, on purpose, because the card's musl comes from step
+# 3 and a second copy is how two libcs end up disagreeing.
+define assert_make_stage
+	set -e; s=$(MAKE_STAGE); \
+	[ -x "$$s/usr/bin/make" ] || { \
+	  echo "  FAIL     $$s/usr/bin/make is missing - is this a SepiaOS make asset?" >&2; exit 1; }; \
+	m=$$(od -An -tx1 -j 18 -N2 "$$s/usr/bin/make" | tr -d ' \n'); \
+	[ "$$m" = "b700" ] || { \
+	  echo "  FAIL     usr/bin/make has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	grep -aq 'ld-musl-aarch64.so.1' "$$s/usr/bin/make" \
+	  || { echo "  FAIL     usr/bin/make does not ask for the musl loader" >&2; exit 1; }; \
+	[ -s "$$s/usr/share/licenses/make/COPYING" ] \
+	  || { echo "  FAIL     the asset carries no COPYING; GNU make is GPLv3 and this ships it" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: make-update
+make-update: ## Re-resolve the newest GNU make release and refetch
+	@rm -f $(MAKE_ENV)
+	@$(MAKE) --no-print-directory make
+
+.PHONY: make-tag
+make-tag: $(MAKE_ENV) ## Print the GNU make release tag in use
+	@source $(MAKE_ENV); echo "$$MAKE_TAG"
+
+.PHONY: make-info
+make-info: $(MAKE_STAMP) ## Show the fetched GNU make release and what it contains
+	@source $(MAKE_ENV); \
+	 if [ "$$MAKE_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(MAKE_REPO)"; \
+	 echo "  tag      $$MAKE_TAG$$k$(if $(MAKE_TAG), (pinned))"; \
+	 echo "  asset    $$MAKE_ASSET"; \
+	 echo "  make     $${GNU_MAKE_VERSION:-<not named in the release notes>}"; \
+	 echo "  musl     $${MAKE_MUSL:-<not named in the release notes>} (what it was built against)"; \
+	 echo "  staged   $(MAKE_STAGE) ($$(du -sk $(MAKE_STAGE) | cut -f1) KiB)"
+	@printf '  binary   %s bytes\n' "$$(wc -c < $(MAKE_STAGE)/usr/bin/make | tr -d ' ')"
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. One binary, so the closure it checks is one line long: musl's
+# libc.so and nothing else. That is the whole claim the producing repository
+# makes about this asset, and it is the claim that decides whether the binary
+# starts at all on the card - `libatomic.so.1` in an llvm release is what this
+# kind of check exists to catch.
+.PHONY: make-check
+make-check: $(MAKE_STAMP) $(TOOLCHAIN_DEP) ## Re-read the on-device make: architecture, loader, library closure
+	@$(call assert_make_stage)
+	@$(call assert_make_closure)
+
+define assert_make_closure
+	set -e; f=$(MAKE_STAGE)/usr/bin/make; \
+	$(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	  || { echo "  FAIL     usr/bin/make is not aarch64" >&2; exit 1; }; \
+	i=$$($(CROSS)readelf -l "$$f" | sed -n 's/.*interpreter: \(.*\)\]/\1/p'); \
+	[ "$$i" = /lib/ld-musl-aarch64.so.1 ] \
+	  || { echo "  FAIL     usr/bin/make asks for '$$i', not the musl loader" >&2; exit 1; }; \
+	miss=; \
+	for n in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	            | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	  [ "$$n" = libc.so ] || miss="$$miss $$n"; \
+	done; \
+	[ -z "$$miss" ] || { \
+	  echo "  FAIL     usr/bin/make needs more than the card's musl:$$miss" >&2; exit 1; }; \
+	echo "  OK       usr/bin/make is aarch64, on the musl loader, needing only libc.so"
+endef
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -1948,17 +2229,18 @@ KEYMAP_VENDOR     := vendor/keymaps/kmaps.tcz
 KEYMAP_VENDOR_MD5 := vendor/keymaps/kmaps.tcz.md5.txt
 KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 
-# WITH_WIFI and WITH_LLVM change what goes into the tree but touch no file, so
-# on their own they would not invalidate anything: make would find the stamp
-# newer than every prerequisite and leave the previous build's wifi - or
-# toolchain - in place. This records them, the way the other steps record the
-# versions they were asked for, and the rootfs depends on the record.
+# WITH_WIFI, WITH_LLVM and WITH_MAKE change what goes into the tree but touch
+# no file, so on their own they would not invalidate anything: make would find
+# the stamp newer than every prerequisite and leave the previous build's wifi -
+# or toolchain, or make - in place. This records them, the way the other steps
+# record the versions they were asked for, and the rootfs depends on the record.
 #
-# The LLVM *tag* is deliberately not in here. $(LLVM_STAMP) is a real
-# prerequisite below and it moves whenever the tag moves, because
-# LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP is a genuine file chain.
-# Only the switch changes the tree while touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+# The LLVM and GNU make *tags* are deliberately not in here. $(LLVM_STAMP) and
+# $(MAKE_STAMP) are real prerequisites below and they move whenever their tags
+# move, because LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same
+# chain for make) is a genuine file chain. Only the switches change the tree
+# while touching nothing.
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -2070,7 +2352,7 @@ $(ROOTFS_CFG): FORCE
 	@printf '%s\n' '$(ROOTFS_SIG)' | cmp -s - $@ || printf '%s\n' '$(ROOTFS_SIG)' > $@
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) \
-                 $(WIRELESS_DEP) $(LLVM_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
+                 $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
 	@rm -rf $(ROOTFS_DIR)
@@ -2087,6 +2369,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
 	@$(if $(WIRELESS_DEP),cp -R $(WIRELESS_STAGE)/. $(ROOTFS_DIR)/,:)
 	@$(call install_toolchain)
+	@$(call install_gnu_make)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
@@ -2153,6 +2436,34 @@ define install_toolchain
 	printf '  TOOLS    llvm + musl headers -> %s (%s MiB)\n' "$$r" "$$(du -sm $$r | cut -f1)"
 endef
 
+# GNU make, on the same terms and immediately after the toolchain: a `usr/`
+# tree copied in whole, guarded from the inside by the switch, and refusing to
+# overwrite anything already in the tree. It runs *after* install_toolchain
+# rather than before it so that this check sees the toolchain's 2361 entries as
+# well - busybox has no `make` applet and llvm ships no `usr/bin/make`, but
+# "no collision today" is exactly the fact that stops being true when one of
+# them grows a file, and a silent overwrite of a compiler by a build tool (or
+# the other way round) is not something to discover on the card.
+#
+# Nothing has to be added beside it, unlike the toolchain: make is one static
+# piece of userspace with no headers, no runtime and no driver looking for a
+# linker. It needs a compiler to be useful, but it does not need one to run, so
+# the two switches stay independent - WITH_MAKE=1 WITH_LLVM=0 is a perfectly
+# sensible card for driving Makefiles that only shell out.
+define install_gnu_make
+	set -e; \
+	[ -n '$(MAKE_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); m=$(abspath $(MAKE_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$m") <(names "$$(cd $$r && pwd)")); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     GNU make would overwrite files already in the tree:" >&2; \
+	  printf '           %s\n' $$c >&2; exit 1; }; \
+	cp -R "$$m"/. $$r/; \
+	printf '  MAKE     GNU make -> %s/usr/bin/make (%s KiB)\n' \
+	   "$$r" "$$(du -sk $$m | cut -f1)"
+endef
+
 # fstab names the boot partition so `mount /boot` in rcS has something to read,
 # and the swap line is appended by sepia-firstboot once the partition exists.
 # The root entry is documentation and a fsck order: the kernel has already
@@ -2161,6 +2472,7 @@ define generate_etc
 	set -e; r=$(ROOTFS_DIR); \
 	source $(MOD_KERNELS); source $(BOOT_ENV); source $(MUSL_ENV); \
 	$(if $(LLVM_DEP),source $(LLVM_ENV);,LLVM_TAG=; LLVM_VERSION=;) \
+	$(if $(MAKE_DEP),source $(MAKE_ENV);,MAKE_TAG=; GNU_MAKE_VERSION=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -2179,7 +2491,9 @@ define generate_etc
 	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; \
 	  echo "SEPIAOS_MUSL=\"$$MUSL_VER\""; \
 	  [ -z "$$LLVM_TAG" ] || { echo "SEPIAOS_LLVM_RELEASE=\"$$LLVM_TAG\""; \
-	                           echo "SEPIAOS_LLVM=\"$$LLVM_VERSION\""; }; } > $$r/etc/os-release; \
+	                           echo "SEPIAOS_LLVM=\"$$LLVM_VERSION\""; }; \
+	  [ -z "$$MAKE_TAG" ] || { echo "SEPIAOS_MAKE_RELEASE=\"$$MAKE_TAG\""; \
+	                           echo "SEPIAOS_MAKE=\"$$GNU_MAKE_VERSION\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -2204,6 +2518,7 @@ define assert_rootfs
 	         $(if $(LLVM_DEP),usr/bin/clang usr/bin/clang++ usr/bin/lld usr/bin/ld \
 	         usr/include/stdio.h usr/include/linux/kd.h usr/lib/crt1.o usr/lib/crti.o \
 	         usr/lib/libc.a usr/lib/libm.a) \
+	         $(if $(MAKE_DEP),usr/bin/make usr/share/licenses/make/COPYING) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
@@ -2804,6 +3119,9 @@ help: ## Show this help
 	  "WITH_LLVM"         "ship the on-device clang/lld toolchain (default $(WITH_LLVM))" \
 	  "LLVM_TAG"          "pin an LLVM release instead of taking the newest one" \
 	  "LLVM_REPO"         "where the toolchain comes from (default $(LLVM_REPO))" \
+	  "WITH_MAKE"         "ship GNU make for the device (default $(WITH_MAKE))" \
+	  "MAKE_TAG"          "pin a GNU make release instead of taking the newest one" \
+	  "MAKE_REPO"         "where GNU make comes from (default $(MAKE_REPO))" \
 	  "E2FS_VERSION"      "pin an e2fsprogs release instead of taking the latest one" \
 	  "HOST_E2FSPROGS"    "directory of mke2fs/debugfs to use instead of building them" \
 	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
@@ -2830,9 +3148,12 @@ help: ## Show this help
 	@echo "  make llvm                              the newest on-device clang and lld"
 	@echo "  make LLVM_TAG=v23.1.0 llvm             a specific toolchain release"
 	@echo "  make llvm-update                       move onto a newer one"
+	@echo "  make fetch-make                        the newest GNU make for the device"
+	@echo "  make MAKE_TAG=v4.4.1 fetch-make        a specific GNU make release"
 	@echo "  make rootfs                            stage the root filesystem tree"
 	@echo "  make image                             the bootable card image"
 	@echo "  make WITH_LLVM=0 image                 without the toolchain, back to 256 MiB"
+	@echo "  make WITH_MAKE=0 image                 without GNU make on the card"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"

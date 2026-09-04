@@ -95,10 +95,14 @@ jobs:
       # 196 MiB release and failed llvm-check on a dependency upstream had
       # already removed. The Makefile now keys those downloads on the release
       # asset's GitHub id rather than on the tag and refetches on a mismatch,
-      # so nothing here has to change for it. In particular do not narrow the
-      # key to compensate: dropping the restore-key fallback would refetch the
-      # cross-toolchain on every Makefile edit to fix a problem it does not
-      # have.
+      # so nothing here has to change for it - and downloads/make/<tag>/ is
+      # keyed the same way, even though Sepia-OS/make does not reuse a tag in
+      # the ordinary course, because deleting a release and republishing it is
+      # what that repository's own retry advice says to do.
+      #
+      # In particular do not narrow the key to compensate: dropping the
+      # restore-key fallback would refetch the cross-toolchain on every
+      # Makefile edit to fix a problem it does not have.
       - name: Cache the downloaded upstream artifacts
         uses: actions/cache@v4
         with:
@@ -114,6 +118,13 @@ jobs:
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
+      # Same reasoning, and the same few seconds: GNU make for the device is
+      # resolved over the API and verified against the release's own digest, so
+      # a repository that has published nothing - or an asset that will not
+      # verify - should say so now rather than at the end of the image build.
+      - name: Resolve and fetch GNU make for the device
+        run: make fetch-make
+
       - name: Build the image
         run: make image
 
@@ -123,6 +134,7 @@ jobs:
           make rootfs-info
           make modules-info
           make llvm-info
+          make make-info
 
       - name: Read the image back
         run: make image-check
@@ -132,6 +144,13 @@ jobs:
       # path and asked for here rather than being part of `make llvm`.
       - name: Read the toolchain back
         run: make llvm-check
+
+      # The same closure check for the build driver beside it - one binary, so
+      # the claim is one line: aarch64, the musl loader, and libc.so as its only
+      # shared library. Needs the cross-toolchain's readelf too, so it sits here
+      # rather than on the build path.
+      - name: Read GNU make back
+        run: make make-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

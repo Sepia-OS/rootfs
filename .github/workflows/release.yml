@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release. It does NOT select an LLVM toolchain - see llvm_tag.'
+        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release. It does NOT select an LLVM toolchain or a GNU make - see llvm_tag and make_tag.'
         required: false
         default: true
         type: boolean
@@ -31,6 +31,11 @@ on:
         type: string
       llvm_tag:
         description: 'Pin a specific Sepia-OS/llvm release instead of taking the newest one (optional). Note that llvm keeps only its newest release and deletes older tags, so a pin can stop resolving.'
+        required: false
+        default: ''
+        type: string
+      make_tag:
+        description: 'Pin a specific Sepia-OS/make release instead of taking the newest one (optional). Unlike llvm, that repository keeps its releases, so a pin here goes on resolving.'
         required: false
         default: ''
         type: string
@@ -154,6 +159,8 @@ jobs:
       musl: ${{ steps.facts.outputs.musl }}
       llvm: ${{ steps.facts.outputs.llvm }}
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
+      gnu_make: ${{ steps.facts.outputs.gnu_make }}
+      make_release: ${{ steps.facts.outputs.make_release }}
     env:
       QEMU_TIMEOUT: 300
       SEPIAOS_VERSION: ${{ needs.gate.outputs.version }}
@@ -179,6 +186,14 @@ jobs:
       # is only the pin. WITH_LLVM is not set here on purpose: the Makefile
       # defaults it on, so the release ships exactly the card CI boots.
       LLVM_TAG: ${{ inputs.llvm_tag }}
+      # GNU make for the device, from Sepia-OS/make, and not through CHANNEL
+      # either - it has cut a full release, so a pre-release dispatch would
+      # otherwise fail looking for a pre-release line that does not exist. The
+      # difference from llvm is that this repository keeps its releases and
+      # refuses to reuse a version, so a pin here does not decay. WITH_MAKE is
+      # likewise left at its default for the same reason WITH_LLVM is: the
+      # released card has to be the card CI builds and boots.
+      MAKE_TAG: ${{ inputs.make_tag }}
       # The Makefile asks api.github.com which boot release to build against.
       # Unauthenticated that is 60 requests an hour *per IP*, and hosted
       # runners share their egress addresses with every other job on the
@@ -215,6 +230,11 @@ jobs:
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
+      # Same again, and for the same reason: a mistyped make_tag should stop
+      # this in seconds rather than after the whole rootfs has been built.
+      - name: Resolve and fetch GNU make for the device
+        run: make fetch-make
+
       - name: Build the image
         run: make image
 
@@ -226,6 +246,11 @@ jobs:
       # the build path and asked for here rather than being part of `make llvm`.
       - name: Read the toolchain back
         run: make llvm-check
+
+      # One binary, so one claim: aarch64, on the musl loader, with libc.so as
+      # its only shared library. Needs the cross-toolchain's readelf as well.
+      - name: Read GNU make back
+        run: make make-check
 
       - name: Boot it as every board QEMU can emulate
         run: make smoke
@@ -246,6 +271,8 @@ jobs:
             echo "musl=${SEPIAOS_MUSL}"
             echo "llvm=${SEPIAOS_LLVM}"
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
+            echo "gnu_make=${SEPIAOS_MAKE}"
+            echo "make_release=${SEPIAOS_MAKE_RELEASE}"
             echo "image=$(make -s print-IMAGE)"
           } >> "$GITHUB_OUTPUT"
 
@@ -315,13 +342,17 @@ jobs:
           MUSL: ${{ needs.build.outputs.musl }}
           LLVM: ${{ needs.build.outputs.llvm }}
           LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
+          # Not MAKE: that name is GNU make's own, and exporting it into a
+          # shell that later runs make would point $(MAKE) at a version number.
+          GNU_MAKE: ${{ needs.build.outputs.gnu_make }}
+          MAKE_RELEASE: ${{ needs.build.outputs.make_release }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           cat > notes.md <<EOF
           A complete SepiaOS card for Pi Zero 2 W, Pi 3, Pi 4, CM4, Pi 5 and
           CM5: the boot partition, and a root filesystem of musl and busybox
           with the kernel modules that match the shipped kernel — and an LLVM
-          toolchain, so the card compiles for itself.
+          toolchain with GNU make beside it, so the card builds for itself.
 
           | | |
           |---|---|
@@ -332,11 +363,12 @@ jobs:
           | Kernels | \`${KERNELS}\` |
           | musl | \`${MUSL}\` |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
+          | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
 
           Booted to a login prompt under QEMU as a Pi Zero 2 W, a Pi 3, a Pi 4
           and a CM4 before publishing.
 
-          ## Compiling on the card
+          ## Building on the card
 
           \`clang\`, \`clang++\`, \`lld\` and the LLVM binutils equivalents are in
           \`/usr/bin\`, with libc++, libc++abi, libunwind, compiler-rt's builtins
@@ -348,12 +380,20 @@ jobs:
           a configuration file in \`/usr/lib/clang-config\`, so no flags are
           needed.
 
-          **Two honest caveats.** First, nothing has run \`clang\` on this card:
-          QEMU's serial console is output-only, so what CI checks is that every
-          shipped binary is aarch64, asks for the musl loader, and has its
-          shared-library dependencies satisfied. That is a layout proof, not a
-          behavioural one. Second, every shared library the toolchain names is
-          satisfied on this card, which CI asserts — but that is a statement
+          **GNU make \`${GNU_MAKE}\` is at \`/usr/bin/make\`**, from
+          \`Sepia-OS/make\` — the same cross-build against the same musl, so it
+          runs against the libc that is already on the card. That is the piece
+          that makes an ordinary \`Makefile\` work on the device rather than
+          only a single \`clang\` command line, and it is the last thing needed
+          to build a project here rather than compile a file. Its GPLv3 licence
+          text ships with it, at \`/usr/share/licenses/make/COPYING\`.
+
+          **Two honest caveats.** First, nothing has run \`clang\` or \`make\`
+          on this card: QEMU's serial console is output-only, so what CI checks
+          is that every shipped binary is aarch64, asks for the musl loader, and
+          has its shared-library dependencies satisfied. That is a layout proof,
+          not a behavioural one. Second, every shared library these binaries name
+          is satisfied on this card, which CI asserts — but that is a statement
           about the dynamic linker, not about the compiler working.
 
           ## Logging in

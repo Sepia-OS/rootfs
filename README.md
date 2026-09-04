@@ -85,11 +85,47 @@ would start. It was an over-link rather than a real dependency, fixed upstream
 in [Sepia-OS/llvm#1](https://github.com/Sepia-OS/llvm/issues/1) by suppressing
 the `-latomic` rather than by shipping the library.
 
+### Retrieve GNU make for the device
+
+The latest release of https://github.com/Sepia-OS/make shall be retrieved and
+unpacked into the root file system, so that a SepiaOS device can *build* for
+itself and not only compile a file. That repository cross-builds GNU make
+against musl to run on the Pi and publishes it as one `usr/` tree with a
+`SHA256SUMS` beside it, exactly as the toolchain above; the asset is verified
+against that digest before anything is unpacked.
+
+It lands at `/usr/bin/make`, with its GPLv3 licence text at
+`/usr/share/licenses/make/COPYING`. Nothing has to be added beside it: it is
+one 273 KiB binary, dynamically linked against the musl this build already
+puts on the card and needing no headers, no runtime and no linker of its own.
+
+**This does not follow `CHANNEL` either**, for the reason the toolchain does
+not: `CHANNEL` picks a boot release and defaults to `prerelease`, while
+`Sepia-OS/make` has cut a full release, so wiring it through would fail a plain
+`make image` with "has no published pre-release". "Latest" is the newest
+published release whatever its flag, and `MAKE_TAG` pins a specific one — and
+unlike an `LLVM_TAG`, a pin here keeps resolving, because that repository keeps
+its releases and refuses to reuse a version.
+
+`WITH_MAKE=0` leaves it out. `make make-check` reads the unpacked binary back:
+aarch64, on the musl loader, and with `libc.so` as its only shared library —
+which is the whole claim the asset makes, and the one that decides whether it
+starts at all on the card.
+
+```sh
+make fetch-make                 # resolve, verify and unpack it
+make make-info                  # which release, which version, how big
+make MAKE_TAG=v4.4.1 fetch-make # a specific release
+make make-update                # move onto a newer one
+make WITH_MAKE=0 image          # an image with no make on it
+```
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
-populated with musl libc, busybox, the kernel modules and the LLVM toolchain
-from the previous steps. The rootfs shall be created with `ext4` file system.
+populated with musl libc, busybox, the kernel modules, the LLVM toolchain and
+GNU make from the previous steps. The rootfs shall be created with `ext4` file
+system.
 
 The bootable image is created using the boot partition, musl libc and
 busybox. It boots to a login screen. As soon as a user logs in, a shell
@@ -264,14 +300,15 @@ When the build succeeded the a release shall be created
 image that can be downloaded and written to an SD card by
 the user who downlaoded it.
 
-The released card carries the LLVM toolchain, because `WITH_LLVM` defaults to
-on and the release workflow does not override it — so what is published is the
-same card every CI run builds and boots, rather than a configuration that is
-first exercised inside the release build itself. The `prerelease` input still
-selects the boot partition's channel and deliberately does **not** select an
-LLVM channel; `llvm_tag` pins a toolchain the way `boot_tag` pins a boot
-partition. The release notes quote the LLVM and musl versions out of the built
-tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
+The released card carries the LLVM toolchain and GNU make, because `WITH_LLVM`
+and `WITH_MAKE` default to on and the release workflow does not override
+either — so what is published is the same card every CI run builds and boots,
+rather than a configuration that is first exercised inside the release build
+itself. The `prerelease` input still selects the boot partition's channel and
+deliberately selects **neither** an LLVM nor a make channel; `llvm_tag` and
+`make_tag` pin those the way `boot_tag` pins a boot partition. The release
+notes quote the LLVM, GNU make and musl versions out of the built tree's
+`/etc/os-release`, so they cannot drift from what was actually shipped.
 
 ## Networking
 
