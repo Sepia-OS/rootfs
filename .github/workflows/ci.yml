@@ -98,7 +98,8 @@ jobs:
       # so nothing here has to change for it - and downloads/make/<tag>/ is
       # keyed the same way, even though Sepia-OS/make does not reuse a tag in
       # the ordinary course, because deleting a release and republishing it is
-      # what that repository's own retry advice says to do.
+      # what that repository's own retry advice says to do. downloads/
+      # e2fsprogs-package/<tag>/ follows both of them, for both reasons.
       #
       # In particular do not narrow the key to compensate: dropping the
       # restore-key fallback would refetch the cross-toolchain on every
@@ -125,6 +126,13 @@ jobs:
       - name: Resolve and fetch GNU make for the device
         run: make fetch-make
 
+      # And the filesystem tools, for the same reason again. This one also
+      # decides whether the *host* build has anything to cross-compile: with
+      # the package on, which is the default, step 6 part 1 builds mke2fs for
+      # this machine and nothing for the card.
+      - name: Resolve and fetch e2fsprogs for the device
+        run: make e2fsprogs
+
       - name: Build the image
         run: make image
 
@@ -135,6 +143,7 @@ jobs:
           make modules-info
           make llvm-info
           make make-info
+          make e2fsprogs-info
 
       - name: Read the image back
         run: make image-check
@@ -151,6 +160,12 @@ jobs:
       # rather than on the build path.
       - name: Read GNU make back
         run: make make-check
+
+      # And the same for the twenty-two programs of e2fsprogs, all of which are
+      # read rather than a sample: they come from six upstream directories and
+      # one linking differently from the rest is exactly what this catches.
+      - name: Read e2fsprogs back
+        run: make e2fsprogs-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

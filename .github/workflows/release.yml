@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       prerelease:
-        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release. It does NOT select an LLVM toolchain or a GNU make - see llvm_tag and make_tag.'
+        description: 'Mark as a pre-release. This also decides which boot partition is used: a pre-release build takes the latest pre-release of Sepia-OS/boot, a full release takes the latest full release. It does NOT select an LLVM toolchain, a GNU make or an e2fsprogs - see llvm_tag, make_tag and e2fsprogs_tag.'
         required: false
         default: true
         type: boolean
@@ -36,6 +36,11 @@ on:
         type: string
       make_tag:
         description: 'Pin a specific Sepia-OS/make release instead of taking the newest one (optional). Unlike llvm, that repository keeps its releases, so a pin here goes on resolving.'
+        required: false
+        default: ''
+        type: string
+      e2fsprogs_tag:
+        description: 'Pin a specific Sepia-OS/e2fsprogs release instead of taking the newest one (optional). Like make, that repository keeps its releases, so a pin here goes on resolving.'
         required: false
         default: ''
         type: string
@@ -161,6 +166,8 @@ jobs:
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
       gnu_make: ${{ steps.facts.outputs.gnu_make }}
       make_release: ${{ steps.facts.outputs.make_release }}
+      e2fsprogs: ${{ steps.facts.outputs.e2fsprogs }}
+      e2fsprogs_release: ${{ steps.facts.outputs.e2fsprogs_release }}
     env:
       QEMU_TIMEOUT: 300
       SEPIAOS_VERSION: ${{ needs.gate.outputs.version }}
@@ -194,6 +201,14 @@ jobs:
       # likewise left at its default for the same reason WITH_LLVM is: the
       # released card has to be the card CI builds and boots.
       MAKE_TAG: ${{ inputs.make_tag }}
+      # The filesystem tools, from Sepia-OS/e2fsprogs, on exactly the same
+      # terms as GNU make: not through CHANNEL, a pin that does not decay, and
+      # WITH_E2FSPROGS left at its default so the released card is the card CI
+      # builds and boots. This one also decides where the card's resize2fs
+      # comes from - the package, or the single binary the Makefile
+      # cross-builds when it is off - and the first boot cannot grow the root
+      # filesystem without one of them.
+      E2FSPROGS_TAG: ${{ inputs.e2fsprogs_tag }}
       # The Makefile asks api.github.com which boot release to build against.
       # Unauthenticated that is 60 requests an hour *per IP*, and hosted
       # runners share their egress addresses with every other job on the
@@ -235,6 +250,10 @@ jobs:
       - name: Resolve and fetch GNU make for the device
         run: make fetch-make
 
+      # And once more for the filesystem tools.
+      - name: Resolve and fetch e2fsprogs for the device
+        run: make e2fsprogs
+
       - name: Build the image
         run: make image
 
@@ -251,6 +270,10 @@ jobs:
       # its only shared library. Needs the cross-toolchain's readelf as well.
       - name: Read GNU make back
         run: make make-check
+
+      # Twenty-two programs, all of them read rather than a sample.
+      - name: Read e2fsprogs back
+        run: make e2fsprogs-check
 
       - name: Boot it as every board QEMU can emulate
         run: make smoke
@@ -273,6 +296,8 @@ jobs:
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "gnu_make=${SEPIAOS_MAKE}"
             echo "make_release=${SEPIAOS_MAKE_RELEASE}"
+            echo "e2fsprogs=${SEPIAOS_E2FSPROGS}"
+            echo "e2fsprogs_release=${SEPIAOS_E2FSPROGS_RELEASE}"
             echo "image=$(make -s print-IMAGE)"
           } >> "$GITHUB_OUTPUT"
 
@@ -346,13 +371,16 @@ jobs:
           # shell that later runs make would point $(MAKE) at a version number.
           GNU_MAKE: ${{ needs.build.outputs.gnu_make }}
           MAKE_RELEASE: ${{ needs.build.outputs.make_release }}
+          E2FSPROGS: ${{ needs.build.outputs.e2fsprogs }}
+          E2FSPROGS_RELEASE: ${{ needs.build.outputs.e2fsprogs_release }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           cat > notes.md <<EOF
           A complete SepiaOS card for Pi Zero 2 W, Pi 3, Pi 4, CM4, Pi 5 and
           CM5: the boot partition, and a root filesystem of musl and busybox
-          with the kernel modules that match the shipped kernel — and an LLVM
-          toolchain with GNU make beside it, so the card builds for itself.
+          with the kernel modules that match the shipped kernel — an LLVM
+          toolchain with GNU make beside it, so the card builds for itself, and
+          the e2fsprogs tools, so it can look after its own filesystems.
 
           | | |
           |---|---|
@@ -364,6 +392,7 @@ jobs:
           | musl | \`${MUSL}\` |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
           | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
+          | e2fsprogs | \`${E2FSPROGS}\` (\`${E2FSPROGS_RELEASE}\` from \`Sepia-OS/e2fsprogs\`) |
 
           Booted to a login prompt under QEMU as a Pi Zero 2 W, a Pi 3, a Pi 4
           and a CM4 before publishing.
@@ -387,6 +416,23 @@ jobs:
           only a single \`clang\` command line, and it is the last thing needed
           to build a project here rather than compile a file. Its GPLv3 licence
           text ships with it, at \`/usr/share/licenses/make/COPYING\`.
+
+          ## Filesystem tools
+
+          **e2fsprogs \`${E2FSPROGS}\`** is on the card, from
+          \`Sepia-OS/e2fsprogs\` — the whole package rather than the single
+          \`resize2fs\` earlier images carried. \`mke2fs\`, \`e2fsck\`,
+          \`tune2fs\`, \`resize2fs\`, \`debugfs\`, \`dumpe2fs\`,
+          \`badblocks\`, \`blkid\`, \`fsck\` and \`e2image\` are in
+          \`/sbin\`, with \`filefrag\`, \`e2freefrag\`, \`e4defrag\`,
+          \`uuidd\` and the rest under \`/usr\`, the usual
+          \`mkfs.ext4\`/\`fsck.ext4\`/\`e2label\` names beside them, and
+          \`/etc/mke2fs.conf\`. Six of those names were busybox applets and
+          are now the real programs; busybox's own \`chattr\` and \`lsattr\`
+          in \`/bin\` still take precedence on \`PATH\` over the e2fsprogs
+          ones in \`/usr/bin\`. This is also what grows the root filesystem on
+          first boot. Its licences ship with it, at
+          \`/usr/share/licenses/e2fsprogs/\`.
 
           **Two honest caveats.** First, nothing has run \`clang\` or \`make\`
           on this card: QEMU's serial console is output-only, so what CI checks

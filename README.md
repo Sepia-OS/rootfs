@@ -120,12 +120,65 @@ make make-update                # move onto a newer one
 make WITH_MAKE=0 image          # an image with no make on it
 ```
 
+### Retrieve the e2fsprogs filesystem tools for the device
+
+The latest release of https://github.com/Sepia-OS/e2fsprogs shall be retrieved
+and unpacked into the root file system, so that a SepiaOS device can create,
+check, resize and inspect its own ext2/3/4 filesystems. That repository
+cross-builds the whole package against musl to run on the Pi — twenty-two
+programs and nine alternate names — and publishes it with a `SHA256SUMS` beside
+it, exactly as the toolchain and GNU make above; the asset is verified against
+that digest before anything is unpacked.
+
+It lands as upstream's own Linux layout rather than a `usr/` tree: `mke2fs`,
+`e2fsck`, `tune2fs`, `resize2fs`, `debugfs`, `dumpe2fs`, `badblocks`, `blkid`,
+`fsck`, `e2image`, `e2undo` and `logsave` in `/sbin`, `filefrag`, `e2freefrag`,
+`e4defrag`, `e4crypt`, `mklost+found` and `uuidd` in `/usr/sbin`, `chattr`,
+`lsattr` and `uuidgen` in `/usr/bin`, the `mkfs.ext*`/`fsck.ext*`/`e2label`
+names beside their programs, `/etc/mke2fs.conf` — which `mke2fs` will not run
+without — and the licences under `/usr/share/licenses/e2fsprogs/`.
+
+**This replaces the cross-built `resize2fs`.** Growing the root filesystem on
+first boot needs `resize2fs` and busybox has no applet for it, so this build
+used to cross-build that one binary itself. The package contains the same
+program built the same way, so the cross build is switched off by default and
+the card gets the other twenty-one as well — a card that can now `fsck` and
+`mke2fs` for real rather than through busybox's minimal stand-ins.
+
+**Six paths collide with busybox applets** — `/sbin/blkid`, `/sbin/findfs`,
+`/sbin/fsck`, `/sbin/mke2fs`, `/sbin/mkfs.ext2` and `/usr/bin/uuidgen` — and
+e2fsprogs wins all six; the applet symlinks are removed before the copy rather
+than overwritten, because `cp` follows a symlink it is copying onto and would
+otherwise write into `/bin/busybox` itself. Anything colliding that is *not* a
+busybox applet stops the build. `/bin/chattr` and `/bin/lsattr` are busybox
+applets at a different path, so they keep shadowing the e2fsprogs ones in
+`/usr/bin` on `PATH`; both remain reachable by full path.
+
+**This does not follow `CHANNEL`**, for the reason the toolchain and GNU make
+do not. "Latest" is the newest published release whatever its flag, and
+`E2FSPROGS_TAG` pins a specific one — and as with `MAKE_TAG`, a pin here keeps
+resolving, because that repository keeps its releases and refuses to reuse a
+version.
+
+`WITH_E2FSPROGS=0` leaves the package out and brings the cross-built
+`/usr/sbin/resize2fs` back, so the first-boot resize works either way.
+`make e2fsprogs-check` reads every unpacked program back: aarch64, on the musl
+loader, and with `libc.so` as its only shared library.
+
+```sh
+make e2fsprogs                        # resolve, verify and unpack it
+make e2fsprogs-info                   # which release, which version, how big
+make E2FSPROGS_TAG=v1.47.4 e2fsprogs  # a specific release
+make e2fsprogs-update                 # move onto a newer one
+make WITH_E2FSPROGS=0 image           # an image with the single resize2fs instead
+```
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
-populated with musl libc, busybox, the kernel modules, the LLVM toolchain and
-GNU make from the previous steps. The rootfs shall be created with `ext4` file
-system.
+populated with musl libc, busybox, the kernel modules, the LLVM toolchain, GNU
+make and the e2fsprogs filesystem tools from the previous steps. The rootfs
+shall be created with `ext4` file system.
 
 The bootable image is created using the boot partition, musl libc and
 busybox. It boots to a login screen. As soon as a user logs in, a shell
@@ -300,14 +353,15 @@ When the build succeeded the a release shall be created
 image that can be downloaded and written to an SD card by
 the user who downlaoded it.
 
-The released card carries the LLVM toolchain and GNU make, because `WITH_LLVM`
-and `WITH_MAKE` default to on and the release workflow does not override
-either — so what is published is the same card every CI run builds and boots,
-rather than a configuration that is first exercised inside the release build
-itself. The `prerelease` input still selects the boot partition's channel and
-deliberately selects **neither** an LLVM nor a make channel; `llvm_tag` and
-`make_tag` pin those the way `boot_tag` pins a boot partition. The release
-notes quote the LLVM, GNU make and musl versions out of the built tree's
+The released card carries the LLVM toolchain, GNU make and the e2fsprogs
+tools, because `WITH_LLVM`, `WITH_MAKE` and `WITH_E2FSPROGS` default to on and
+the release workflow does not override any of them — so what is published is
+the same card every CI run builds and boots, rather than a configuration that
+is first exercised inside the release build itself. The `prerelease` input
+still selects the boot partition's channel and deliberately selects **no**
+channel for the three siblings; `llvm_tag`, `make_tag` and `e2fsprogs_tag` pin
+those the way `boot_tag` pins a boot partition. The release notes quote the
+LLVM, GNU make, e2fsprogs and musl versions out of the built tree's
 `/etc/os-release`, so they cannot drift from what was actually shipped.
 
 ## Networking

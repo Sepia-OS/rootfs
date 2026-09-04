@@ -1071,6 +1071,17 @@ modules-info: $(MOD_STAMP) ## Show the kernel module trees that were installed
 #            applet for. Dynamic against the musl from step 3, exactly like
 #            busybox, and proved that way rather than assumed.
 #
+# The target half is now the fallback rather than the rule. `Sepia-OS/e2fsprogs`
+# publishes the whole package built the same way - resize2fs among twenty-two
+# programs - and WITH_E2FSPROGS=1, the default, puts that on the card. Building
+# a second resize2fs here would either be work thrown away or, worse, a second
+# copy on the card at a different path. So the cross build below runs only when
+# the package is switched off, and then it is the only thing that grows the
+# root filesystem on first boot.
+#
+# The host half is unconditional and stays that way: it is what *creates* the
+# image on this machine, and no release from any sibling can do that.
+#
 # HOST_E2FSPROGS=<dir> points at tools you already have (say
 # /opt/homebrew/opt/e2fsprogs/sbin) and skips the host build; the image layout
 # then depends on whatever version that is.
@@ -1082,6 +1093,12 @@ modules-info: $(MOD_STAMP) ## Show the kernel module trees that were installed
 # then comes back undefined at link time. AR, RANLIB and STRIP are passed
 # explicitly for that reason, and only for that reason.
 # ---------------------------------------------------------------------------
+
+# Declared here rather than in the section that owns it, three steps below,
+# because Make expands a rule's prerequisites the moment it reads the rule: by
+# the time $(E2FSPROGS_DEP) exists this file is already past the goals that
+# have to know about it. The package step is "e2fsprogs for the device".
+WITH_E2FSPROGS ?= 1
 
 E2FS_VERSION ?=
 E2FS_BASE    ?= https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs
@@ -1102,15 +1119,23 @@ DEBUGFS         = $(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS)/debugfs,$(abspath $(E
 E2FSCK          = $(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS)/e2fsck,$(abspath $(E2FS_DIR)/host/e2fsck/e2fsck))
 RESIZE2FS       = $(E2FS_DIR)/target/resize/resize2fs
 
+# Empty when the device takes the package from Sepia-OS/e2fsprogs, which is
+# what removes the cross build from the default path entirely.
+E2FS_TGT_DEP    = $(if $(filter 1,$(WITH_E2FSPROGS)),,$(E2FS_TGT_STAMP))
+
 # Neither build needs nls, uuidd, the initrd helper, e4defrag or e2image, and
 # every one of them is another way for a cross build to go wrong.
 E2FS_CONFIGURE = --disable-nls --disable-fsck --disable-uuidd \
                  --disable-e2initrd-helper --disable-defrag --disable-imager
 
-.PHONY: e2fsprogs
-e2fsprogs: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Build mke2fs/debugfs for this host and resize2fs for the target
-	@source $(E2FS_ENV); printf '  READY    e2fsprogs %s -> %s + %s\n' \
-	   "$$E2FS_VER" "$(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS) (host tools),$(E2FS_DIR)/host)" $(RESIZE2FS)
+# `host-e2fsprogs`, not `e2fsprogs`: the plain name belongs to the package that
+# goes on the card, the way `llvm` and `make` name the things this repository
+# consumes rather than the machinery that builds them.
+.PHONY: host-e2fsprogs
+host-e2fsprogs: $(E2FS_HOST_DEP) $(E2FS_TGT_DEP) ## Build mke2fs/debugfs for this host (and resize2fs for the target, if WITH_E2FSPROGS=0)
+	@source $(E2FS_ENV); printf '  READY    e2fsprogs %s -> %s%s\n' \
+	   "$$E2FS_VER" "$(if $(HOST_E2FSPROGS),$(HOST_E2FSPROGS) (host tools),$(E2FS_DIR)/host)" \
+	   "$(if $(E2FS_TGT_DEP), + $(RESIZE2FS),)"
 
 $(E2FS_CFG): FORCE
 	@mkdir -p $(@D)
@@ -1214,12 +1239,16 @@ define assert_target_binary
 	  || { echo "  FAIL     $(1) does not link libc.so" >&2; exit 1; }
 endef
 
-.PHONY: e2fsprogs-info
-e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_STAMP) ## Show the e2fsprogs build
+.PHONY: host-e2fsprogs-info
+host-e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_DEP) ## Show the e2fsprogs built here for this machine
 	@source $(E2FS_ENV); echo "  version  e2fsprogs $$E2FS_VER"
 	@echo "  mke2fs   $(MKE2FS)$(if $(HOST_E2FSPROGS), (HOST_E2FSPROGS))"
 	@$(MKE2FS) -V 2>&1 | sed -n '1s/^/  reports  /p'
-	@printf '  resize2fs %s (%s KiB, aarch64)\n' $(RESIZE2FS) "$$(( $$(wc -c < $(RESIZE2FS)) / 1024 ))"
+	@echo "  target   $(if $(E2FS_TGT_DEP),resize2fs is cross-built here,resize2fs comes from the $(E2FSPROGS_REPO) package)"
+	@if [ -n '$(E2FS_TGT_DEP)' ]; then \
+	   printf '  resize2fs %s (%s KiB, aarch64)\n' \
+	     $(RESIZE2FS) "$$(( $$(wc -c < $(RESIZE2FS)) / 1024 ))"; \
+	 fi
 # ---------------------------------------------------------------------------
 # Networking - the parts of it that have to be built
 #
@@ -2160,11 +2189,324 @@ define assert_make_closure
 endef
 
 # ---------------------------------------------------------------------------
+# e2fsprogs for the device
+#
+# `Sepia-OS/e2fsprogs` cross-builds the whole package against musl to run *on*
+# the Pi - twenty-two programs and nine alternate names - and publishes it as
+# one tree, verified the way the toolchain and GNU make are. mke2fs, e2fsck,
+# tune2fs, resize2fs, debugfs, dumpe2fs, badblocks, blkid, e2image, filefrag
+# and the rest, plus the /etc/mke2fs.conf that mke2fs will not run without.
+#
+# This is what step 6 part 1's target half used to be. That build produced one
+# binary, resize2fs, because first boot has to grow the root filesystem and
+# busybox has no applet for it; the package contains that same binary built the
+# same way, so the cross build is switched off by default and the card gets the
+# other twenty-one as well. WITH_E2FSPROGS=0 reverses both halves of that.
+#
+# Structurally this is the GNU make step with the names changed, so only what
+# differs is written down:
+#
+#   - It is *not* a `usr/` tree. e2fsprogs' own Linux layout puts what a system
+#     needs before /usr is mounted in /sbin, so the asset writes /sbin, /etc,
+#     /usr/sbin, /usr/bin and /usr/lib. That is why the install below is more
+#     than a copy: this is the first sibling asset that lands on top of busybox.
+#   - Six paths collide with busybox applet symlinks - sbin/blkid, sbin/findfs,
+#     sbin/fsck, sbin/mke2fs, sbin/mkfs.ext2 and usr/bin/uuidgen - and
+#     e2fsprogs wins all six. busybox's are size-optimised stand-ins; these are
+#     the programs that made the filesystem in the first place. Each link is
+#     *removed* before the copy, because cp follows a symlink it is copying
+#     onto: without the rm, e2fsck's bytes would be written straight into
+#     /bin/busybox and the card would have no shell.
+#   - bin/chattr and bin/lsattr are busybox applets at a different path, so
+#     they do not collide - and /bin comes before /usr/bin in the login PATH,
+#     so typing `chattr` still runs busybox's. The e2fsprogs ones are at
+#     usr/bin/chattr. Deliberate: replacing an applet is a decision about
+#     busybox's install, not about unpacking this asset.
+#   - resize2fs lands at /sbin/resize2fs rather than /usr/sbin/resize2fs.
+#     sepia-firstboot calls it by name and /etc/profile's PATH is
+#     /bin:/sbin:/usr/bin:/usr/sbin, so it is found either way.
+#   - CHANNEL is not used, for the reason it is not used above: it selects a
+#     boot release and defaults to `prerelease`, while this repository has cut
+#     a full release. "Latest" is the newest published non-draft release
+#     whatever its flag, and E2FSPROGS_TAG pins one.
+#   - Pinning has a long memory, as GNU make's does: that release workflow
+#     refuses to reuse a version, so its tags do not move in the ordinary
+#     course of events. The asset-id check is kept anyway, for the same
+#     extraordinary course of events - `gh release delete --cleanup-tag` and a
+#     re-release of the same version - and because CI restores downloads/.
+#
+# E2FS_VERSION (step 6, part 1) and E2FSPROGS_VERSION (here) are one letter
+# apart and mean different things: the first pins the *source* release this
+# machine builds mke2fs from, the second is read out of the release notes and
+# says what is on the card. They are allowed to differ, and normally will.
+#
+# This sits before the rootfs step because the rootfs copies its output in.
+# ---------------------------------------------------------------------------
+
+# WITH_E2FSPROGS is declared in step 6, part 1, which needs it before this
+# point; see the comment there.
+
+E2FSPROGS_REPO ?= Sepia-OS/e2fsprogs
+
+# Pin a specific release, e.g. E2FSPROGS_TAG=v1.47.4. Empty means "resolve the
+# newest one", resolved once and then cached in build/e2fsprogs-package/
+# release.env like every other upstream version this build takes.
+# `make e2fsprogs-update` moves it.
+E2FSPROGS_TAG  ?=
+
+DL_E2FSPKG      := $(DL_DIR)/e2fsprogs-package
+E2FSPROGS_DIR   := $(BUILD_DIR)/e2fsprogs-package
+
+E2FSPROGS_ENV   := $(E2FSPROGS_DIR)/release.env
+E2FSPROGS_STAGE := $(E2FSPROGS_DIR)/stage
+E2FSPROGS_STAMP := $(E2FSPROGS_DIR)/.staged
+E2FSPROGS_CFG   := $(E2FSPROGS_DIR)/.config
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+E2FSPROGS_SIG    = $(E2FSPROGS_REPO)|$(E2FSPROGS_TAG)|$(GITHUB_API)|env1
+
+ifeq ($(WITH_E2FSPROGS),1)
+  E2FSPROGS_DEP := $(E2FSPROGS_STAMP)
+else
+  E2FSPROGS_DEP :=
+endif
+
+# Named after the product, as `llvm` and `make` are. `fetch-e2fsprogs` is the
+# alias for scripts that would rather say what the target does.
+.PHONY: e2fsprogs fetch-e2fsprogs
+e2fsprogs fetch-e2fsprogs: $(E2FSPROGS_STAMP) ## Fetch, verify and unpack the e2fsprogs package for the device
+	@source $(E2FSPROGS_ENV); printf '  READY    e2fsprogs %s (e2fsprogs %s) -> %s (%s KiB)\n' \
+	   "$$E2FSPROGS_TAG" "$${E2FSPROGS_VERSION:-?}" $(E2FSPROGS_STAGE) "$$(du -sk $(E2FSPROGS_STAGE) | cut -f1)"
+
+$(E2FSPROGS_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(E2FSPROGS_SIG)' | cmp -s - $@ || printf '%s\n' '$(E2FSPROGS_SIG)' > $@
+
+# The release body is mined the way the boot, llvm and make ones are: it states
+# both numbers verbatim as table rows, `| e2fsprogs | `1.47.4` |` and
+# `| Built against musl | `1.2.6` |`. The first names the package in
+# /etc/os-release and in the release notes; the second is the libc it was
+# linked against, which is worth having beside the card's own musl version -
+# these binaries are dynamic, so a card whose musl is older than the one they
+# were built against is how "symbol not found" appears at exec time. A release
+# that names neither leaves them empty rather than failing this step, which
+# does not need them.
+$(E2FSPROGS_ENV): $(E2FSPROGS_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(E2FSPROGS_REPO) ($(if $(E2FSPROGS_TAG),pinned $(E2FSPROGS_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(E2FSPROGS_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(E2FSPROGS_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(E2FSPROGS_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(E2FSPROGS_REPO) has no release tagged '$(E2FSPROGS_TAG)'. Leave E2FSPROGS_TAG" >&2; \
+	     echo "empty to take the newest one, or check 'gh release list --repo $(E2FSPROGS_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(E2FSPROGS_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(E2FSPROGS_REPO) has published no release yet. Build without it using" >&2; \
+	     echo "WITH_E2FSPROGS=0, or pin one with E2FSPROGS_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *e2fsprogs *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 mus=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/.*Built against musl[^|]*| *`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$mus" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || mus=''; \
+	 { echo "E2FSPROGS_TAG='$$tag'"; \
+	   echo "E2FSPROGS_PRERELEASE='$$pre'"; \
+	   echo "E2FSPROGS_ASSET='$$ast'"; \
+	   echo "E2FSPROGS_ASSET_URL='$$asturl'"; \
+	   echo "E2FSPROGS_ASSET_ID='$$astid'"; \
+	   echo "E2FSPROGS_SUMS_URL='$$sumurl'"; \
+	   echo "E2FSPROGS_VERSION='$$ver'"; \
+	   echo "E2FSPROGS_MUSL='$$mus'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^E2FSPROGS_TAG='\(.*\)'/  E2FS     \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it. The marker is
+# written only after VERIFY passes, so an interrupted download is refetched
+# rather than trusted.
+$(E2FSPROGS_STAMP): $(E2FSPROGS_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(E2FSPROGS_ENV); \
+	 d=$(DL_E2FSPKG)/$$E2FSPROGS_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$E2FSPROGS_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$E2FSPROGS_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$E2FSPROGS_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$E2FSPROGS_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$E2FSPROGS_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$E2FSPROGS_ASSET"; \
+	   $(CURL) -o "$$d/$$E2FSPROGS_ASSET.part" "$$E2FSPROGS_ASSET_URL"; \
+	   mv -f "$$d/$$E2FSPROGS_ASSET.part" "$$d/$$E2FSPROGS_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$E2FSPROGS_ASSET"; \
+	 ( cd "$$d" && grep -F "$$E2FSPROGS_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$E2FSPROGS_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$E2FSPROGS_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$E2FSPROGS_ASSET -> $(E2FSPROGS_STAGE)"; \
+	 rm -rf $(E2FSPROGS_STAGE); mkdir -p $(E2FSPROGS_STAGE); \
+	 tar -xf "$$d/$$E2FSPROGS_ASSET" -C $(E2FSPROGS_STAGE)
+	@$(call assert_e2fsprogs_stage)
+	@touch $@
+
+# Asked of the unpacked tree before it is mixed into the rootfs, so a truncated
+# or wrong-architecture asset fails naming itself. Deliberately uses nothing
+# from the cross-toolchain - this step is a download, and needing
+# $(CROSS)readelf would drag 600 MiB into it. ELF byte 18 is e_machine,
+# little-endian, and 0xb7 is AArch64; `e2fsprogs-check` does the deeper reading.
+#
+# Four programs are named rather than one: resize2fs because first boot cannot
+# grow the card without it, mke2fs and e2fsck because they are the reason to
+# ship the package at all, and debugfs because it is the one that proves this
+# is the full asset and not the single binary the cross build used to produce.
+# mke2fs.conf is named because mke2fs has no filesystem profiles without it and
+# will refuse to create anything.
+#
+# The licences are checked because e2fsprogs is GPLv2 with LGPLv2, MIT and
+# BSD-licensed libraries and this build redistributes binaries of all of it.
+#
+# The libc check mirrors the toolchain's and GNU make's. That repository's
+# `dist` refuses to pack a libc or a loader, on purpose, because the card's
+# musl comes from step 3 and a second copy is how two libcs end up disagreeing.
+define assert_e2fsprogs_stage
+	set -e; s=$(E2FSPROGS_STAGE); \
+	for f in sbin/mke2fs sbin/e2fsck sbin/resize2fs sbin/tune2fs sbin/debugfs; do \
+	  [ -x "$$s/$$f" ] || { \
+	    echo "  FAIL     $$s/$$f is missing - is this a SepiaOS e2fsprogs asset?" >&2; exit 1; }; \
+	  m=$$(od -An -tx1 -j 18 -N2 "$$s/$$f" | tr -d ' \n'); \
+	  [ "$$m" = "b700" ] || { \
+	    echo "  FAIL     $$f has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	  grep -aq 'ld-musl-aarch64.so.1' "$$s/$$f" \
+	    || { echo "  FAIL     $$f does not ask for the musl loader" >&2; exit 1; }; \
+	done; \
+	for l in sbin/mkfs.ext4 sbin/fsck.ext4 sbin/e2label; do \
+	  [ -L "$$s/$$l" ] && [ -e "$$s/$$l" ] \
+	    || { echo "  FAIL     $$l is not a symlink resolving inside the asset" >&2; exit 1; }; \
+	done; \
+	[ -s "$$s/etc/mke2fs.conf" ] \
+	  || { echo "  FAIL     the asset carries no etc/mke2fs.conf; mke2fs cannot run without it" >&2; exit 1; }; \
+	[ -s "$$s/usr/share/licenses/e2fsprogs/NOTICE" ] \
+	  || { echo "  FAIL     the asset carries no NOTICE; e2fsprogs is GPLv2 and this ships it" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: e2fsprogs-update
+e2fsprogs-update: ## Re-resolve the newest e2fsprogs release and refetch
+	@rm -f $(E2FSPROGS_ENV)
+	@$(MAKE) --no-print-directory e2fsprogs
+
+.PHONY: e2fsprogs-tag
+e2fsprogs-tag: $(E2FSPROGS_ENV) ## Print the e2fsprogs release tag in use
+	@source $(E2FSPROGS_ENV); echo "$$E2FSPROGS_TAG"
+
+.PHONY: e2fsprogs-info
+e2fsprogs-info: $(E2FSPROGS_STAMP) ## Show the fetched e2fsprogs release and what it contains
+	@source $(E2FSPROGS_ENV); \
+	 if [ "$$E2FSPROGS_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(E2FSPROGS_REPO)"; \
+	 echo "  tag      $$E2FSPROGS_TAG$$k$(if $(E2FSPROGS_TAG), (pinned))"; \
+	 echo "  asset    $$E2FSPROGS_ASSET"; \
+	 echo "  version  $${E2FSPROGS_VERSION:-<not named in the release notes>}"; \
+	 echo "  musl     $${E2FSPROGS_MUSL:-<not named in the release notes>} (what it was built against)"; \
+	 echo "  staged   $(E2FSPROGS_STAGE) ($$(du -sk $(E2FSPROGS_STAGE) | cut -f1) KiB)"
+	@printf '  programs %s, alternate names %s\n' \
+	   "$$(find $(E2FSPROGS_STAGE) -type f -perm -u+x | wc -l | tr -d ' ')" \
+	   "$$(find $(E2FSPROGS_STAGE) -type l | wc -l | tr -d ' ')"
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. Every program is read rather than a sample: this asset is twenty-two
+# of them from six upstream directories, and one linking differently from the
+# rest is exactly the failure this is for - `libatomic.so.1` in an llvm release
+# is what this kind of check exists to catch.
+.PHONY: e2fsprogs-check
+e2fsprogs-check: $(E2FSPROGS_STAMP) $(TOOLCHAIN_DEP) ## Re-read the on-device e2fsprogs: architecture, loader, library closure
+	@$(call assert_e2fsprogs_stage)
+	@$(call assert_e2fsprogs_closure)
+
+define assert_e2fsprogs_closure
+	set -e; n=0; \
+	while read -r f; do \
+	  case "$$(od -An -N4 -tx1 "$$f" | tr -d ' ')" in 7f454c46) ;; *) continue;; esac; \
+	  $(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	    || { echo "  FAIL     $$f is not aarch64" >&2; exit 1; }; \
+	  i=$$($(CROSS)readelf -l "$$f" | sed -n 's/.*interpreter: \(.*\)\]/\1/p'); \
+	  [ "$$i" = /lib/ld-musl-aarch64.so.1 ] \
+	    || { echo "  FAIL     $$f asks for '$$i', not the musl loader" >&2; exit 1; }; \
+	  miss=; \
+	  for d in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	              | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	    [ "$$d" = libc.so ] || miss="$$miss $$d"; \
+	  done; \
+	  [ -z "$$miss" ] || { \
+	    echo "  FAIL     $$f needs more than the card's musl:$$miss" >&2; exit 1; }; \
+	  n=$$((n+1)); \
+	done < <(find $(E2FSPROGS_STAGE) -type f); \
+	[ "$$n" -gt 20 ] || { \
+	  echo "  FAIL     only $$n programs in the asset - is it truncated?" >&2; exit 1; }; \
+	echo "  OK       $$n programs, all aarch64, on the musl loader, needing only libc.so"
+endef
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
 # 408 applet links, the musl loader and libc.so, both kernel module trees, the
-# cross-built resize2fs, and the configuration in overlay/.
+# e2fsprogs package (or, with WITH_E2FSPROGS=0, the cross-built resize2fs on its
+# own), and the configuration in overlay/.
 #
 # overlay/ is a directory of real files rather than heredocs in this Makefile
 # on purpose - /etc/init.d/rcS and the two scripts under usr/sbin are shell
@@ -2229,18 +2571,20 @@ KEYMAP_VENDOR     := vendor/keymaps/kmaps.tcz
 KEYMAP_VENDOR_MD5 := vendor/keymaps/kmaps.tcz.md5.txt
 KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 
-# WITH_WIFI, WITH_LLVM and WITH_MAKE change what goes into the tree but touch
-# no file, so on their own they would not invalidate anything: make would find
-# the stamp newer than every prerequisite and leave the previous build's wifi -
-# or toolchain, or make - in place. This records them, the way the other steps
-# record the versions they were asked for, and the rootfs depends on the record.
+# WITH_WIFI, WITH_LLVM, WITH_MAKE and WITH_E2FSPROGS change what goes into the
+# tree but touch no file, so on their own they would not invalidate anything:
+# make would find the stamp newer than every prerequisite and leave the previous
+# build's wifi - or toolchain, or make, or filesystem tools - in place. This
+# records them, the way the other steps record the versions they were asked for,
+# and the rootfs depends on the record.
 #
-# The LLVM and GNU make *tags* are deliberately not in here. $(LLVM_STAMP) and
-# $(MAKE_STAMP) are real prerequisites below and they move whenever their tags
-# move, because LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same
-# chain for make) is a genuine file chain. Only the switches change the tree
-# while touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+# The LLVM, GNU make and e2fsprogs *tags* are deliberately not in here.
+# $(LLVM_STAMP), $(MAKE_STAMP) and $(E2FSPROGS_STAMP) are real prerequisites
+# below and they move whenever their tags move, because
+# LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same chain for the
+# other two) is a genuine file chain. Only the switches change the tree while
+# touching nothing.
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -2351,8 +2695,9 @@ $(ROOTFS_CFG): FORCE
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(ROOTFS_SIG)' | cmp -s - $@ || printf '%s\n' '$(ROOTFS_SIG)' > $@
 
-$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP_STAMP) \
-                 $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
+$(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_STAMP) \
+                 $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) \
+                 $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
 	@rm -rf $(ROOTFS_DIR)
@@ -2366,17 +2711,18 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_STAMP) $(KEYMAP
 	@cp -R $(SYSROOT)/lib/modules $(ROOTFS_DIR)/lib/
 	@cp -R $(SYSROOT)/lib/ld-musl-aarch64.so.1 $(ROOTFS_DIR)/lib/
 	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
-	@cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs
+	@$(if $(E2FS_TGT_DEP),cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs,:)
 	@$(if $(WIRELESS_DEP),cp -R $(WIRELESS_STAGE)/. $(ROOTFS_DIR)/,:)
 	@$(call install_toolchain)
 	@$(call install_gnu_make)
+	@$(call install_e2fsprogs)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
 	@$(call generate_etc)
 	@chmod 0755 $(ROOTFS_DIR) $(ROOTFS_DIR)/etc/init.d/rcS $(ROOTFS_DIR)/etc/init.d/rcK \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-gettys $(ROOTFS_DIR)/usr/sbin/sepia-firstboot \
-	            $(ROOTFS_DIR)/usr/sbin/resize2fs $(ROOTFS_DIR)/usr/bin/sepia-keymap \
+	            $(if $(E2FS_TGT_DEP),$(ROOTFS_DIR)/usr/sbin/resize2fs) $(ROOTFS_DIR)/usr/bin/sepia-keymap \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-network \
 	            $(ROOTFS_DIR)/usr/share/udhcpc/default.script
 	@$(if $(WIRELESS_DEP),chmod 0755 $(ROOTFS_DIR)/usr/sbin/wpa_supplicant $(ROOTFS_DIR)/usr/sbin/wpa_cli $(ROOTFS_DIR)/usr/sbin/wpa_passphrase,:)
@@ -2464,6 +2810,48 @@ define install_gnu_make
 	   "$$r" "$$(du -sk $$m | cut -f1)"
 endef
 
+# e2fsprogs, on the same terms and immediately after GNU make - and the first
+# sibling asset that is not a `usr/` tree. It writes /sbin, /etc, /usr/sbin,
+# /usr/bin and /usr/lib, which means it lands on top of busybox rather than
+# beside it.
+#
+# Six paths collide, all of them busybox applet symlinks: sbin/blkid,
+# sbin/findfs, sbin/fsck, sbin/mke2fs, sbin/mkfs.ext2 and usr/bin/uuidgen.
+# e2fsprogs wins them, because busybox's are size-optimised stand-ins for the
+# programs that made the filesystem in the first place - a busybox mke2fs
+# cannot create the ext4 this build ships. Anything colliding that is *not* an
+# applet symlink stops the build, exactly as it does for the toolchain and for
+# make: that would be two packages claiming one path, and the answer to it is a
+# decision, not a `cp`.
+#
+# The links are removed before the copy rather than overwritten, and that is
+# the whole reason this is not `cp -R` on its own: `cp` follows a symlink it is
+# copying *onto*. Without the rm, e2fsck's bytes would be written through
+# sbin/fsck straight into bin/busybox, and the card would come up with no
+# shell, no init and no way to find out why. The same trap is why sbin/init is
+# unlinked before the overlay is copied in.
+define install_e2fsprogs
+	set -e; \
+	[ -n '$(E2FSPROGS_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); e=$(abspath $(E2FSPROGS_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$e") <(names "$$(cd $$r && pwd)")); \
+	bad=; \
+	for f in $$c; do \
+	  case "$$(readlink "$$r/$$f" 2>/dev/null || echo '')" in \
+	    busybox|*/busybox) ;; \
+	    *) bad="$$bad $$f";; \
+	  esac; \
+	done; \
+	[ -z "$$bad" ] || { \
+	  echo "  FAIL     e2fsprogs would overwrite files that are not busybox applets:" >&2; \
+	  printf '           %s\n' $$bad >&2; exit 1; }; \
+	for f in $$c; do rm -f "$$r/$$f"; done; \
+	cp -R "$$e"/. $$r/; \
+	printf '  E2FS     e2fsprogs -> %s (%s KiB, %s busybox applets replaced)\n' \
+	   "$$r" "$$(du -sk $$e | cut -f1)" "$$(echo $$c | wc -w | tr -d ' ')"
+endef
+
 # fstab names the boot partition so `mount /boot` in rcS has something to read,
 # and the swap line is appended by sepia-firstboot once the partition exists.
 # The root entry is documentation and a fsck order: the kernel has already
@@ -2473,6 +2861,7 @@ define generate_etc
 	source $(MOD_KERNELS); source $(BOOT_ENV); source $(MUSL_ENV); \
 	$(if $(LLVM_DEP),source $(LLVM_ENV);,LLVM_TAG=; LLVM_VERSION=;) \
 	$(if $(MAKE_DEP),source $(MAKE_ENV);,MAKE_TAG=; GNU_MAKE_VERSION=;) \
+	$(if $(E2FSPROGS_DEP),source $(E2FSPROGS_ENV);,E2FSPROGS_TAG=; E2FSPROGS_VERSION=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -2493,7 +2882,9 @@ define generate_etc
 	  [ -z "$$LLVM_TAG" ] || { echo "SEPIAOS_LLVM_RELEASE=\"$$LLVM_TAG\""; \
 	                           echo "SEPIAOS_LLVM=\"$$LLVM_VERSION\""; }; \
 	  [ -z "$$MAKE_TAG" ] || { echo "SEPIAOS_MAKE_RELEASE=\"$$MAKE_TAG\""; \
-	                           echo "SEPIAOS_MAKE=\"$$GNU_MAKE_VERSION\""; }; } > $$r/etc/os-release; \
+	                           echo "SEPIAOS_MAKE=\"$$GNU_MAKE_VERSION\""; }; \
+	  [ -z "$$E2FSPROGS_TAG" ] || { echo "SEPIAOS_E2FSPROGS_RELEASE=\"$$E2FSPROGS_TAG\""; \
+	                                echo "SEPIAOS_E2FSPROGS=\"$$E2FSPROGS_VERSION\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -2508,7 +2899,11 @@ define assert_rootfs
 	[ ! -L "$$r/sbin/init" ] && [ -s "$$r/bin/busybox" ] \
 	  || { echo "  FAIL     sbin/init should be the wrapper script, not a busybox symlink" >&2; exit 1; }; \
 	for f in sbin/init bin/sh bin/busybox bin/login usr/bin/passwd sbin/getty \
-	         sbin/loadkmap usr/sbin/resize2fs etc/inittab etc/init.d/rcS \
+	         sbin/loadkmap etc/inittab etc/init.d/rcS \
+	         $(if $(E2FS_TGT_DEP),usr/sbin/resize2fs) \
+	         $(if $(E2FSPROGS_DEP),sbin/resize2fs sbin/mke2fs sbin/e2fsck sbin/tune2fs \
+	         sbin/debugfs sbin/mkfs.ext4 sbin/fsck.ext4 etc/mke2fs.conf \
+	         usr/share/licenses/e2fsprogs/NOTICE) \
 	         etc/passwd etc/shadow usr/bin/sepia-keymap \
 	         usr/share/keymaps/english_us.kmap \
 	         etc/network.conf usr/sbin/sepia-network sbin/udhcpc \
@@ -3102,7 +3497,7 @@ help: ## Show this help
 	@echo "SepiaOS root filesystem builder"
 	@echo
 	@echo "Targets:"
-	@grep -hE '^[a-zA-Z_-]+([ ]+[a-zA-Z_-]+)*:.*?## ' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+([ ]+[a-zA-Z0-9_-]+)*:.*?## ' $(MAKEFILE_LIST) \
 	  | sed 's/:.*## /|/' \
 	  | awk -F'|' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo
@@ -3122,7 +3517,10 @@ help: ## Show this help
 	  "WITH_MAKE"         "ship GNU make for the device (default $(WITH_MAKE))" \
 	  "MAKE_TAG"          "pin a GNU make release instead of taking the newest one" \
 	  "MAKE_REPO"         "where GNU make comes from (default $(MAKE_REPO))" \
-	  "E2FS_VERSION"      "pin an e2fsprogs release instead of taking the latest one" \
+	  "WITH_E2FSPROGS"    "ship the e2fsprogs filesystem tools (default $(WITH_E2FSPROGS))" \
+	  "E2FSPROGS_TAG"     "pin an e2fsprogs release instead of taking the newest one" \
+	  "E2FSPROGS_REPO"    "where e2fsprogs comes from (default $(E2FSPROGS_REPO))" \
+	  "E2FS_VERSION"      "pin the e2fsprogs *sources* built here for this machine" \
 	  "HOST_E2FSPROGS"    "directory of mke2fs/debugfs to use instead of building them" \
 	  "SEPIAOS_VERSION"   "version stamped into the image (default $(SEPIAOS_VERSION))" \
 	  "SEPIAOS_VERSION_DISPLAY" "login-banner version text (default the SEPIAOS_VERSION)" \
@@ -3150,10 +3548,14 @@ help: ## Show this help
 	@echo "  make llvm-update                       move onto a newer one"
 	@echo "  make fetch-make                        the newest GNU make for the device"
 	@echo "  make MAKE_TAG=v4.4.1 fetch-make        a specific GNU make release"
+	@echo "  make e2fsprogs                         the newest e2fsprogs for the device"
+	@echo "  make E2FSPROGS_TAG=v1.47.4 e2fsprogs   a specific e2fsprogs release"
+	@echo "  make host-e2fsprogs                    the mke2fs this machine builds the image with"
 	@echo "  make rootfs                            stage the root filesystem tree"
 	@echo "  make image                             the bootable card image"
 	@echo "  make WITH_LLVM=0 image                 without the toolchain, back to 256 MiB"
 	@echo "  make WITH_MAKE=0 image                 without GNU make on the card"
+	@echo "  make WITH_E2FSPROGS=0 image            without them, back to a cross-built resize2fs"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"
