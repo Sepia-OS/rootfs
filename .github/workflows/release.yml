@@ -49,6 +49,11 @@ on:
         required: false
         default: ''
         type: string
+      wifi_tag:
+        description: 'Pin a specific Sepia-OS/wifi release (libnl and wpa_supplicant) instead of taking the newest one (optional).'
+        required: false
+        default: ''
+        type: string
 
 # One release at a time, and never cancelled halfway: a half-finished publish
 # would leave a branch, a tag or a release behind with nothing on it.
@@ -168,6 +173,8 @@ jobs:
       kernels: ${{ steps.facts.outputs.kernels }}
       musl: ${{ steps.facts.outputs.musl }}
       musl_release: ${{ steps.facts.outputs.musl_release }}
+      wpa: ${{ steps.facts.outputs.wpa }}
+      wifi_release: ${{ steps.facts.outputs.wifi_release }}
       llvm: ${{ steps.facts.outputs.llvm }}
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
       gnu_make: ${{ steps.facts.outputs.gnu_make }}
@@ -213,6 +220,11 @@ jobs:
       # binary in the image runs on, which is why the release notes name both
       # the version and the release it came from.
       MUSL_TAG: ${{ inputs.musl_tag }}
+      # libnl and wpa_supplicant, from Sepia-OS/wifi. WITH_WIFI is left at its
+      # default for the same reason WITH_LLVM is: the released card has to be
+      # the card CI builds and boots. The Broadcom firmware is still fetched by
+      # this repository and follows BRCM_VERSION, not this pin.
+      WIFI_TAG: ${{ inputs.wifi_tag }}
       # The filesystem tools, from Sepia-OS/e2fsprogs, on exactly the same
       # terms as GNU make: not through CHANNEL, a pin that does not decay, and
       # WITH_E2FSPROGS left at its default so the released card is the card CI
@@ -259,6 +271,9 @@ jobs:
       # has been built.
       - name: Resolve and fetch musl
         run: make musl
+
+      - name: Resolve and fetch the wifi package
+        run: make wifi
 
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
@@ -311,6 +326,8 @@ jobs:
             echo "kernels=${SEPIAOS_KERNELS}"
             echo "musl=${SEPIAOS_MUSL}"
             echo "musl_release=${SEPIAOS_MUSL_RELEASE}"
+            echo "wpa=${SEPIAOS_WPA_SUPPLICANT}"
+            echo "wifi_release=${SEPIAOS_WIFI_RELEASE}"
             echo "llvm=${SEPIAOS_LLVM}"
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "gnu_make=${SEPIAOS_MAKE}"
@@ -385,6 +402,8 @@ jobs:
           KERNELS: ${{ needs.build.outputs.kernels }}
           MUSL: ${{ needs.build.outputs.musl }}
           MUSL_RELEASE: ${{ needs.build.outputs.musl_release }}
+          WPA: ${{ needs.build.outputs.wpa }}
+          WIFI_RELEASE: ${{ needs.build.outputs.wifi_release }}
           LLVM: ${{ needs.build.outputs.llvm }}
           LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
           # Not MAKE: that name is GNU make's own, and exporting it into a
@@ -410,6 +429,7 @@ jobs:
           | Raspberry Pi firmware | \`${FIRMWARE}\` |
           | Kernels | \`${KERNELS}\` |
           | musl | \`${MUSL}\` (\`${MUSL_RELEASE}\` from \`Sepia-OS/musl\`) |
+          | wpa_supplicant | \`${WPA}\` (\`${WIFI_RELEASE}\` from \`Sepia-OS/wifi\`) |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
           | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
           | e2fsprogs | \`${E2FSPROGS}\` (\`${E2FSPROGS_RELEASE}\` from \`Sepia-OS/e2fsprogs\`) |

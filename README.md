@@ -53,6 +53,32 @@ make musl-update                # move onto a newer one
 make musl-check                 # link against it, both ways
 ```
 
+### Retrieve the wifi userspace
+
+The latest release of https://github.com/Sepia-OS/wifi shall be retrieved and
+unpacked into the root file system. That repository cross-builds `libnl` and
+`wpa_supplicant` against the same musl this build unpacks, and publishes the
+five files that ship — the two libnl libraries with their SONAME links and the
+three wpa programs — with a `SHA256SUMS` beside it.
+
+They are **not built here any more**. libnl and wpa_supplicant took eighty
+lines of configure flags, a pkg-config stub and a note about bison; one
+repository owns that now, and `/etc/os-release` records which release the card
+carries.
+
+The **Broadcom firmware stays here**, in the step below: it is a download — an
+unpacked Debian package — rather than a build, it is four times the size of the
+package, and it is tied to the kernel that loads it. `WITH_WIFI=0` still leaves
+out all of it, package and firmware together.
+
+```sh
+make wifi                       # resolve, verify and unpack it
+make wifi-info                  # which release, which versions, how big
+make WIFI_TAG=v2.12 wifi        # a specific release
+make wifi-update                # move onto a newer one
+make wifi-check                 # re-read all five files
+```
+
 ### Retrieve and build busybox
 
 The latest release of busybox shall be retrieved and compiled as a dynamic
@@ -388,8 +414,8 @@ the release workflow does not override any of them — so what is published is
 the same card every CI run builds and boots, rather than a configuration that
 is first exercised inside the release build itself. The `prerelease` input
 still selects the boot partition's channel and deliberately selects **no**
-channel for the four siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag` and
-`musl_tag` pin those the way `boot_tag` pins a boot partition. The release
+channel for the five siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
+`musl_tag` and `wifi_tag` pin those the way `boot_tag` pins a boot partition. The release
 notes quote the LLVM, GNU make, e2fsprogs and musl versions out of the built
 tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 
@@ -433,16 +459,20 @@ udev would.
 
 ### Wifi
 
-Wifi needs three things ethernet does not, all built by `make wireless` and
+Wifi needs three things ethernet does not, all gathered by `make wireless` and
 installed into the image:
 
 - the Broadcom firmware and its per-board NVRAM, from the same package
-  Raspberry Pi OS installs. Every chip Raspberry Pi has shipped is covered:
-  43430, 43436, 43455 and 43456, which between them are every supported board.
+  Raspberry Pi OS installs — downloaded and unpacked **here**. Every chip
+  Raspberry Pi has shipped is covered: 43430, 43436, 43455 and 43456, which
+  between them are every supported board.
 - `libnl`, because `wpa_supplicant` speaks to the kernel over nl80211 and that
   is a netlink protocol.
 - `wpa_supplicant`, built against its own internal TLS and libtommath so that
-  nothing here needs OpenSSL. That covers WPA and WPA2 with a passphrase.
+  nothing needs OpenSSL. That covers WPA and WPA2 with a passphrase.
+
+The last two come from the `Sepia-OS/wifi` release rather than being built
+here; the firmware does not, because it is a download rather than a build.
 
 Image builds carry wifi by default (`WITH_WIFI=1`). `WITH_WIFI=0` is an
 option, not a default, and leaves all three out - worth having for more than
@@ -453,7 +483,8 @@ The country code is passed to the supplicant as `country=`. Without one the
 radio is held to the channels that are legal everywhere.
 
 ```sh
-make wireless          # firmware, libnl and wpa_supplicant
+make wireless          # the wifi package and the firmware together
+make wifi              # just the package: libnl and wpa_supplicant
 make wireless-info     # versions, size, and which chips the firmware covers
 make WITH_WIFI=0 image # optional: an image with no wifi in it at all
 ```

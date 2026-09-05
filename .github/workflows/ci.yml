@@ -127,6 +127,12 @@ jobs:
       - name: Link a test program against the sysroot, both ways
         run: make musl-check
 
+      # The wifi userspace, from Sepia-OS/wifi. Same reasoning as the three
+      # below: it is a prerequisite of the rootfs staging, so a release that
+      # cannot be resolved or verified should say so now.
+      - name: Resolve and fetch the wifi package
+        run: make wifi
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -152,6 +158,8 @@ jobs:
           make image-info
           make rootfs-info
           make musl-info
+          make wifi-info
+          make wireless-info
           make modules-info
           make llvm-info
           make make-info
@@ -178,6 +186,12 @@ jobs:
       # one linking differently from the rest is exactly what this catches.
       - name: Read e2fsprogs back
         run: make e2fsprogs-check
+
+      # Five files, and the closure rule that is particular to this package:
+      # every library they name is either the card's libc or a file that
+      # arrived in the same asset.
+      - name: Read the wifi package back
+        run: make wifi-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

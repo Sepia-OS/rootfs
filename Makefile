@@ -1357,49 +1357,21 @@ host-e2fsprogs-info: $(E2FS_HOST_DEP) $(E2FS_TGT_DEP) ## Show the e2fsprogs buil
 
 WITH_WIFI ?= 1
 
-# musl's headers, ahead of the compiler's own. GCC searches its internal
-# include/ and include-fixed/ *before* the sysroot, and include-fixed holds
-# whatever fixincludes rewrote when the toolchain was built - against glibc,
-# because both of these toolchains are glibc ones. Arm's Linux toolchain has a
-# glibc <pthread.h> in there, so the first thing here that includes <pthread.h>
-# picks it up instead of musl's and stops at `bits/endian.h: No such file or
-# directory` - a header musl does not have and never will.
-#
-# -isystem is searched before the built-in directories, so this puts musl's
-# /usr/include first while leaving it a system directory (warnings inside it
-# stay suppressed, which plain -I would undo). The compiler-provided headers
-# musl does not ship - stddef.h, stdarg.h, float.h - are still found where they
-# always were, one directory later.
-#
-# It is only needed for the wireless step because nothing built before it
-# includes <pthread.h>, and only on Linux because messense's macOS toolchain
-# ships no fixincludes headers at all: its include-fixed/ holds a README and an
-# empty bits/. Harmless on both, so it is not made conditional - a difference
-# that only bites on one host is exactly the difference worth not having.
-MUSL_INCLUDES = -isystem $(abspath $(SYSROOT))/usr/include
 
 # Empty means "latest", resolved once and cached like every other version here.
-LIBNL_VERSION ?=
-WPA_VERSION   ?=
+# libnl and wpa_supplicant are no longer among them: they are a release of
+# Sepia-OS/wifi, pinned with WIFI_TAG rather than by version number.
 BRCM_VERSION  ?=
 
-# Two hosts, deliberately: the API answers what the latest release is, and the
-# release assets are served from github.com itself - api.github.com does not
-# serve them, and a download URL built from it 404s.
-LIBNL_API  := https://api.github.com/repos/thom311/libnl/releases/latest
-LIBNL_REPO := https://github.com/thom311/libnl
-WPA_BASE   := https://w1.fi/releases
 BRCM_BASE  := https://archive.raspberrypi.com/debian/pool/main/f/firmware-nonfree
 
 WIRELESS_DIR   := $(BUILD_DIR)/wireless
 WIRELESS_STAGE := $(WIRELESS_DIR)/stage
 DL_WIRELESS    := $(DL_DIR)/wireless
 
-WIRELESS_SIG   = $(LIBNL_VERSION)|$(WPA_VERSION)|$(BRCM_VERSION)
+WIRELESS_SIG   = $(BRCM_VERSION)
 WIRELESS_CFG   := $(WIRELESS_DIR)/.config
 WIRELESS_ENV   := $(WIRELESS_DIR)/version.env
-LIBNL_STAMP    := $(WIRELESS_DIR)/.libnl
-WPA_STAMP      := $(WIRELESS_DIR)/.wpa-supplicant
 BRCM_STAMP     := $(WIRELESS_DIR)/.firmware
 WIRELESS_STAMP := $(WIRELESS_DIR)/.staged
 
@@ -1436,10 +1408,11 @@ define fetch_recorded
 endef
 
 .PHONY: wireless
-wireless: $(WIRELESS_DEP) ## Build the wifi firmware, libnl and wpa_supplicant
+wireless: $(WIRELESS_DEP) ## Fetch the wifi package and the firmware for it to drive
 ifeq ($(WITH_WIFI),1)
-	@source $(WIRELESS_ENV); printf '  READY    wireless -> %s (libnl %s, wpa_supplicant %s, firmware %s)\n' \
-	   $(WIRELESS_STAGE) "$$LIBNL_VER" "$$WPA_VER" "$$BRCM_VER"
+	@source $(WIRELESS_ENV); source $(WIFI_ENV); \
+	 printf '  READY    wireless -> %s + %s (wpa_supplicant %s, libnl %s, firmware %s)\n' \
+	   $(WIFI_STAGE) $(WIRELESS_STAGE) "$$WPA_VER" "$$LIBNL_VER" "$$BRCM_VER"
 else
 	@echo "  SKIP     WITH_WIFI=0: no firmware, no supplicant, ethernet only"
 endif
@@ -1448,145 +1421,285 @@ $(WIRELESS_CFG): FORCE
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(WIRELESS_SIG)' | cmp -s - $@ || printf '%s\n' '$(WIRELESS_SIG)' > $@
 
-# All three versions are resolved in one go and cached together, because they
-# are fetched together and there is no sense in one of them drifting alone.
-#
-# The libnl tag is libnl3_11_0 where the tarball is libnl-3.11.0, so the
-# version comes from the asset name in the release JSON rather than from the
-# tag - guessing that mapping is exactly how a build breaks on the next
-# release. wpa_supplicant and the firmware are read off their index pages.
+# The firmware version is the only thing still resolved here. libnl and
+# wpa_supplicant used to be resolved beside it - one of them from a GitHub
+# release's asset names, because libnl's tag is libnl3_11_0 where its tarball
+# is libnl-3.11.0 and guessing that mapping is how a build breaks on the next
+# release - and both are now a single release of Sepia-OS/wifi instead.
 $(WIRELESS_ENV): $(WIRELESS_CFG)
 	@mkdir -p $(@D)
-	@echo "  RESOLVE  wireless (libnl, wpa_supplicant, brcm firmware)"
+	@echo "  RESOLVE  brcm firmware"
 	@set -e; \
-	 if [ -n '$(LIBNL_VERSION)' ]; then lv='$(LIBNL_VERSION)'; else \
-	   lv=$$($(CURL) $(LIBNL_API) 2>/dev/null \
-	         | grep -oE 'libnl-[0-9][0-9.]*\.tar\.gz' \
-	         | sed 's|^libnl-||; s|\.tar\.gz$$||' | sort -uV | tail -1 || true); \
-	 fi; \
-	 if [ -n '$(WPA_VERSION)' ]; then wv='$(WPA_VERSION)'; else \
-	   wv=$$($(CURL) "$(WPA_BASE)/" 2>/dev/null \
-	         | grep -oE 'wpa_supplicant-[0-9][0-9.]*\.tar\.gz' \
-	         | sed 's|^wpa_supplicant-||; s|\.tar\.gz$$||' | sort -uV | tail -1 || true); \
-	 fi; \
 	 if [ -n '$(BRCM_VERSION)' ]; then bv='$(BRCM_VERSION)'; else \
 	   bv=$$($(CURL) "$(BRCM_BASE)/" 2>/dev/null \
 	         | grep -oE 'firmware-brcm80211_[^"]+_all\.deb' \
 	         | sed 's|^firmware-brcm80211_||; s|_all\.deb$$||' | sort -uV | tail -1 || true); \
 	 fi; \
-	 for pair in "libnl:$$lv" "wpa_supplicant:$$wv" "brcm firmware:$$bv"; do \
-	   [ -n "$${pair#*:}" ] || { \
-	     echo "Could not resolve a version for $${pair%%:*}. Pin one with" >&2; \
-	     echo "LIBNL_VERSION=, WPA_VERSION= or BRCM_VERSION=." >&2; exit 1; }; \
-	 done; \
-	 { printf "LIBNL_VER='%s'\n" "$$lv"; \
-	   printf "WPA_VER='%s'\n"   "$$wv"; \
-	   printf "BRCM_VER='%s'\n"  "$$bv"; } > $@.part
+	 [ -n "$$bv" ] || { \
+	   echo "Could not resolve a version for the brcm firmware. Pin one with" >&2; \
+	   echo "BRCM_VERSION=." >&2; exit 1; }; \
+	 printf "BRCM_VER='%s'\n" "$$bv" > $@.part
 	@mv -f $@.part $@
-	@source $@; printf '  WIRELESS libnl %s, wpa_supplicant %s, firmware %s\n' \
-	   "$$LIBNL_VER" "$$WPA_VER" "$$BRCM_VER"
+	@source $@; printf '  WIRELESS firmware %s\n' "$$BRCM_VER"
 
-# Only two of libnl's libraries are built, and that is not an optimisation.
-# `make` builds lib/route as well, whose parsers are generated with bison, and
-# the tarball ships the flex output but not the bison output - so a full build
-# needs bison 3 on the host, which macOS does not have (it ships 2.3, from
-# 2006, which rejects %code and stops). wpa_supplicant needs libnl-3 and
-# libnl-genl-3 and nothing else, so those two targets are named directly and
-# lib/route is never reached.
+# ---------------------------------------------------------------------------
+# The wifi userspace, from Sepia-OS/wifi
 #
-# Only the runtime files are staged: the .so.200 soname symlink and the real
-# object behind it. The bare .so is a link-time convenience and the headers are
-# for building against, and this tree becomes a root filesystem.
+# libnl and wpa_supplicant used to be cross-built here, in about eighty lines
+# of configure flags, a pkg-config stub and a note about bison. `Sepia-OS/wifi`
+# builds them now and publishes the five files that ship - the two libnl
+# libraries with their SONAME links, the three wpa programs - as one `usr/`
+# tree, built against the same musl release this repository unpacks in step 3.
 #
-# A stub pkg-config is put on PATH when the host has none. libnl 3.12's
-# configure stops outright without one, and it is not for anything libnl needs:
-# it asks pkg-config only about optional test libraries, so a stub that answers
-# "not installed" to every question gives the same configuration as a host with
-# a real pkg-config and no libcheck. A real one is used whenever there is one.
+# Structurally this is the llvm, make and e2fsprogs steps: resolve a release
+# over the GitHub API, fetch the asset keyed by tag, check it against the
+# release's own SHA256SUMS, unpack it, assert the result. What is particular:
 #
-# YACC=false FLEX=false for the same reason and with the same justification.
-# libnl's configure ends with a bare `test -z "$$YACC"` and `test -z "$$FLEX"`
-# and fails if either is empty - it never runs them - and the two libraries
-# built here need no generated parser, only lib/route does. Setting them
-# satisfies that check without adding two build-time dependencies that would
-# exist purely to go unused: macOS ships flex and bison, but a Debian container
-# does not, which is exactly where this first failed. `false` rather than a
-# plausible name on purpose - if a future libnl ever does invoke the parser
-# generator, it exits non-zero and the build stops, instead of quietly
-# producing nothing. Verified by configuring and building both libraries with
-# these settings on a host that does have flex and bison.
-$(LIBNL_STAMP): $(WIRELESS_ENV) $(MUSL_STAMP) $(TOOLCHAIN_DEP) Makefile
-	@source $(WIRELESS_ENV); t=libnl-$$LIBNL_VER.tar.gz; \
-	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(LIBNL_REPO)/releases/download/libnl$$(echo $$LIBNL_VER | tr . _)/$$t,libnl-$$LIBNL_VER); \
-	 s=$(WIRELESS_DIR)/libnl-$$LIBNL_VER; \
-	 echo "  UNPACK   $$t"; \
-	 rm -rf $$s; mkdir -p $(WIRELESS_DIR); tar -xf $(DL_WIRELESS)/$$t -C $(WIRELESS_DIR); \
-	 echo "  CONFIG   libnl $$LIBNL_VER (aarch64, dynamic against $(SYSROOT))"; \
-	 if ! command -v pkg-config >/dev/null 2>&1; then \
-	   p=$(abspath $(WIRELESS_DIR))/pkg-config-stub; mkdir -p $$p; \
-	   printf '%s\n' '#!/bin/sh' \
-	     'case "$$1" in --atleast-pkgconfig-version) exit 0;; --version) echo 0.29.2; exit 0;; esac' \
-	     'exit 1' > $$p/pkg-config; chmod 0755 $$p/pkg-config; \
-	   PATH=$$p:$$PATH; export PATH; \
+#   - It is unpacked to its own stage rather than into $(WIRELESS_STAGE),
+#     which the firmware step below owns. Two stages, both copied into the
+#     rootfs, and neither able to wipe the other's work.
+#   - Its closure is not "musl and nothing else": wpa_supplicant needs
+#     libnl-3.so.200 and libnl-genl-3.so.200, and they are in the asset. The
+#     assertion is that every library it names is either the card's libc or a
+#     file that arrived with it.
+#   - The firmware stays here, in this repository. It is a download rather
+#     than a build, it is four times the size of this package, and it is tied
+#     to the kernel that loads it.
+# ---------------------------------------------------------------------------
+
+WIFI_REPO ?= Sepia-OS/wifi
+
+# Pin a specific release, e.g. WIFI_TAG=v2.12. Empty means "resolve the newest
+# one", cached in build/wireless/wifi/release.env. `make wifi-update` moves it.
+WIFI_TAG  ?=
+
+DL_WIFI    := $(DL_DIR)/wifi
+WIFI_DIR   := $(WIRELESS_DIR)/wifi
+WIFI_ENV   := $(WIFI_DIR)/release.env
+WIFI_STAGE := $(WIFI_DIR)/stage
+WIFI_STAMP := $(WIFI_DIR)/.staged
+WIFI_CFG   := $(WIFI_DIR)/.config
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+WIFI_SIG    = $(WIFI_REPO)|$(WIFI_TAG)|$(GITHUB_API)|env1
+
+.PHONY: wifi
+wifi: $(WIFI_STAMP) ## Fetch, verify and unpack the wifi package
+	@source $(WIFI_ENV); printf '  READY    wifi %s (wpa_supplicant %s, libnl %s) -> %s\n' \
+	   "$$WIFI_TAG" "$${WPA_VER:-?}" "$${LIBNL_VER:-?}" $(WIFI_STAGE)
+
+$(WIFI_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(WIFI_SIG)' | cmp -s - $@ || printf '%s\n' '$(WIFI_SIG)' > $@
+
+# The release body is mined the way the boot, llvm, make, e2fsprogs and musl
+# ones are: it states each version verbatim as a table row - `| wpa_supplicant
+# | `2.12` |`, `| libnl | `3.12.0` |`, and the musl it was built against. The
+# first two are recorded in /etc/os-release and quoted by the release notes;
+# the third is worth having beside the card's own musl version, because these
+# binaries are dynamic and a card whose libc is older than the one they were
+# built against is how "symbol not found" appears at exec time.
+$(WIFI_ENV): $(WIFI_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(WIFI_REPO) ($(if $(WIFI_TAG),pinned $(WIFI_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(WIFI_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(WIFI_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(WIFI_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(WIFI_REPO) has no release tagged '$(WIFI_TAG)'. Leave WIFI_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(WIFI_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(WIFI_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(WIFI_REPO) does not exist, or this token cannot see it. Build" >&2; \
+	     echo "without wifi using WITH_WIFI=0, or point WIFI_REPO at a repository" >&2; \
+	     echo "that has cut a release." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(WIFI_REPO) has published no release yet. Build without wifi using" >&2; \
+	     echo "WITH_WIFI=0, or pin one with WIFI_TAG=<tag>." >&2; exit 1; fi; \
 	 fi; \
-	 ( cd $$s && ./configure --host=aarch64-linux --prefix=/usr --disable-static --disable-cli \
-	     YACC=false FLEX=false \
-	     CC=$(CROSS)gcc AR=$(CROSS)ar RANLIB=$(CROSS)ranlib \
-	     CFLAGS="-Os $(MUSL_INCLUDES) --sysroot=$(abspath $(SYSROOT))" \
-	     LDFLAGS="--sysroot=$(abspath $(SYSROOT)) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
-	   ) > $$s/configure.log 2>&1 || { \
-	   tail -20 $$s/configure.log >&2; \
-	   echo "  FAIL     configure (full log: $$s/configure.log)" >&2; exit 1; }; \
-	 echo "  BUILD    libnl-3 and libnl-genl-3 (-j$(JOBS))"; \
-	 $(MAKE) --no-print-directory -C $$s -j$(JOBS) \
-	   lib/libnl-3.la lib/libnl-genl-3.la > $$s/build.log 2>&1 || { \
-	   tail -30 $$s/build.log >&2; \
-	   echo "  FAIL     libnl (full log: $$s/build.log)" >&2; exit 1; }; \
-	 mkdir -p $(WIRELESS_STAGE)/usr/lib; \
-	 cp -P $$s/lib/.libs/libnl-3.so.[0-9]* $$s/lib/.libs/libnl-genl-3.so.[0-9]* \
-	   $(WIRELESS_STAGE)/usr/lib/
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 wv=$$(jq -r '.body // ""' <<<"$$rel" \
+	       | sed -n 's/^| *wpa_supplicant *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$wv" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || wv=''; \
+	 lv=$$(jq -r '.body // ""' <<<"$$rel" \
+	       | sed -n 's/^| *libnl *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$lv" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || lv=''; \
+	 mus=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/.*Built against musl[^|]*| *`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$mus" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || mus=''; \
+	 { echo "WIFI_TAG='$$tag'"; \
+	   echo "WIFI_PRERELEASE='$$pre'"; \
+	   echo "WIFI_ASSET='$$ast'"; \
+	   echo "WIFI_ASSET_URL='$$asturl'"; \
+	   echo "WIFI_ASSET_ID='$$astid'"; \
+	   echo "WIFI_SUMS_URL='$$sumurl'"; \
+	   echo "WPA_VER='$$wv'"; \
+	   echo "LIBNL_VER='$$lv'"; \
+	   echo "WIFI_MUSL='$$mus'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^WIFI_TAG='\(.*\)'/  WIFI     \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it. The marker
+# is written only after VERIFY passes, so an interrupted download is refetched
+# rather than trusted.
+$(WIFI_STAMP): $(WIFI_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(WIFI_ENV); \
+	 d=$(DL_WIFI)/$$WIFI_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$WIFI_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$WIFI_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$WIFI_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$WIFI_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$WIFI_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$WIFI_ASSET"; \
+	   $(CURL) -o "$$d/$$WIFI_ASSET.part" "$$WIFI_ASSET_URL"; \
+	   mv -f "$$d/$$WIFI_ASSET.part" "$$d/$$WIFI_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$WIFI_ASSET"; \
+	 ( cd "$$d" && grep -F "$$WIFI_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$WIFI_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$WIFI_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$WIFI_ASSET -> $(WIFI_STAGE)"; \
+	 rm -rf $(WIFI_STAGE); mkdir -p $(WIFI_STAGE); \
+	 tar -xf "$$d/$$WIFI_ASSET" -C $(WIFI_STAGE)
+	@$(call assert_wifi_stage)
 	@touch $@
 
-# CFLAGS and LIBS reach wpa_supplicant's Makefile through the environment and
-# not on the command line, and that distinction is load-bearing: a variable set
-# on make's command line cannot be appended to, so `make CFLAGS=...` would
-# discard every += in the Makefile - including the ones that add the nl80211
-# driver's own flags - and the build would fail in a way that reads like a
-# missing header. From the environment, += still works.
+# Asked of the unpacked tree before it is mixed into the rootfs, so a truncated
+# or wrong-architecture asset fails naming itself. Deliberately uses nothing
+# from the cross-toolchain - this step is a download, and needing
+# $(CROSS)readelf would drag 600 MiB into it. ELF byte 18 is e_machine,
+# little-endian, and 0xb7 is AArch64; `wifi-check` does the deeper reading.
 #
-# -I points at the unpacked libnl instead of a sysroot include path because
-# libnl's headers are only installed by `make install`, which is exactly the
-# thing not being run above. The .config asks for internal TLS and libtommath
-# so that nothing here needs OpenSSL: that covers WPA and WPA2 with a
-# passphrase, which is what a Pi on a home or office network needs.
-$(WPA_STAMP): $(LIBNL_STAMP) Makefile
-	@source $(WIRELESS_ENV); t=wpa_supplicant-$$WPA_VER.tar.gz; \
-	 $(call fetch_recorded,$(DL_WIRELESS),$$t,$(WPA_BASE)/$$t,wpa_supplicant-$$WPA_VER); \
-	 s=$(WIRELESS_DIR)/wpa_supplicant-$$WPA_VER; l=$(abspath $(WIRELESS_DIR))/libnl-$$LIBNL_VER; \
-	 echo "  UNPACK   $$t"; \
-	 rm -rf $$s; tar -xf $(DL_WIRELESS)/$$t -C $(WIRELESS_DIR); \
-	 printf '%s\n' \
-	   'CONFIG_DRIVER_NL80211=y' \
-	   'CONFIG_LIBNL32=y' \
-	   'CONFIG_CTRL_IFACE=y' \
-	   'CONFIG_BACKEND=file' \
-	   'CONFIG_TLS=internal' \
-	   'CONFIG_INTERNAL_LIBTOMMATH=y' > $$s/wpa_supplicant/.config; \
-	 echo "  BUILD    wpa_supplicant $$WPA_VER (-j$(JOBS))"; \
-	 ( cd $$s/wpa_supplicant && \
-	   CC=$(CROSS)gcc \
-	   CFLAGS="-Os $(MUSL_INCLUDES) --sysroot=$(abspath $(SYSROOT)) -I$$l/include" \
-	   LIBS="--sysroot=$(abspath $(SYSROOT)) -L$$l/lib/.libs -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1" \
-	   $(MAKE) --no-print-directory -j$(JOBS) wpa_supplicant wpa_cli wpa_passphrase \
-	 ) > $$s/build.log 2>&1 || { \
-	   tail -30 $$s/build.log >&2; \
-	   echo "  FAIL     wpa_supplicant (full log: $$s/build.log)" >&2; exit 1; }; \
-	 mkdir -p $(WIRELESS_STAGE)/usr/sbin; \
-	 cp $$s/wpa_supplicant/wpa_supplicant $$s/wpa_supplicant/wpa_cli \
-	    $$s/wpa_supplicant/wpa_passphrase $(WIRELESS_STAGE)/usr/sbin/
-	@source $(WIRELESS_ENV); \
-	 $(call assert_target_binary,$(WIRELESS_STAGE)/usr/sbin/wpa_supplicant)
-	@touch $@
+# The SONAME links are checked because they are what wpa_supplicant records:
+# an asset with the versioned libraries and no links is one where the
+# supplicant does not start, and nothing else here would notice.
+define assert_wifi_stage
+	set -e; s=$(WIFI_STAGE); \
+	for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/wpa_passphrase; do \
+	  [ -x "$$s/$$f" ] || { \
+	    echo "  FAIL     $$s/$$f is missing - is this a SepiaOS wifi asset?" >&2; exit 1; }; \
+	  m=$$(od -An -tx1 -j 18 -N2 "$$s/$$f" | tr -d ' \n'); \
+	  [ "$$m" = "b700" ] || { \
+	    echo "  FAIL     $$f has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	  grep -aq 'ld-musl-aarch64.so.1' "$$s/$$f" \
+	    || { echo "  FAIL     $$f does not ask for the musl loader" >&2; exit 1; }; \
+	done; \
+	for l in libnl-3.so.200 libnl-genl-3.so.200; do \
+	  [ -L "$$s/usr/lib/$$l" ] && [ -e "$$s/usr/lib/$$l" ] \
+	    || { echo "  FAIL     usr/lib/$$l is not a symlink resolving inside the asset" >&2; exit 1; }; \
+	done; \
+	[ -s "$$s/usr/share/licenses/wifi/COPYING.libnl" ] \
+	  || { echo "  FAIL     the asset carries no licences; libnl is LGPL and this ships it" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: wifi-update
+wifi-update: ## Re-resolve the newest wifi release and refetch
+	@rm -f $(WIFI_ENV)
+	@$(MAKE) --no-print-directory wifi
+
+.PHONY: wifi-tag
+wifi-tag: $(WIFI_ENV) ## Print the wifi release tag in use
+	@source $(WIFI_ENV); echo "$$WIFI_TAG"
+
+.PHONY: wifi-info
+wifi-info: $(WIFI_STAMP) ## Show the fetched wifi release and what it contains
+	@source $(WIFI_ENV); \
+	 if [ "$$WIFI_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(WIFI_REPO)"; \
+	 echo "  tag      $$WIFI_TAG$$k$(if $(WIFI_TAG), (pinned))"; \
+	 echo "  asset    $$WIFI_ASSET"; \
+	 echo "  wpa      $${WPA_VER:-<not named in the release notes>}"; \
+	 echo "  libnl    $${LIBNL_VER:-<not named in the release notes>}"; \
+	 echo "  musl     $${WIFI_MUSL:-<not named in the release notes>} (what it was built against)"; \
+	 echo "  staged   $(WIFI_STAGE) ($$(du -sk $(WIFI_STAGE) | cut -f1) KiB)"
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. Every library each file names has to be either the card's libc or a
+# file that arrived in the same asset - the closure rule the producing
+# repository holds itself to, checked again from this side.
+.PHONY: wifi-check
+wifi-check: $(WIFI_STAMP) $(TOOLCHAIN_DEP) ## Re-read the wifi package: architecture, loader, library closure
+	@$(call assert_wifi_stage)
+	@$(call assert_wifi_closure)
+
+define assert_wifi_closure
+	set -e; n=0; \
+	while read -r f; do \
+	  case "$$(od -An -N4 -tx1 "$$f" | tr -d ' ')" in 7f454c46) ;; *) continue;; esac; \
+	  $(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	    || { echo "  FAIL     $$f is not aarch64" >&2; exit 1; }; \
+	  for d in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	              | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	    case "$$d" in \
+	      libc.so*) ;; \
+	      *) [ -e "$(WIFI_STAGE)/usr/lib/$$d" ] || { \
+	           echo "  FAIL     $$f needs $$d, which is neither the card's libc nor in the asset" >&2; \
+	           exit 1; };; \
+	    esac; \
+	  done; \
+	  n=$$((n+1)); \
+	done < <(find $(WIFI_STAGE) -type f); \
+	[ "$$n" -eq 5 ] || { \
+	  echo "  FAIL     $$n ELF files in the wifi asset, expected 5" >&2; exit 1; }; \
+	echo "  OK       5 files: aarch64, and every library they need is here or is musl"
+endef
 
 # The firmware comes out of a .deb, which is an ar archive of two tarballs -
 # `ar x` and `tar` are all it takes, and both are on every host this builds on.
@@ -1624,15 +1737,16 @@ $(BRCM_STAMP): $(WIRELESS_ENV) Makefile
 # steps that filled it. A dangling firmware symlink is the failure mode worth
 # catching here: it survives the build, ships, and turns into a wifi chip that
 # will not start on hardware nobody tested.
-$(WIRELESS_STAMP): $(LIBNL_STAMP) $(WPA_STAMP) $(BRCM_STAMP)
-	@set -e; s=$(WIRELESS_STAGE); \
+$(WIRELESS_STAMP): $(WIFI_STAMP) $(BRCM_STAMP)
+	@set -e; s=$(WIRELESS_STAGE); w=$(WIFI_STAGE); \
 	 for f in usr/sbin/wpa_supplicant usr/sbin/wpa_cli usr/sbin/wpa_passphrase \
-	          lib/firmware/brcm/brcmfmac43430-sdio.bin \
+	          usr/lib/libnl-3.so.200 usr/lib/libnl-genl-3.so.200; do \
+	   [ -e "$$w/$$f" ] || { echo "  FAIL     $$w/$$f is missing" >&2; exit 1; }; \
+	 done; \
+	 for f in lib/firmware/brcm/brcmfmac43430-sdio.bin \
 	          lib/firmware/brcm/brcmfmac43455-sdio.bin; do \
 	   [ -e "$$s/$$f" ] || { echo "  FAIL     $$s/$$f is missing" >&2; exit 1; }; \
 	 done; \
-	 ls $$s/usr/lib/libnl-3.so.[0-9]* >/dev/null 2>&1 \
-	   || { echo "  FAIL     libnl-3 was not staged" >&2; exit 1; }; \
 	 d=$$(find $$s/lib/firmware -type l ! -exec test -e {} \; -print | head -3); \
 	 [ -z "$$d" ] || { echo "  FAIL     dangling firmware links: $$d" >&2; exit 1; }
 	@touch $@
@@ -1640,11 +1754,13 @@ $(WIRELESS_STAMP): $(LIBNL_STAMP) $(WPA_STAMP) $(BRCM_STAMP)
 .PHONY: wireless-info
 wireless-info: $(WIRELESS_DEP) ## Versions, sizes and what the firmware covers
 ifeq ($(WITH_WIFI),1)
-	@source $(WIRELESS_ENV); \
-	 echo "  libnl     $$LIBNL_VER"; \
+	@source $(WIRELESS_ENV); source $(WIFI_ENV); \
+	 echo "  wifi      $$WIFI_TAG ($(WIFI_REPO))"; \
 	 echo "  wpa       $$WPA_VER"; \
+	 echo "  libnl     $$LIBNL_VER"; \
 	 echo "  firmware  $$BRCM_VER"; \
-	 echo "  staged    $$(du -sk $(WIRELESS_STAGE) | cut -f1) KiB in $(WIRELESS_STAGE)"; \
+	 echo "  staged    $$(du -sk $(WIFI_STAGE) | cut -f1) KiB in $(WIFI_STAGE)"; \
+	 echo "  firmware  $$(du -sk $(WIRELESS_STAGE) | cut -f1) KiB in $(WIRELESS_STAGE)"; \
 	 echo "  chips     $$(ls $(WIRELESS_STAGE)/lib/firmware/brcm | sed -n 's|^brcmfmac\([0-9a-z]*\)-sdio\..*|\1|p' | sort -u | tr '\n' ' ')"
 else
 	@echo "  WITH_WIFI=0 - this image has no wifi in it"
@@ -2789,6 +2905,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@cp -R $(SYSROOT)/lib/ld-musl-aarch64.so.1 $(ROOTFS_DIR)/lib/
 	@cp $(SYSROOT)/usr/lib/libc.so $(ROOTFS_DIR)/usr/lib/
 	@$(if $(E2FS_TGT_DEP),cp $(RESIZE2FS) $(ROOTFS_DIR)/usr/sbin/resize2fs,:)
+	@$(if $(WIRELESS_DEP),cp -R $(WIFI_STAGE)/. $(ROOTFS_DIR)/,:)
 	@$(if $(WIRELESS_DEP),cp -R $(WIRELESS_STAGE)/. $(ROOTFS_DIR)/,:)
 	@$(call install_toolchain)
 	@$(call install_gnu_make)
@@ -2939,6 +3056,7 @@ define generate_etc
 	$(if $(LLVM_DEP),source $(LLVM_ENV);,LLVM_TAG=; LLVM_VERSION=;) \
 	$(if $(MAKE_DEP),source $(MAKE_ENV);,MAKE_TAG=; GNU_MAKE_VERSION=;) \
 	$(if $(E2FSPROGS_DEP),source $(E2FSPROGS_ENV);,E2FSPROGS_TAG=; E2FSPROGS_VERSION=;) \
+	$(if $(WIRELESS_DEP),source $(WIFI_ENV);,WIFI_TAG=; WPA_VER=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -2962,7 +3080,9 @@ define generate_etc
 	  [ -z "$$MAKE_TAG" ] || { echo "SEPIAOS_MAKE_RELEASE=\"$$MAKE_TAG\""; \
 	                           echo "SEPIAOS_MAKE=\"$$GNU_MAKE_VERSION\""; }; \
 	  [ -z "$$E2FSPROGS_TAG" ] || { echo "SEPIAOS_E2FSPROGS_RELEASE=\"$$E2FSPROGS_TAG\""; \
-	                                echo "SEPIAOS_E2FSPROGS=\"$$E2FSPROGS_VERSION\""; }; } > $$r/etc/os-release; \
+	                                echo "SEPIAOS_E2FSPROGS=\"$$E2FSPROGS_VERSION\""; }; \
+	  [ -z "$$WIFI_TAG" ] || { echo "SEPIAOS_WIFI_RELEASE=\"$$WIFI_TAG\""; \
+	                           echo "SEPIAOS_WPA_SUPPLICANT=\"$$WPA_VER\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -3590,6 +3710,10 @@ help: ## Show this help
 	  "MUSL_REPO"         "where musl comes from (default $(MUSL_REPO))" \
 	  "BUSYBOX_VERSION"   "pin a busybox release instead of taking the latest one" \
 	  "FIRMWARE_TAG"      "pin the kernel modules' firmware tag (default: the boot release's)" \
+	  "WITH_WIFI"         "ship wifi at all: package and firmware (default $(WITH_WIFI))" \
+	  "WIFI_TAG"          "pin a wifi release instead of taking the newest one" \
+	  "WIFI_REPO"         "where libnl and wpa_supplicant come from (default $(WIFI_REPO))" \
+	  "BRCM_VERSION"      "pin the Broadcom firmware package instead of the newest" \
 	  "WITH_LLVM"         "ship the on-device clang/lld toolchain (default $(WITH_LLVM))" \
 	  "LLVM_TAG"          "pin an LLVM release instead of taking the newest one" \
 	  "LLVM_REPO"         "where the toolchain comes from (default $(LLVM_REPO))" \
