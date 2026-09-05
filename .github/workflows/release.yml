@@ -44,6 +44,11 @@ on:
         required: false
         default: ''
         type: string
+      musl_tag:
+        description: 'Pin a specific Sepia-OS/musl release instead of taking the newest one (optional). This is the libc everything else on the card runs on.'
+        required: false
+        default: ''
+        type: string
 
 # One release at a time, and never cancelled halfway: a half-finished publish
 # would leave a branch, a tag or a release behind with nothing on it.
@@ -162,6 +167,7 @@ jobs:
       firmware: ${{ steps.facts.outputs.firmware }}
       kernels: ${{ steps.facts.outputs.kernels }}
       musl: ${{ steps.facts.outputs.musl }}
+      musl_release: ${{ steps.facts.outputs.musl_release }}
       llvm: ${{ steps.facts.outputs.llvm }}
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
       gnu_make: ${{ steps.facts.outputs.gnu_make }}
@@ -201,6 +207,12 @@ jobs:
       # likewise left at its default for the same reason WITH_LLVM is: the
       # released card has to be the card CI builds and boots.
       MAKE_TAG: ${{ inputs.make_tag }}
+      # musl, from Sepia-OS/musl. Not through CHANNEL for the same reason as
+      # the other three, and with no WITH_ switch to leave it out: there is no
+      # card without a libc. This is the one pin that decides what every other
+      # binary in the image runs on, which is why the release notes name both
+      # the version and the release it came from.
+      MUSL_TAG: ${{ inputs.musl_tag }}
       # The filesystem tools, from Sepia-OS/e2fsprogs, on exactly the same
       # terms as GNU make: not through CHANNEL, a pin that does not decay, and
       # WITH_E2FSPROGS left at its default so the released card is the card CI
@@ -242,6 +254,12 @@ jobs:
       # otherwise surface forty minutes in - after musl, busybox, the modules
       # and the wireless stack have all been built. This is the same documented
       # target the build reaches later; it just reaches it in seconds.
+      # First, because nothing else can be built without a libc: a mistyped
+      # musl_tag should stop this in seconds rather than after the whole rootfs
+      # has been built.
+      - name: Resolve and fetch musl
+        run: make musl
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -292,6 +310,7 @@ jobs:
             echo "firmware=${SEPIAOS_FIRMWARE}"
             echo "kernels=${SEPIAOS_KERNELS}"
             echo "musl=${SEPIAOS_MUSL}"
+            echo "musl_release=${SEPIAOS_MUSL_RELEASE}"
             echo "llvm=${SEPIAOS_LLVM}"
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "gnu_make=${SEPIAOS_MAKE}"
@@ -365,6 +384,7 @@ jobs:
           FIRMWARE: ${{ needs.build.outputs.firmware }}
           KERNELS: ${{ needs.build.outputs.kernels }}
           MUSL: ${{ needs.build.outputs.musl }}
+          MUSL_RELEASE: ${{ needs.build.outputs.musl_release }}
           LLVM: ${{ needs.build.outputs.llvm }}
           LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
           # Not MAKE: that name is GNU make's own, and exporting it into a
@@ -389,7 +409,7 @@ jobs:
           | Boot partition | \`${BOOT_RELEASE}\` |
           | Raspberry Pi firmware | \`${FIRMWARE}\` |
           | Kernels | \`${KERNELS}\` |
-          | musl | \`${MUSL}\` |
+          | musl | \`${MUSL}\` (\`${MUSL_RELEASE}\` from \`Sepia-OS/musl\`) |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
           | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
           | e2fsprogs | \`${E2FSPROGS}\` (\`${E2FSPROGS_RELEASE}\` from \`Sepia-OS/e2fsprogs\`) |

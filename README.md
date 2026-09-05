@@ -19,15 +19,44 @@ partition shall be used.
 If the build is running on macOS, the macOS version of the toolset shall be
 retrieved; on Linux the Linux version of the toolset shall be retrieved.
 
-### Retrieve and build the musl libc
+### Retrieve the musl libc
 
-The latest release of the musl libc shall be downloaded and build as static as
-well as dynamic library.
+The latest release of https://github.com/Sepia-OS/musl shall be retrieved and
+unpacked into `build/sysroot`. That repository cross-builds musl — static and
+dynamic — and publishes it as a **sysroot**: the loader, `libc.so`, `libc.a`,
+the crt objects, the empty `-lm`/`-lpthread` archives and 217 headers, with a
+`SHA256SUMS` beside it. The asset is verified against that digest before
+anything is unpacked.
+
+musl is **not built here any more**. This repository resolved "the latest musl"
+from git tags on every build and compiled it, which meant the card's libc could
+change without a commit, cost two minutes of every build, and produced a libc
+that existed only inside this build tree — while `llvm`, `make` and `e2fsprogs`
+each built their own copy of the same sources to link against. One repository
+owns it now, one release names it, and `/etc/os-release` records both the
+version and the release it came from.
+
+The Linux UAPI headers are added on top, from the cross-toolchain's own
+sysroot, because they have to match the compiler that will use them. The musl
+release deliberately does not carry them.
+
+There is **no switch to leave it out**: nothing on the card runs without a
+libc, so `Sepia-OS/musl` having a published release is a precondition for
+building at all. `MUSL_TAG` pins a specific one; `make musl-check` links a test
+program against the unpacked sysroot, statically and dynamically.
+
+```sh
+make musl                       # resolve, verify and unpack it
+make musl-info                  # which release, which version, how big
+make MUSL_TAG=v1.2.6 musl       # a specific release
+make musl-update                # move onto a newer one
+make musl-check                 # link against it, both ways
+```
 
 ### Retrieve and build busybox
 
 The latest release of busybox shall be retrieved and compiled as a dynamic
-executable based on the musl libc built in the last step.
+executable based on the musl libc from the last step.
 
 ### Retrieve and install the kernel modules
 
@@ -359,10 +388,10 @@ the release workflow does not override any of them — so what is published is
 the same card every CI run builds and boots, rather than a configuration that
 is first exercised inside the release build itself. The `prerelease` input
 still selects the boot partition's channel and deliberately selects **no**
-channel for the three siblings; `llvm_tag`, `make_tag` and `e2fsprogs_tag` pin
-those the way `boot_tag` pins a boot partition. The release notes quote the
-LLVM, GNU make, e2fsprogs and musl versions out of the built tree's
-`/etc/os-release`, so they cannot drift from what was actually shipped.
+channel for the four siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag` and
+`musl_tag` pin those the way `boot_tag` pins a boot partition. The release
+notes quote the LLVM, GNU make, e2fsprogs and musl versions out of the built
+tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 
 ## Networking
 

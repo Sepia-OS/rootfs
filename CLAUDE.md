@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Everything through step 8 is committed; the board table in the `Makefile` and `.github/workflows/` are not. **Everything `README.md` specifies is implemented**: the boot partition, the cross-compiler, musl libc, busybox, the kernel modules, the on-device LLVM toolchain, GNU make and the e2fsprogs filesystem tools, the bootable image, the QEMU test, the launcher, and CI plus the manual release build.
+Everything through step 8 is committed; the board table in the `Makefile` and `.github/workflows/` are not. **Everything `README.md` specifies is implemented**: the boot partition, the cross-compiler, the musl libc release, busybox, the kernel modules, the on-device LLVM toolchain, GNU make and the e2fsprogs filesystem tools, the bootable image, the QEMU test, the launcher, and CI plus the manual release build.
 
 **`.gitignore` needed a fix to make this repository buildable from a clone**: the stock C section's `*.d` pattern matches the *directory* `overlay/etc/init.d`, so `rcS` and `rcK` had never been committed — a fresh clone would have built an image whose init has no sysinit script, and so no `/proc`, no `/dev`, no getty and no login prompt. `!overlay/etc/init.d/` re-includes it. Worth remembering if a file that plainly exists refuses to be added.
 
@@ -23,10 +23,11 @@ gmake CHANNEL=release boot-partition    # take the latest full release instead
 gmake BOOT_TAG=v0.1.0 boot-partition    # pin one specific boot release
 gmake toolchain                         # fetch the aarch64 cross-compiler for this host
 gmake toolchain-info                    # which compiler, from where, targeting what
-gmake musl                              # cross-build musl into build/sysroot (~2 min cold)
-gmake musl-info                         # version, sysroot, static/shared sizes
+gmake musl                              # fetch the musl release and unpack it into build/sysroot
+gmake musl-info                         # which release, which version, static/shared sizes
 gmake musl-check                        # link a test program against the sysroot, both ways
-gmake MUSL_VERSION=1.2.5 musl           # pin a musl release
+gmake MUSL_TAG=v1.2.6 musl              # pin a musl release
+gmake musl-update                       # move onto a newer one
 gmake busybox                           # build busybox and install it into build/sysroot
 gmake busybox-info                      # version, size, applet count, loader
 gmake modules                           # install the boot kernel's modules into build/sysroot
@@ -99,7 +100,7 @@ Required tools: `gmake` ≥ 4.0, `curl`, `git`, `jq`, `xz`, `tar`, `python3` (fo
 
 So: **macOS → messense 15.2.0** (`aarch64-unknown-linux-gnu`, gcc 15.2), **Linux → Arm 14.3.rel1** (`aarch64-none-linux-gnu`, gcc 14.3). Both hosts and both host architectures were verified to resolve. The consequence is that **the compiler differs by build host, so macOS and Linux builds are not byte-identical** — release builds should be cut on Linux the way `../boot` already does it, with macOS as the development host.
 
-- The **GNU-targeting** variant is chosen deliberately over the musl-targeting one messense also ships: step 3 builds musl from source, and a toolchain with musl baked in would make that step a no-op.
+- The **GNU-targeting** variant was chosen over the musl-targeting one messense also ships because step 3 used to build musl from source, and a toolchain with musl baked in would have made that step a no-op. That reason is gone — musl is a download now — but the choice stands and nothing depends on it either way: every cross-build here passes `--sysroot=$(abspath build/sysroot)`, so the toolchain's own libc never participates. Switching to the musl-targeting variant the siblings use is a defensible change, and it is a change: it would rebuild busybox, libnl and wpa_supplicant with a different compiler, so make it deliberately and boot the result, not as a tidy-up.
 - Everything is pinned, so unlike step 1 nothing is resolved over the network and all paths are known at parse time — ordinary Make file targets, no cached resolution.
 - Both vendors publish a plain `sha256sum`-format sidecar (`.sha256` for messense, `.sha256asc` for Arm — despite the name it is a bare digest, not a signature), so the download is checked against upstream's own digest rather than a checksum committed here.
 - The toolchain is unpacked into `downloads/toolchain/<vendor>-<version>-<host>/`, **not** `build/`: it is an immutable upstream artifact and ~600 MiB is too much to re-extract on every `clean`.
@@ -108,13 +109,18 @@ So: **macOS → messense 15.2.0** (`aarch64-unknown-linux-gnu`, gcc 15.2), **Lin
 
 ### How step 3 works
 
-- **`build/sysroot` is the deliverable**, produced by `--prefix=/usr --syslibdir=/lib` plus `make install DESTDIR=…`, *not* by an absolute `--prefix`. That keeps the tree correct as a rootfs: `lib/ld-musl-aarch64.so.1` points at `/usr/lib/libc.so`, which is where it really will be on the target. Steps 4 and 5 consume it directly.
-- **`--disable-wrapper`, so no `musl-gcc` is built.** The sysroot doubles as the source of the shipped rootfs and SepiaOS ships no compiler; without the flag musl installs `usr/bin/musl-gcc` and `usr/lib/musl-gcc.specs`. The wrapper would be the wrong tool here anyway — its specs bake in whatever absolute paths `configure` saw, so a staged install points them at the build host's directories, and `-isystem /usr/include` inside a specs file is not sysroot-relative. Step 4 builds with `--sysroot=$(abspath build/sysroot) -Wl,--dynamic-linker=/lib/ld-musl-aarch64.so.1` instead.
-- **The sysroot is musl *plus* Linux UAPI headers.** A musl install alone is not a usable sysroot: busybox will not compile without `linux/kd.h` and friends. They are copied in from `$(CROSS)gcc -print-sysroot` — the same toolchain that supplies libgcc — so this costs no download and cannot drift from the compiler.
-- **The version is resolved from git tags** (`git ls-remote --tags --refs`), not by scraping the release index. `sort -V` is what keeps 1.2.10 above 1.2.6; a plain `sort` gets that backwards. Resolution is cached in `build/musl/version.env` exactly like the boot release, with `musl-update` to move it.
-- **Trust model is weaker here than in steps 1 and 2, and this is worth knowing.** musl publishes no checksum sidecar — only a detached GPG signature — so the digest is recorded in `checksums/musl-<version>.sha256` on first fetch and checked against that record every time after. That first fetch is trust-on-first-use; the manifest must be committed for it to mean anything afterwards. `musl-verify-sig` is the real check (pinned fingerprint `836489290BB6B70F99FFDA0556BCDB593020450F`) and is opt-in because it needs `gpg` plus a keyserver round trip.
-- **Both linkages are exercised, not inferred** from `libc.a` and `libc.so` merely existing: a test program is linked static and dynamic, then `readelf` confirms AArch64 and that the dynamic one records the musl loader. `readelf` comes from the cross-toolchain, so this adds no dependency — `file` is absent from a slim Debian image.
-- `configure` and `make` output goes to `build/musl/musl-<version>/{configure,build}.log`; only the tail surfaces, and only on failure.
+musl is **not built here any more**. `Sepia-OS/musl` cross-builds it and publishes a sysroot; this step resolves the newest release over the GitHub API (or `MUSL_TAG`), fetches the asset keyed by tag into `downloads/musl/<tag>/`, checks it against the release's own `SHA256SUMS`, unpacks it into `build/musl/stage`, asserts its shape, and only then replaces musl's own directories inside `build/sysroot`. Structurally it is the llvm and make steps; what is worth writing down is what is particular to a libc:
+
+- **There is no `WITH_MUSL`, and there will not be one.** Nothing on the card runs without a libc, so a published release in `Sepia-OS/musl` is a precondition for building at all. A missing repository and an empty release list each get their own message saying so, because this is the first dependency anyone hits.
+- **The asset is a sysroot, not a runtime.** Step 4 cross-builds busybox against it, step 5 libnl and wpa_supplicant, and step 6 copies `usr/include` and `usr/lib` onto the card so the on-device clang can *link* rather than only compile. All of that needs the headers, the crt objects and `libc.a`, which is why the producing repository publishes 249 files rather than two.
+- **The sysroot is still musl *plus* Linux UAPI headers**, and those still come from `$(CROSS)gcc -print-sysroot`. The musl release deliberately does not carry them: they have to match the compiler that will use them, and this repository is the one that has it. `install_uapi_headers` runs immediately after the unpack, in the same stamp, because the unpack wipes `usr/include`.
+- **Only the directories musl owns are cleared** (`usr/include`, `usr/lib`, `lib/ld-musl-*`), not the whole sysroot: busybox and the kernel modules live in the same tree, and an `rm -rf` here would delete them whenever musl alone was refetched.
+- **Unpacked to a stage first, then copied in.** An asset that turns out to be the wrong shape must not be able to leave `build/sysroot` half-replaced, because the previous one still works. `assert_musl_asset` runs against the stage.
+- **The loader is checked with `-L` and `readlink`, never `-e`.** musl installs `lib/ld-musl-aarch64.so.1` as a symlink to the *absolute* path `/usr/lib/libc.so`, which resolves on the card and nowhere else. On a Linux build host `-e` follows it to that host's own `/usr/lib/libc.so` — glibc's linker script — and passes for entirely the wrong reason.
+- **The asset is refused if it carries `bin/`, `sbin/`, `usr/bin/` or `usr/sbin/`.** That would be a rootfs, not a libc, and it would land on top of busybox.
+- **Both linkages are still exercised, and now they prove more than they did.** `assert_musl` links a test program static and dynamic against the unpacked tree; that is the only check anywhere that says *somebody else's libc* and *this repository's cross-toolchain* work together, which is a thing neither side can test alone.
+- **The libc's bytes changed with this move**, and that is expected: this repository compiled musl with its own *gnu* cross-toolchain, and the release is built with the musl-targeting one. Both are correct musl builds; a digest difference against an old `build/sysroot` is not a fault.
+- **`/etc/os-release` records both numbers** — `SEPIAOS_MUSL` and `SEPIAOS_MUSL_RELEASE` — so a card can say which release its libc came from, the way it already does for llvm, make and e2fsprogs.
 
 ### How step 4 works
 
@@ -123,7 +129,7 @@ So: **macOS → messense 15.2.0** (`aarch64-unknown-linux-gnu`, gcc 15.2), **Lin
 - **"Dynamic, against the musl from step 3" is read back off the binary**, not inferred from the flags that were passed: `readelf` must show AArch64, an interpreter of `/lib/ld-musl-aarch64.so.1`, and a `NEEDED` entry for `libc.so`. A static build would have none of those. `CONFIG_STATIC` is separately asserted to be unset before the build starts.
 - **`make busybox` always runs the compiler**, by design: `$(BB_BIN)` carries a `FORCE` prerequisite. Configuring is a separate stamp from compiling, because `defconfig` rewrites `.config` from scratch and so invalidates every object file — folding the two together made every run either a full rebuild or, once nothing upstream had changed, no build at all. busybox's own kbuild decides what to recompile (about three seconds when nothing changed) and is a better judge of that than a stamp here, which cannot see an edit inside the source tree. The result is copied out only when it differs, so an unchanged build does not bump timestamps and set everything downstream rebuilding.
 - **busybox is installed into `build/sysroot`** (`make install CONFIG_PREFIX=…`): `/bin/busybox` plus 408 applet symlinks, including `/sbin/init` and `/bin/sh`. `make busybox.links` is run too — the same applet list with FHS paths, for step 5.
-- Because musl and busybox now share that tree, **step 3 clears only the directories musl owns** (`usr/include`, `usr/lib`, `lib/ld-musl-*`) instead of the whole sysroot; an `rm -rf` there would delete the busybox install whenever musl alone was rebuilt.
+- Because musl and busybox share that tree, **step 3 clears only the directories musl owns** (`usr/include`, `usr/lib`, `lib/ld-musl-*`) instead of the whole sysroot; an `rm -rf` there would delete the busybox install whenever musl alone was refetched.
 - **`oldconfig` reads from `/dev/null`, never from `yes ""`.** Under `pipefail` a `yes` killed by SIGPIPE fails the whole recipe. Nothing is asked anyway, since editing two string options introduces no new symbols.
 - **busybox.net is genuinely flaky** — it went down for minutes and reset mid-transfer connections repeatedly during development. Hence `--retry-all-errors` on every download (plain `--retry` does not cover a reset once bytes are moving), and `BUSYBOX_BASE` is overridable so a mirror such as `https://sources.buildroot.net/busybox` can serve the tarball. That mirror carries no `.sha256`, so the digest is always taken from the canonical site (`BUSYBOX_SUMS_BASE`) and a mirrored tarball still has to match it. Resolving "latest" needs the canonical index either way, so a mirror only helps together with `BUSYBOX_VERSION`.
 
@@ -137,7 +143,7 @@ So: **macOS → messense 15.2.0** (`aarch64-unknown-linux-gnu`, gcc 15.2), **Lin
 - **The recorded artifact is the tag's commit SHA**, in `checksums/firmware-<tag>.commit`, trust-on-first-use like the musl digest. A git tag can be moved upstream; everything below the commit is covered by git's own integrity, so one line of manifest stands in for 3800 files. Verified by simulation: a mismatched record aborts the fetch and leaves nothing behind in `downloads/`.
 - **`depmod` has already been run upstream** — `modules.dep`, `modules.alias` and the `.bin` companions ship in the tree — so nothing here has to run a `depmod` that can target a foreign module tree from macOS. The modules themselves are `.ko.xz`.
 - **The assertion reads `modules.dep` and looks for the first module it names.** That is what catches the real failure mode: a sparse-checkout pattern that matches the directory but none of its contents leaves all the metadata in place and the `.ko.xz` files absent, which every "does the directory exist" check would pass.
-- `build/sysroot/lib/modules` belongs to this step alone and is cleared wholesale on rebuild, so a moved firmware tag cannot leave the previous kernel's tree behind. It is deliberately **independent of musl and busybox** although all three write into the same sysroot — `make modules` is usable on its own, without waiting for a libc build.
+- `build/sysroot/lib/modules` belongs to this step alone and is cleared wholesale on rebuild, so a moved firmware tag cannot leave the previous kernel's tree behind. It is deliberately **independent of musl and busybox** although all three write into the same sysroot — `make modules` is usable on its own, without waiting for a libc.
 - Downloads are keyed by tag under `downloads/modules/<tag>/` and survive `clean`; a `.complete` marker distinguishes a finished copy from an interrupted one, which would otherwise look like a good cache entry. `clean` + `modules` is ~3 s.
 - **For step 6:** busybox's `FEATURE_SEAMLESS_XZ` defaults to `y` and its help text names modprobe explicitly (`modprobe` reads modules through `xmalloc_open_zipped_read_close`), so a defconfig busybox can load these `.ko.xz` files. Worth re-reading off the generated `.config` when module loading is actually wired up.
 
@@ -287,10 +293,10 @@ The same source tree used to be configured a **second** time to cross-build one 
 A CI run failed with `fatal: unable to access 'https://git.musl-libc.org/git/musl/': Failed to connect ... after 135878 ms`. Worth reading carefully, because the shape of it recurs: the build was resolving which musl version is current, the tarball it would have asked for **was already in the restored `downloads/` cache**, and one small upstream host being unreachable for two minutes took the whole build down anyway.
 
 - **Version resolution is the part that always needs the network**, even when every byte the build consumes is already on disk. `build/*/version.env` lives under `build/`, which is deliberately not cached, so every run re-asks.
-- musl now asks `git.musl-libc.org`, then `repo.or.cz/musl.git`, then `github.com/kraj/musl.git`, then falls back to the newest tarball already in `downloads/musl`. Both mirrors were checked to report the same latest tag as the primary. They only ever supply a *number*: the tarball still comes from `MUSL_BASE` and still has to match `checksums/`, so no mirror is trusted with bytes that reach the image.
+- musl used to ask `git.musl-libc.org`, then `repo.or.cz/musl.git`, then `github.com/kraj/musl.git`, then fall back to the newest tarball already in `downloads/musl`. **All of that is gone**, and the failure it was written for went with it: musl is now a release of `Sepia-OS/musl`, resolved over the same `api.github.com` as llvm, make and e2fsprogs. That is one host instead of four, and it is the host the build already cannot run without. `MUSL_TAG` is the pin that skips resolution entirely, exactly as `LLVM_TAG` is.
 - busybox got the same treatment minus the mirrors — `busybox.net` is the flakiest host this build touches, and there is no index elsewhere to read — so it falls back to `downloads/busybox` and says so.
 - **`|| true` on those pipelines is load-bearing.** The recipes run under `set -e` with `pipefail`, so an unreachable host, or a `grep` that matches nothing, takes the recipe down *at the assignment* — before any of the fallback logic can look at the empty result. The first version of this fix was written without it and silently skipped every fallback; the tests below are what caught it. Same trap as the `-v8+` greps in step 5.
-- Tested by pointing the primary at `https://127.0.0.1:1/…`, which fails instantly: primary → mirror 1 → mirror 2 → cached tarball → a clear error naming `MUSL_VERSION=`, all four exercised.
+- Tested at the time by pointing the primary at `https://127.0.0.1:1/…`, which fails instantly: primary → mirror 1 → mirror 2 → cached tarball → a clear error, all four exercised. Kept as the record of *why* busybox still has its fallback, which is the same shape of failure.
 
 **A wrong first guess worth recording**: the failure was at 137 s, which is also almost exactly where the GitHub API call for the boot release lands in a cold build, and CI was passing no token — so this looked like the documented 60-requests-an-hour-per-IP limit. It was not. `gh run view --log-failed` settled it in one command; the step timings from the public API were enough to narrow it down but not to identify it. **Read the log before theorising.** (`GITHUB_TOKEN: ${{ github.token }}` was added to both workflows anyway — the Makefile has always honoured it, hosted runners do share egress IPs, and it costs nothing.)
 
@@ -333,10 +339,10 @@ This repository is the `rootfs` component. Per `README.md` the pipeline is:
 
 1. Fetch the boot partition from the `Sepia-OS/boot` release (pre-release builds take the latest pre-release; release builds take the latest release).
 2. Fetch an aarch64 cross-toolchain — macOS build host gets the macOS toolchain, Linux host the Linux one.
-3. Build the latest musl libc release, both static and dynamic.
+3. Fetch the musl libc sysroot from the `Sepia-OS/musl` release - static and dynamic, plus the headers and crt objects the later steps compile against.
 4. Build the latest busybox release as a **dynamic** executable against that musl.
 5. Fetch the Raspberry Pi kernel modules and install them under `/lib/modules`.
-6. Create an ext4 rootfs on the Linux FHS holding musl, busybox, the modules and the LLVM toolchain from `Sepia-OS/llvm`, and assemble a bootable image with the boot partition. It boots to a login prompt and drops into the user's shell; `root` exists with password `sepiaos`, forced to change on first login.
+6. Create an ext4 rootfs on the Linux FHS holding musl, busybox, the modules, the LLVM toolchain from `Sepia-OS/llvm`, GNU make from `Sepia-OS/make` and the filesystem tools from `Sepia-OS/e2fsprogs`, and assemble a bootable image with the boot partition. It boots to a login prompt and drops into the user's shell; `root` exists with password `sepiaos`, forced to change on first login.
 7. On first boot, grow the rootfs to fill the storage device minus a swap partition (1/2/4 GiB by device size), activate swap, then reboot.
 8. Test the image by booting it under QEMU as a Pi 3, and ship a launch script that does the same interactively.
 
@@ -344,7 +350,7 @@ Step 7 shapes step 6: the shipped image is sized to its contents, not to any par
 
 All eight steps of `README.md` are implemented. What is *not* here: nothing has been run on real hardware, so `config.txt`, device-tree auto-selection and overlays remain untested; there is no networking, no package management and no release/CI wiring (`dist/` is still empty and `.github/` has no workflow); and the image is not reproducible byte-for-byte, because mke2fs stamps a random filesystem UUID and the file timestamps come from the build.
 
-The sibling repositories live beside this one: [../boot](../boot) (a complete, working Makefile build — the closest model for what this repo should look like).
+The sibling repositories live beside this one, and this one is the only one that *assembles* rather than produces: [../boot](../boot) (the FAT boot partition, and the closest model for the house style), [../musl](../musl) (the libc everything here links against), [../llvm](../llvm), [../make](../make) and [../e2fsprogs](../e2fsprogs) (the three packages the card carries), plus [../spm](../spm) (the package manager, early). This repository consumes a published release from five of them and builds only busybox, libnl, wpa_supplicant and the image itself.
 
 ## The Contract With the `boot` Repository
 
@@ -357,6 +363,19 @@ These are the facts the rootfs build has to match; all were read out of `../boot
 - The boot partition's generated `cmdline.txt` says `root=/dev/mmcblk0p2 rootfstype=ext4 fsck.repair=yes rootwait`. **The rootfs must be ext4 on partition 2**, or `CMDLINE_ROOT` has to be overridden when building boot.
 - A boot partition alone panics at `VFS: Unable to mount root fs`. That is boot's expected end state and this repository's starting point — the first milestone is turning that panic into an init.
 - `../boot/Makefile` exposes `make -s print-<VAR>` (e.g. `print-IMAGE`, `print-FIRMWARE_TAG`) for scripts and CI to read a variable without parsing output.
+
+## The Contract With the `musl` Repository
+
+`Sepia-OS/musl` is the fourth repository this one consumes a release from, and the only one it cannot build without. The contract is `make`'s, plus what is particular to a libc:
+
+- **There is no channel and no switch.** "Latest" is the newest published non-draft release whatever its flag; `MUSL_TAG` pins one. Nothing on the card runs without a libc, so there is no `WITH_MUSL=0` and a missing release is a hard stop with a message that says so.
+- **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-musl-<version>-aarch64-<tag>.tar.xz` by `DIST_ASSET` in its Makefile. Resolved by suffix out of the release JSON rather than by a filename invented here.
+- **The asset is a sysroot, not a `usr/` tree and not a runtime**: `lib/ld-musl-aarch64.so.1`, `usr/lib/{libc.so,libc.a,crt*.o,lib*.a}`, `usr/include/**` and `usr/share/licenses/musl/COPYRIGHT`. 249 entries, 4.6 MiB, ~666 KB compressed. It carries no `bin/` or `sbin/`, and this repository refuses it if it does.
+- **`lib/ld-musl-aarch64.so.1` is a symlink to the absolute path `/usr/lib/libc.so`**, which resolves on the card and nowhere else. Check it with `-L` plus `readlink`, never `-e`.
+- **It does not carry the Linux UAPI headers**, on purpose: they have to match the cross-toolchain that will use them, and that toolchain lives here. `install_uapi_headers` adds them after every unpack.
+- **`libc.so` has no `SONAME`** — that is upstream musl's design, not a defect in the asset. Programs get a `DT_NEEDED` of `libc.so` because that is the file they linked against.
+- **The release body is part of the interface.** `| musl | \`1.2.6\` |` names the version; it is mined into `build/musl/release.env` as `MUSL_VER`, recorded as `SEPIAOS_MUSL` in `/etc/os-release` beside `SEPIAOS_MUSL_RELEASE`, and quoted by the release notes from there.
+- **Every other sibling pins the same musl version** it was built against — `llvm`, `make` and `e2fsprogs` each build their own copy of these sources purely to link against. When this repository moves to a newer musl release, theirs move too; a card whose libc is *newer* than what a binary was built against is the safe direction, and the reverse is how "symbol not found" appears at exec time.
 
 ## The Contract With the `llvm` Repository
 

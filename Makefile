@@ -418,55 +418,65 @@ toolchain-info: $(TOOLCHAIN_DEP) ## Show the cross-compiler in use
 	@$(CROSS)ld --version | sed -n '1s/^/  ld       /p'
 
 # ---------------------------------------------------------------------------
-# Step 3 - retrieve and build musl libc
+# Step 3 - retrieve musl libc
 #
-# musl publishes no checksum sidecar, only a detached GPG signature, so the
-# digest is recorded under checksums/ the first time a version is fetched and
-# checked against that record every time after - the same trust-on-first-use
-# manifest ../boot keeps for the Raspberry Pi firmware. `musl-verify-sig` is
-# the stronger check and stays opt-in, because it needs gpg and the
-# maintainer's key from a keyserver.
+# musl is no longer built here. `Sepia-OS/musl` cross-builds it and publishes
+# the result as a sysroot - the loader, the shared and static libc, the crt
+# objects, the empty -lm/-lpthread archives and 217 headers - and this step
+# fetches that asset, verifies it against the release's own SHA256SUMS and
+# unpacks it into build/sysroot.
 #
-# Installed with DESTDIR into build/sysroot rather than with an absolute
-# --prefix. That keeps the tree correct as a rootfs - the ld-musl symlink
-# points at /usr/lib/libc.so, which is where it really will be on the target -
-# and step 4 builds against it with --sysroot instead.
+# What changed and why: this repository resolved "the latest musl" from git
+# tags on every build and compiled it, which meant the card's libc could change
+# without a commit here, took two minutes of every build, and produced a libc
+# that only existed inside this build tree - while ../llvm, ../make and
+# ../e2fsprogs each built their *own* copy of the same sources to link against.
+# One repository now owns it, one release names it, and everything that links
+# against musl can say which musl.
 #
-# Only the directories musl owns are cleared before installing, not the whole
+# Two things this asset is *not*:
+#
+#   - It is not only a runtime. Step 4 cross-builds busybox against this tree,
+#     step 5 builds libnl and wpa_supplicant against it, and step 6 copies
+#     usr/include and usr/lib onto the card so the on-device clang can link a
+#     program rather than only compile one. All of that needs the headers and
+#     the crt objects, which is why the producing repository publishes a
+#     sysroot rather than two files.
+#   - It does not carry the Linux UAPI headers. Those still come from the
+#     cross-toolchain's own sysroot, below, because they have to match the
+#     compiler that will use them and this repository is the one that has it.
+#
+# Only the directories musl owns are cleared before unpacking, not the whole
 # sysroot: step 4 installs busybox into the same tree, and an rm -rf here would
-# quietly delete it whenever musl alone was rebuilt.
+# quietly delete it whenever musl alone was refetched.
 #
-# --disable-wrapper because the sysroot doubles as the source of the shipped
-# rootfs and SepiaOS is not shipping a compiler. Without it musl installs
-# usr/bin/musl-gcc and usr/lib/musl-gcc.specs; the wrapper would be the wrong
-# tool here anyway, since its specs bake in whatever absolute paths configure
-# saw and a staged install points them at the build host's directories.
+# CHANNEL is not used, for the reason it is not used by the llvm and make steps
+# below: it selects a boot release and defaults to `prerelease`, while
+# `Sepia-OS/musl` cuts full releases. "Latest" is the newest published
+# non-draft release whatever its flag, and MUSL_TAG pins one.
+#
+# There is no WITH_MUSL switch and there will not be one: nothing on the card
+# runs without a libc.
 # ---------------------------------------------------------------------------
 
-# Empty means "latest release", resolved from the git tags rather than by
-# scraping the release index, and then cached like the boot release is.
-MUSL_VERSION ?=
-MUSL_SIG      = $(MUSL_VERSION)|$(MUSL_GIT)|$(MUSL_BASE)
+MUSL_REPO ?= Sepia-OS/musl
 
-MUSL_GIT  := https://git.musl-libc.org/git/musl
-MUSL_BASE := https://musl.libc.org/releases
+# Pin a specific release, e.g. MUSL_TAG=v1.2.6. Empty means "resolve the newest
+# one", resolved once and then cached in build/musl/release.env like every
+# other upstream version this build takes. `make musl-update` moves it.
+MUSL_TAG  ?=
 
-# Consulted, in order, only when MUSL_GIT cannot be reached. Both are mirrors
-# of the same repository and both were checked to report the same latest tag as
-# the primary. They supply a version *number* and nothing else: the tarball
-# still comes from MUSL_BASE and still has to match checksums/, so a mirror is
-# never trusted with bytes that reach the image. repo.or.cz first because musl
-# points at it itself; the GitHub one second because when this matters the
-# build is usually running on GitHub, so it is the host least likely to be
-# unreachable at that moment. Set empty to refuse the fallback entirely.
-MUSL_GIT_MIRRORS ?= https://repo.or.cz/musl.git https://github.com/kraj/musl.git
+DL_MUSL    := $(DL_DIR)/musl
+MUSL_DIR   := $(BUILD_DIR)/musl
+MUSL_ENV   := $(MUSL_DIR)/release.env
+MUSL_STAGE := $(MUSL_DIR)/stage
+MUSL_STAMP := $(MUSL_DIR)/.installed
+MUSL_CFG   := $(MUSL_DIR)/.config
 
-DL_MUSL       := $(DL_DIR)/musl
-MUSL_DIR      := $(BUILD_DIR)/musl
-MUSL_ENV      := $(MUSL_DIR)/version.env
-MUSL_CFG      := $(MUSL_DIR)/.config
-MUSL_UNPACKED := $(MUSL_DIR)/.unpacked
-MUSL_STAMP    := $(MUSL_DIR)/.installed
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+MUSL_SIG    = $(MUSL_REPO)|$(MUSL_TAG)|$(GITHUB_API)|env1
 
 # Where musl lands, and what steps 4 and 5 consume.
 SYSROOT   := $(BUILD_DIR)/sysroot
@@ -475,117 +485,187 @@ CHECKSUMS := checksums
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 
 .PHONY: musl
-musl: $(MUSL_STAMP) ## Fetch and cross-build musl libc, static and shared
-	@source $(MUSL_ENV); printf '  READY    musl %s -> %s (static + shared)\n' \
-	   "$$MUSL_VER" $(SYSROOT)
+musl: $(MUSL_STAMP) ## Fetch, verify and unpack musl libc into the sysroot
+	@source $(MUSL_ENV); printf '  READY    musl %s (%s) -> %s\n' \
+	   "$$MUSL_VER" "$$MUSL_TAG" $(SYSROOT)
 
 $(MUSL_CFG): FORCE
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(MUSL_SIG)' | cmp -s - $@ || printf '%s\n' '$(MUSL_SIG)' > $@
 
-# --refs drops the ^{} peeled entries; sort -V is what keeps 1.2.10 above
-# 1.2.6, which a plain sort would get backwards.
-#
-# Three sources, in order, because musl's own host is small and has gone away
-# mid-build: a CI run died here after git.musl-libc.org black-holed the
-# connection for 136 seconds, on a runner whose downloads/ cache already held
-# the tarball it would have asked for. Nothing below reaches for a version that
-# has not been checked - the mirror only ever names a number, and the last
-# resort names one whose tarball is already on disk and already verified.
-# The trailing `|| true` is what makes the fallbacks reachable at all. This
-# recipe runs under `set -e` with pipefail, so an unreachable host - or a grep
-# that matches nothing - takes the whole recipe down at the assignment, before
-# anything can look at the empty result and try the next source.
-define musl_latest_tag
-git ls-remote --tags --refs $(1) 2>/dev/null | sed 's|.*refs/tags/v||' | grep -E '^[0-9]+(\.[0-9]+)+$$' | sort -V | tail -1 || true
-endef
-
+# The release body is mined the way the boot, llvm, make and e2fsprogs ones
+# are: it states the version verbatim as a table row, `| musl | `1.2.6` |`.
+# That is what /etc/os-release records and what the release notes quote, and a
+# release that does not name it leaves the field empty rather than failing this
+# step - but it *is* the field the image's own version string is built from, so
+# an empty one is worth noticing.
 $(MUSL_ENV): $(MUSL_CFG)
 	@mkdir -p $(@D)
-	@echo "  RESOLVE  musl ($(if $(MUSL_VERSION),pinned $(MUSL_VERSION),latest release))"
-	@if [ -n '$(MUSL_VERSION)' ]; then v='$(MUSL_VERSION)'; else \
-	   v=$$($(call musl_latest_tag,$(MUSL_GIT))); \
-	   if [ -z "$$v" ]; then \
-	     for m in $(MUSL_GIT_MIRRORS); do \
-	       echo "  RETRY    $(MUSL_GIT) did not answer; asking $$m" >&2; \
-	       v=$$($(call musl_latest_tag,$$m)); \
-	       if [ -n "$$v" ]; then break; fi; \
-	     done; \
-	   fi; \
-	   if [ -z "$$v" ]; then \
-	     v=$$(ls $(DL_MUSL)/musl-*.tar.gz 2>/dev/null \
-	          | sed 's|.*/musl-||; s|\.tar\.gz$$||' | sort -V | tail -1 || true); \
-	     if [ -n "$$v" ]; then \
-	       echo "  OFFLINE  nothing answered; using musl $$v, already downloaded" >&2; \
-	     fi; \
-	   fi; \
-	   [ -n "$$v" ] || { \
-	     echo "Could not read the tag list from $(MUSL_GIT)$(if $(MUSL_GIT_MIRRORS), or any of: $(MUSL_GIT_MIRRORS))," >&2; \
-	     echo "and $(DL_MUSL) holds no tarball to fall back on. Pin one with MUSL_VERSION=." >&2; \
-	     exit 1; }; \
-	 fi; \
-	 [[ "$$v" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || { echo "Refusing musl version '$$v'." >&2; exit 1; }; \
-	 printf "MUSL_VER='%s'\n" "$$v" > $@.part
-	@mv -f $@.part $@
-	@sed -n "s/^MUSL_VER='\(.*\)'/  MUSL     \1/p" $@
-
-$(MUSL_UNPACKED): $(MUSL_ENV)
-	@mkdir -p $(DL_MUSL) $(CHECKSUMS) $(MUSL_DIR)
-	@source $(MUSL_ENV); \
-	 t=musl-$$MUSL_VER.tar.gz; \
-	 if [ ! -f $(DL_MUSL)/$$t ]; then \
-	   echo "  FETCH    $$t"; \
-	   $(CURL) -o $(DL_MUSL)/$$t.part "$(MUSL_BASE)/$$t" || { \
-	     echo "  FAIL     could not fetch $(MUSL_BASE)/$$t - not published, or the" >&2; \
-	     echo "           transfer failed; curl said why above" >&2; exit 1; }; \
-	   mv -f $(DL_MUSL)/$$t.part $(DL_MUSL)/$$t; \
-	 fi; \
-	 if [ ! -f $(DL_MUSL)/$$t.asc ]; then \
-	   $(CURL) -o $(DL_MUSL)/$$t.asc.part "$(MUSL_BASE)/$$t.asc"; \
-	   mv -f $(DL_MUSL)/$$t.asc.part $(DL_MUSL)/$$t.asc; \
-	 fi; \
-	 m=$(abspath $(CHECKSUMS))/musl-$$MUSL_VER.sha256; \
-	 if [ -f "$$m" ]; then \
-	   echo "  VERIFY   $$t"; \
-	   ( cd $(DL_MUSL) && $(SHA256) --check --quiet "$$m" ) || { \
-	     echo "  FAIL     $$t does not match $$m; delete $(DL_MUSL)/$$t and retry" >&2; exit 1; }; \
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(MUSL_REPO) ($(if $(MUSL_TAG),pinned $(MUSL_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(MUSL_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(MUSL_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(MUSL_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(MUSL_REPO) has no release tagged '$(MUSL_TAG)'. Leave MUSL_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(MUSL_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(MUSL_TAG)"; \
+	   rel=$$(cat "$$body"); \
 	 else \
-	   ( cd $(DL_MUSL) && $(SHA256) "$$t" ) > "$$m"; \
-	   echo "  RECORD   $(CHECKSUMS)/musl-$$MUSL_VER.sha256 - first fetch of this version, commit it"; \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(MUSL_REPO) does not exist, or this token cannot see it. It is a" >&2; \
+	     echo "hard dependency - there is no card without a libc - so create it and" >&2; \
+	     echo "cut a release, or point MUSL_REPO at one that has." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(MUSL_REPO) has published no release yet. There is no build without" >&2; \
+	     echo "a libc, so pin one with MUSL_TAG=<tag> or cut a release there first." >&2; \
+	     exit 1; fi; \
 	 fi; \
-	 echo "  UNPACK   $$t"; \
-	 rm -rf $(MUSL_DIR)/musl-$$MUSL_VER; \
-	 tar -xf $(DL_MUSL)/$$t -C $(MUSL_DIR)
-	@touch $@
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *musl *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 { echo "MUSL_TAG='$$tag'"; \
+	   echo "MUSL_PRERELEASE='$$pre'"; \
+	   echo "MUSL_ASSET='$$ast'"; \
+	   echo "MUSL_ASSET_URL='$$asturl'"; \
+	   echo "MUSL_ASSET_ID='$$astid'"; \
+	   echo "MUSL_SUMS_URL='$$sumurl'"; \
+	   echo "MUSL_VER='$$ver'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^MUSL_TAG='\(.*\)'/  MUSL     \1/p" $@
 
-# configure and make are noisy and only interesting when they fail, so the
-# output goes to a log and the tail of it is what surfaces on an error.
-$(MUSL_STAMP): $(MUSL_UNPACKED) $(TOOLCHAIN_DEP) Makefile
-	@source $(MUSL_ENV); s=$(MUSL_DIR)/musl-$$MUSL_VER; \
-	 echo "  CONFIG   musl $$MUSL_VER (static + shared)"; \
-	 ( cd $$s && ./configure --prefix=/usr --syslibdir=/lib \
-	       --enable-static --enable-shared --disable-wrapper \
-	       CROSS_COMPILE=$(CROSS) ) > $$s/configure.log 2>&1 || { \
-	   tail -20 $$s/configure.log >&2; \
-	   echo "  FAIL     configure (full log: $$s/configure.log)" >&2; exit 1; }; \
-	 echo "  BUILD    musl $$MUSL_VER (-j$(JOBS))"; \
-	 $(MAKE) --no-print-directory -C $$s -j$(JOBS) > $$s/build.log 2>&1 || { \
-	   tail -30 $$s/build.log >&2; \
-	   echo "  FAIL     build (full log: $$s/build.log)" >&2; exit 1; }; \
-	 echo "  INSTALL  -> $(SYSROOT)"; \
-	 rm -rf $(SYSROOT)/usr/include $(SYSROOT)/usr/lib $(SYSROOT)/lib/ld-musl-*; \
-	 $(MAKE) --no-print-directory -C $$s install DESTDIR=$(abspath $(SYSROOT)) \
-	   >> $$s/build.log 2>&1 || { \
-	   tail -30 $$s/build.log >&2; \
-	   echo "  FAIL     install (full log: $$s/build.log)" >&2; exit 1; }
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it: that
+# repository keeps its releases and refuses to reuse a version, but the retry
+# path its own error message recommends is deleting a release and republishing
+# it, after which the same tag names different bytes. The marker is written
+# only after VERIFY passes, so an interrupted download is refetched rather than
+# trusted.
+#
+# Unpacked into build/musl/stage and only then copied into the sysroot, rather
+# than straight into it: an asset that turns out to be the wrong shape must not
+# be able to leave the sysroot half-replaced, because the previous one still
+# works.
+$(MUSL_STAMP): $(MUSL_ENV) $(TOOLCHAIN_DEP) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(MUSL_ENV); \
+	 d=$(DL_MUSL)/$$MUSL_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$MUSL_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$MUSL_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$MUSL_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$MUSL_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$MUSL_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$MUSL_ASSET"; \
+	   $(CURL) -o "$$d/$$MUSL_ASSET.part" "$$MUSL_ASSET_URL"; \
+	   mv -f "$$d/$$MUSL_ASSET.part" "$$d/$$MUSL_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$MUSL_ASSET"; \
+	 ( cd "$$d" && grep -F "$$MUSL_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$MUSL_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$MUSL_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$MUSL_ASSET"; \
+	 rm -rf $(MUSL_STAGE); mkdir -p $(MUSL_STAGE); \
+	 tar -xf "$$d/$$MUSL_ASSET" -C $(MUSL_STAGE)
+	@$(call assert_musl_asset)
+	@echo "  INSTALL  -> $(SYSROOT)"
+	@rm -rf $(SYSROOT)/usr/include $(SYSROOT)/usr/lib $(SYSROOT)/lib/ld-musl-*
+	@mkdir -p $(SYSROOT)
+	@cp -R $(MUSL_STAGE)/. $(SYSROOT)/
 	@$(call install_uapi_headers)
 	@$(call assert_musl)
 	@touch $@
 
+# Asked of the unpacked asset before any of it reaches the sysroot, so a
+# truncated or wrong-shaped one fails naming itself rather than leaving the
+# tree half-replaced.
+#
+# The loader is checked with -L and readlink rather than -e, and that is not
+# fussiness: musl installs it as a symlink to the *absolute* path
+# /usr/lib/libc.so, which resolves on the card and nowhere else. On a Linux
+# build host `[ -e ]` would follow it to that host's own /usr/lib/libc.so -
+# glibc's linker script - and pass for entirely the wrong reason.
+#
+# The crt objects and the headers are named because they are what makes this a
+# sysroot rather than a runtime: without them step 4 cannot link busybox and
+# the card's clang cannot link anything at all. ELF byte 18 is e_machine,
+# little-endian, and 0xb7 is AArch64.
+define assert_musl_asset
+	set -e; s=$(MUSL_STAGE); \
+	for f in usr/lib/libc.so usr/lib/libc.a usr/lib/crt1.o usr/lib/crti.o \
+	         usr/lib/crtn.o usr/lib/Scrt1.o usr/include/stdio.h \
+	         usr/share/licenses/musl/COPYRIGHT; do \
+	  [ -f "$$s/$$f" ] || { \
+	    echo "  FAIL     $$f is missing - is this a SepiaOS musl asset?" >&2; exit 1; }; \
+	done; \
+	m=$$(od -An -tx1 -j 18 -N2 "$$s/usr/lib/libc.so" | tr -d ' \n'); \
+	[ "$$m" = "b700" ] || { \
+	  echo "  FAIL     usr/lib/libc.so has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	[ -L "$$s/lib/ld-musl-aarch64.so.1" ] || { \
+	  echo "  FAIL     lib/ld-musl-aarch64.so.1 is not a symlink - every binary's PT_INTERP names it" >&2; exit 1; }; \
+	t=$$(readlink "$$s/lib/ld-musl-aarch64.so.1"); \
+	[ "$$t" = /usr/lib/libc.so ] || { \
+	  echo "  FAIL     the loader points at '$$t', not /usr/lib/libc.so" >&2; exit 1; }; \
+	for d in bin sbin usr/bin usr/sbin; do \
+	  [ ! -d "$$s/$$d" ] || { \
+	    echo "  FAIL     the asset carries $$d/ - that is a rootfs, not a libc" >&2; exit 1; }; \
+	done
+endef
+
 # Both linkages are what the README asks for, so both are actually exercised
-# rather than inferred from the presence of libc.a and libc.so. readelf comes
-# from the cross-toolchain itself, so this needs nothing that is not already
-# a dependency - `file` is absent from a slim Debian image.
+# rather than inferred from the presence of libc.a and libc.so. It is worth
+# keeping now that musl arrives as a download rather than a build: this is the
+# check that says the *combination* of somebody else's libc and this
+# repository's cross-toolchain works, which is a thing neither side can test
+# alone. readelf comes from the cross-toolchain itself, so this needs nothing
+# that is not already a dependency - `file` is absent from a slim Debian image.
 define assert_musl
 	set -e; \
 	d=$(MUSL_DIR)/.check; rm -rf $$d; mkdir -p $$d; \
@@ -606,7 +686,8 @@ endef
 # busybox in step 4 wants linux/kd.h before it will even compile. They are
 # taken from the cross-toolchain's own sysroot - the same toolchain that
 # supplies libgcc - rather than downloaded separately, so this costs nothing
-# and cannot drift from the compiler.
+# and cannot drift from the compiler. The musl release deliberately does not
+# carry them, for exactly that reason.
 define install_uapi_headers
 	set -e; \
 	k=$$($(CROSS)gcc -print-sysroot)/usr/include; \
@@ -619,9 +700,13 @@ define install_uapi_headers
 endef
 
 .PHONY: musl-update
-musl-update: ## Re-resolve the latest musl release and rebuild
+musl-update: ## Re-resolve the newest musl release and refetch
 	@rm -f $(MUSL_ENV)
 	@$(MAKE) --no-print-directory musl
+
+.PHONY: musl-tag
+musl-tag: $(MUSL_ENV) ## Print the musl release tag in use
+	@source $(MUSL_ENV); echo "$$MUSL_TAG"
 
 .PHONY: musl-check
 musl-check: $(MUSL_STAMP) ## Link a test program against the sysroot, both ways
@@ -629,26 +714,18 @@ musl-check: $(MUSL_STAMP) ## Link a test program against the sysroot, both ways
 	@echo "  OK       static and dynamic both link against $(SYSROOT)"
 
 .PHONY: musl-info
-musl-info: $(MUSL_STAMP) ## Show the musl build and what it installed
-	@source $(MUSL_ENV); echo "  version  musl $$MUSL_VER"
+musl-info: $(MUSL_STAMP) ## Show the fetched musl release and what it installed
+	@source $(MUSL_ENV); \
+	 if [ "$$MUSL_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(MUSL_REPO)"; \
+	 echo "  tag      $$MUSL_TAG$$k$(if $(MUSL_TAG), (pinned))"; \
+	 echo "  asset    $$MUSL_ASSET"; \
+	 echo "  version  musl $${MUSL_VER:-<not named in the release notes>}"
 	@echo "  sysroot  $(SYSROOT)"
 	@ls -l $(SYSROOT)/lib/ld-musl-aarch64.so.1 | sed 's/^/  loader   /'
 	@printf '  static   %s (%s KiB)\n' $(SYSROOT)/usr/lib/libc.a "$$(( $$(wc -c < $(SYSROOT)/usr/lib/libc.a) / 1024 ))"
 	@printf '  shared   %s (%s KiB)\n' $(SYSROOT)/usr/lib/libc.so "$$(( $$(wc -c < $(SYSROOT)/usr/lib/libc.so) / 1024 ))"
 	@$(CROSS)readelf -h $(SYSROOT)/usr/lib/libc.so | sed -n 's/^ *Machine: *\(.*\)/  machine  \1/p'
-
-# Opt-in: needs gpg and fetches Rich Felker's key from a keyserver. The
-# fingerprint is pinned here so that importing it cannot substitute another.
-MUSL_KEY := 836489290BB6B70F99FFDA0556BCDB593020450F
-
-.PHONY: musl-verify-sig
-musl-verify-sig: $(MUSL_UNPACKED) ## Check the musl tarball's GPG signature (needs gpg)
-	@command -v gpg >/dev/null 2>&1 || { echo "gpg is not installed" >&2; exit 1; }
-	@source $(MUSL_ENV); t=musl-$$MUSL_VER.tar.gz; \
-	 gpg --list-keys $(MUSL_KEY) >/dev/null 2>&1 \
-	   || gpg --recv-keys $(MUSL_KEY) \
-	   || { echo "Could not fetch key $(MUSL_KEY) from a keyserver." >&2; exit 1; }; \
-	 gpg --verify $(DL_MUSL)/$$t.asc $(DL_MUSL)/$$t
 
 # ---------------------------------------------------------------------------
 # Step 4 - retrieve and build busybox
@@ -2879,6 +2956,7 @@ define generate_etc
 	  echo "SEPIAOS_FIRMWARE=\"$$FW_TAG\""; \
 	  echo "SEPIAOS_KERNELS=\"$$KVER_V8 $$KVER_V8_16K\""; \
 	  echo "SEPIAOS_MUSL=\"$$MUSL_VER\""; \
+	  echo "SEPIAOS_MUSL_RELEASE=\"$$MUSL_TAG\""; \
 	  [ -z "$$LLVM_TAG" ] || { echo "SEPIAOS_LLVM_RELEASE=\"$$LLVM_TAG\""; \
 	                           echo "SEPIAOS_LLVM=\"$$LLVM_VERSION\""; }; \
 	  [ -z "$$MAKE_TAG" ] || { echo "SEPIAOS_MAKE_RELEASE=\"$$MAKE_TAG\""; \
@@ -3508,7 +3586,8 @@ help: ## Show this help
 	  "BOOT_REPO"         "where the boot partition comes from (default $(BOOT_REPO))" \
 	  "TOOLCHAIN_VERSION" "cross-compiler release (default $(TOOLCHAIN_VERSION), $(TC_VENDOR) on $(HOST_OS))" \
 	  "CROSS_COMPILE"     "use a toolchain you already have; nothing is downloaded" \
-	  "MUSL_VERSION"      "pin a musl release instead of taking the latest one" \
+	  "MUSL_TAG"          "pin a musl release instead of taking the newest one" \
+	  "MUSL_REPO"         "where musl comes from (default $(MUSL_REPO))" \
 	  "BUSYBOX_VERSION"   "pin a busybox release instead of taking the latest one" \
 	  "FIRMWARE_TAG"      "pin the kernel modules' firmware tag (default: the boot release's)" \
 	  "WITH_LLVM"         "ship the on-device clang/lld toolchain (default $(WITH_LLVM))" \
@@ -3538,8 +3617,9 @@ help: ## Show this help
 	@echo "  make BOOT_TAG=v0.1.0 boot-partition    a specific one"
 	@echo "  make toolchain                         the aarch64 cross-compiler for this host"
 	@echo "  make CROSS_COMPILE=aarch64-linux-gnu- toolchain-info    use a system one"
-	@echo "  make musl                              latest musl, static and shared"
-	@echo "  make MUSL_VERSION=1.2.5 musl           a specific one"
+	@echo "  make musl                              the newest musl release for the sysroot"
+	@echo "  make MUSL_TAG=v1.2.6 musl              a specific musl release"
+	@echo "  make musl-update                       move onto a newer one"
 	@echo "  make busybox                           latest busybox, dynamic against musl"
 	@echo "  make modules                           the boot kernel's modules, both trees"
 	@echo "  make FIRMWARE_TAG=1.20260521 modules   modules from a specific firmware tag"

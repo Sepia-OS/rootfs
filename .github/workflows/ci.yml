@@ -64,7 +64,7 @@ jobs:
     steps:
       # Before checkout on purpose: without git in the container, actions/checkout
       # silently falls back to downloading a tarball, and the Makefile needs git
-      # both for the module fetch and to resolve the musl version. zstd is here
+      # for the module fetch. zstd is here
       # for actions/cache, which otherwise falls back to gzip and says so, and
       # python3 for tools/generate_keymaps.py - the one part of the build that
       # needs an interpreter - and squashfs-tools for vendor/keymaps/kmaps.tcz,
@@ -99,7 +99,8 @@ jobs:
       # keyed the same way, even though Sepia-OS/make does not reuse a tag in
       # the ordinary course, because deleting a release and republishing it is
       # what that repository's own retry advice says to do. downloads/
-      # e2fsprogs-package/<tag>/ follows both of them, for both reasons.
+      # e2fsprogs-package/<tag>/ and downloads/musl/<tag>/ follow both of them,
+      # for both reasons.
       #
       # In particular do not narrow the key to compensate: dropping the
       # restore-key fallback would refetch the cross-toolchain on every
@@ -116,6 +117,16 @@ jobs:
       # toolchain that cannot be resolved or verified would otherwise surface
       # forty minutes in, after musl, busybox, the modules and the wireless
       # stack. Same documented target the build reaches later, reached sooner.
+      # Before everything, and before the toolchain: musl is what step 4 and
+      # step 5 compile against and what every binary on the card runs on, so
+      # there is no build at all without it. A repository that has published
+      # no release, or an asset that will not verify, should say so in seconds.
+      - name: Resolve and fetch musl
+        run: make musl
+
+      - name: Link a test program against the sysroot, both ways
+        run: make musl-check
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -140,6 +151,7 @@ jobs:
         run: |
           make image-info
           make rootfs-info
+          make musl-info
           make modules-info
           make llvm-info
           make make-info
