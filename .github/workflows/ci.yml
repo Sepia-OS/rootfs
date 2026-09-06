@@ -133,6 +133,14 @@ jobs:
       - name: Resolve and fetch the wifi package
         run: make wifi
 
+      # 160 MiB compressed, 725 MiB unpacked - by a wide margin the largest
+      # thing this build fetches, and the reason the image it produces is
+      # 2 GiB rather than 512 MiB. Runner disk is the thing to watch if this
+      # ever starts failing oddly: the downloads, the sysroot, the staged tree
+      # and a 2 GiB image all live on the same volume.
+      - name: Resolve and fetch the Rust toolchain
+        run: make rust
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -160,6 +168,7 @@ jobs:
           make musl-info
           make wifi-info
           make wireless-info
+          make rust-info
           make modules-info
           make llvm-info
           make make-info
@@ -192,6 +201,12 @@ jobs:
       # arrived in the same asset.
       - name: Read the wifi package back
         run: make wifi-check
+
+      # rustc, cargo and librustc_driver: aarch64, and every library they name
+      # is either the card's musl, libgcc_s (which upstream links against and
+      # ships), or a file in the asset.
+      - name: Read the Rust toolchain back
+        run: make rust-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

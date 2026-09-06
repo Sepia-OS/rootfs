@@ -228,11 +228,40 @@ make e2fsprogs-update                 # move onto a newer one
 make WITH_E2FSPROGS=0 image           # an image with the single resize2fs instead
 ```
 
+### Retrieve the Rust toolchain for the device
+
+The latest release of https://github.com/Sepia-OS/rust-toolchain shall be
+retrieved and unpacked into the root file system, so that a SepiaOS device can
+build Rust programs for itself. That repository repackages upstream's own
+`aarch64-unknown-linux-musl` build of `rustc`, `cargo` and the standard
+library — a Tier 2 Rust target *with host tools*, so those programs exist as an
+official download and nothing has to cross-build them.
+
+**It is 725 MiB unpacked**, which is more than everything else on the card put
+together, and that is why the shipped image is **2 GiB** when Rust is included:
+264 MiB of everything else plus 725 MiB of Rust does not fit in the 512 MiB
+card, and QEMU only accepts a power of two, so 1024 would leave about 35 MiB
+free. `WITH_RUST=0` puts the image straight back to 512 MiB.
+
+`rustc` needs a linker to produce a binary and shells out to `cc` for it, which
+on the card is the clang from `llvm`. The two switches stay independent all the
+same: `WITH_RUST=1 WITH_LLVM=0` is a card that compiles Rust to object files
+and stops.
+
+```sh
+make rust                       # resolve, verify and unpack it
+make rust-info                  # which release, which version, how big
+make RUST_TAG=v1.98.1 rust      # a specific release
+make rust-update                # move onto a newer one
+make WITH_RUST=0 image          # a 512 MiB card with no Rust on it
+```
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
 populated with musl libc, busybox, the kernel modules, the LLVM toolchain, GNU
-make and the e2fsprogs filesystem tools from the previous steps. The rootfs
+make, the e2fsprogs filesystem tools and the Rust toolchain from the previous
+steps. The rootfs
 shall be created with `ext4` file system.
 
 The bootable image is created using the boot partition, musl libc and
@@ -414,8 +443,9 @@ the release workflow does not override any of them — so what is published is
 the same card every CI run builds and boots, rather than a configuration that
 is first exercised inside the release build itself. The `prerelease` input
 still selects the boot partition's channel and deliberately selects **no**
-channel for the five siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
-`musl_tag` and `wifi_tag` pin those the way `boot_tag` pins a boot partition. The release
+channel for the six siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
+`musl_tag`, `wifi_tag` and `rust_tag` pin those the way `boot_tag` pins a boot
+partition. The release
 notes quote the LLVM, GNU make, e2fsprogs and musl versions out of the built
 tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 

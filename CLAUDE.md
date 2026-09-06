@@ -39,6 +39,10 @@ gmake e2fsprogs                         # fetch the e2fsprogs package for the de
 gmake e2fsprogs-info                    # which release, which version, how many programs
 gmake e2fsprogs-check                   # re-read all 22: aarch64, musl loader, closure
 gmake WITH_E2FSPROGS=0 image            # back to a single cross-built resize2fs
+gmake rust                              # fetch the Rust toolchain for the device
+gmake rust-info                         # which release, which version, how big
+gmake rust-check                        # aarch64, loader, library closure
+gmake WITH_RUST=0 image                 # no Rust, and a 512 MiB card again
 gmake rootfs                            # stage the FHS tree under build/rootfs
 gmake rootfs-info                       # size, file count, kernels it carries
 gmake image                             # build/image/sepiaos-<version>.img
@@ -353,7 +357,7 @@ Step 7 shapes step 6: the shipped image is sized to its contents, not to any par
 
 All eight steps of `README.md` are implemented. What is *not* here: nothing has been run on real hardware, so `config.txt`, device-tree auto-selection and overlays remain untested; there is no networking, no package management and no release/CI wiring (`dist/` is still empty and `.github/` has no workflow); and the image is not reproducible byte-for-byte, because mke2fs stamps a random filesystem UUID and the file timestamps come from the build.
 
-The sibling repositories live beside this one, and this one is the only one that *assembles* rather than produces: [../boot](../boot) (the FAT boot partition, and the closest model for the house style), [../musl](../musl) (the libc everything here links against), [../llvm](../llvm), [../make](../make) and [../e2fsprogs](../e2fsprogs) (the three packages the card carries), plus [../spm](../spm) (the package manager, early). This repository consumes a published release from six of them - `boot`, `musl`, `wifi`, `llvm`, `make` and `e2fsprogs` - and builds only busybox and the image itself.
+The sibling repositories live beside this one, and this one is the only one that *assembles* rather than produces: [../boot](../boot) (the FAT boot partition, and the closest model for the house style), [../musl](../musl) (the libc everything here links against), [../llvm](../llvm), [../make](../make), [../e2fsprogs](../e2fsprogs), [../wifi](../wifi) and [../rust-toolchain](../rust-toolchain) (the packages the card carries), plus [../spm](../spm) (the package manager, early). This repository consumes a published release from seven of them - `boot`, `musl`, `wifi`, `llvm`, `make`, `e2fsprogs` and `rust-toolchain` - and builds only busybox and the image itself.
 
 ## The Contract With the `boot` Repository
 
@@ -390,6 +394,17 @@ These are the facts the rootfs build has to match; all were read out of `../boot
 - **The release body is part of the interface.** `| wpa_supplicant | \`2.12\` |`, `| libnl | \`3.12.0\` |` and the musl it was built against are all mined into `build/wireless/wifi/release.env`; the first is recorded as `SEPIAOS_WPA_SUPPLICANT` in `/etc/os-release` beside `SEPIAOS_WIFI_RELEASE`.
 - **The firmware is *not* in it, and stays this repository's job.** The Broadcom blobs are a download rather than a build, four times the size of the package, and tied to the kernel that loads them. `WITH_WIFI=0` leaves out both halves.
 - **It will never contain a libc or a loader**, like every other sibling asset. Its `dist` refuses to pack one, and `assert_wifi_stage` asserts it from this side.
+
+## The Contract With the `rust-toolchain` Repository
+
+`Sepia-OS/rust-toolchain` repackages upstream's own `aarch64-unknown-linux-musl` build of `rustc`, `cargo` and the standard library. The fetch is `make`'s shape; what is particular is the size and the shape of the product:
+
+- **725 MiB unpacked**, more than every other package on the card together, and the reason `IMAGE_SIZE_MIB` defaults to **2048** when `WITH_RUST=1`. 264 MiB of everything else plus 725 does not fit in 512, and QEMU only accepts a power of two, so 1024 would leave about 35 MiB free. `WITH_RUST=0` returns the default to 512.
+- **`bin/rustc` is a 72 KiB shim.** It finds its sysroot by walking up from its own path and loads `librustc_driver-*.so` out of `usr/lib/`. A tree with the three programs and no `lib/` passes any check that only looks at `bin/` and then fails on the card at the first `rustc --version`, so `assert_rust_stage` and `assert_rootfs` both name the driver and `libstd`.
+- **Rust cannot link a program by itself.** `rustc` shells out to `cc` for the final link, which on a SepiaOS card is the clang from `Sepia-OS/llvm`. The switches stay independent anyway: a card with Rust and no clang compiles to object files and stops, which is strange but not something to refuse.
+- **The closure check allows `libgcc_s.so.1` as well as the card's libc**, because upstream links its aarch64-musl build against it and ships it in the asset's own `usr/lib`. Every other `DT_NEEDED` has to be musl or a file in the asset.
+- **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-rust-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| rust | \`1.98.1\` |`, mined into `build/rust/release.env` and recorded as `SEPIAOS_RUST` beside `SEPIAOS_RUST_RELEASE`.
+- **It will never contain a libc or a loader**, like every other sibling asset; `assert_rust_stage` refuses one.
 
 ## The Contract With the `llvm` Repository
 

@@ -2694,6 +2694,269 @@ define assert_e2fsprogs_closure
 endef
 
 # ---------------------------------------------------------------------------
+# The Rust toolchain, from Sepia-OS/rust-toolchain
+#
+# `Sepia-OS/rust-toolchain` repackages upstream's own aarch64-musl build of
+# rustc, cargo and the standard library - aarch64-unknown-linux-musl is a Tier
+# 2 Rust target *with host tools*, so those programs exist as an official
+# download and nothing has to cross-build them. This step fetches that release
+# and unpacks it, and the rootfs step below copies it onto the card.
+#
+# Structurally this is the llvm, make and e2fsprogs steps again. Two things are
+# particular to it, and both are about size:
+#
+#   - It is 725 MiB unpacked, which is more than every other package on the
+#     card put together. That is why IMAGE_SIZE_MIB defaults to 2048 when this
+#     is on: 264 MiB of everything else plus 725 MiB of Rust does not fit in a
+#     512 MiB card, and QEMU only accepts a power of two, so 1024 would leave
+#     about 35 MiB free. WITH_RUST=0 puts the image straight back to 512.
+#   - `bin/rustc` is a 72 KiB shim. It finds its sysroot by walking up from its
+#     own path and loads librustc_driver out of lib/, so a tree with the shim
+#     and nothing else looks fine and fails at the first invocation. The
+#     assertion names the driver and the standard library too.
+#
+# Rust also cannot link a program on its own: rustc shells out to `cc` for the
+# final link, which on a SepiaOS card is the clang from Sepia-OS/llvm. The two
+# switches are independent all the same - WITH_RUST=1 WITH_LLVM=0 is a card
+# that compiles Rust to object files and stops, which is a strange thing to
+# want but not a thing to refuse.
+# ---------------------------------------------------------------------------
+
+WITH_RUST ?= 1
+
+RUST_REPO ?= Sepia-OS/rust-toolchain
+
+# Pin a specific release, e.g. RUST_TAG=v1.98.1. Empty means "resolve the
+# newest one", cached in build/rust/release.env like every other upstream
+# version this build takes. `make rust-update` moves it.
+RUST_TAG  ?=
+
+DL_RUST    := $(DL_DIR)/rust
+RUST_DIR   := $(BUILD_DIR)/rust
+RUST_ENV   := $(RUST_DIR)/release.env
+RUST_STAGE := $(RUST_DIR)/stage
+RUST_STAMP := $(RUST_DIR)/.staged
+RUST_CFG   := $(RUST_DIR)/.config
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+RUST_SIG    = $(RUST_REPO)|$(RUST_TAG)|$(GITHUB_API)|env1
+
+ifeq ($(WITH_RUST),1)
+  RUST_DEP := $(RUST_STAMP)
+else
+  RUST_DEP :=
+endif
+
+.PHONY: rust
+rust: $(RUST_STAMP) ## Fetch, verify and unpack the Rust toolchain
+	@source $(RUST_ENV); printf '  READY    rust %s (%s) -> %s (%s MiB)\n' \
+	   "$${RUST_VER:-?}" "$$RUST_TAG" $(RUST_STAGE) "$$(du -sm $(RUST_STAGE) | cut -f1)"
+
+$(RUST_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(RUST_SIG)' | cmp -s - $@ || printf '%s\n' '$(RUST_SIG)' > $@
+
+# The release body is mined the way every other one is: it states the version
+# verbatim as a table row, `| rust | `1.98.1` |`. That is what /etc/os-release
+# records and what the release notes quote.
+$(RUST_ENV): $(RUST_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(RUST_REPO) ($(if $(RUST_TAG),pinned $(RUST_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(RUST_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(RUST_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(RUST_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(RUST_REPO) has no release tagged '$(RUST_TAG)'. Leave RUST_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(RUST_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(RUST_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(RUST_REPO) does not exist, or this token cannot see it. Build without" >&2; \
+	     echo "Rust using WITH_RUST=0, or point RUST_REPO at a repository that has" >&2; \
+	     echo "cut a release." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(RUST_REPO) has published no release yet. Build without Rust using" >&2; \
+	     echo "WITH_RUST=0, or pin one with RUST_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *rust *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 { echo "RUST_TAG='$$tag'"; \
+	   echo "RUST_PRERELEASE='$$pre'"; \
+	   echo "RUST_ASSET='$$ast'"; \
+	   echo "RUST_ASSET_URL='$$asturl'"; \
+	   echo "RUST_ASSET_ID='$$astid'"; \
+	   echo "RUST_SUMS_URL='$$sumurl'"; \
+	   echo "RUST_VER='$$ver'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^RUST_TAG='\(.*\)'/  RUST     \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it. The marker
+# is written only after VERIFY passes, so an interrupted download is refetched
+# rather than trusted - and at 160 MiB this is the download least worth doing
+# twice.
+$(RUST_STAMP): $(RUST_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(RUST_ENV); \
+	 d=$(DL_RUST)/$$RUST_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$RUST_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$RUST_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$RUST_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$RUST_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$RUST_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$RUST_ASSET (160 MiB)"; \
+	   $(CURL) -o "$$d/$$RUST_ASSET.part" "$$RUST_ASSET_URL"; \
+	   mv -f "$$d/$$RUST_ASSET.part" "$$d/$$RUST_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$RUST_ASSET"; \
+	 ( cd "$$d" && grep -F "$$RUST_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$RUST_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$RUST_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$RUST_ASSET -> $(RUST_STAGE) (725 MiB, takes a minute)"; \
+	 rm -rf $(RUST_STAGE); mkdir -p $(RUST_STAGE); \
+	 tar -xf "$$d/$$RUST_ASSET" -C $(RUST_STAGE)
+	@$(call assert_rust_stage)
+	@touch $@
+
+# Asked of the unpacked tree before it is mixed into the rootfs, so a truncated
+# or wrong-architecture asset fails naming itself. Deliberately uses nothing
+# from the cross-toolchain - this step is a download. ELF byte 18 is e_machine,
+# little-endian, and 0xb7 is AArch64; `rust-check` does the deeper reading.
+#
+# librustc_driver and libstd are named because bin/rustc is a shim that loads
+# them out of the sysroot it finds beside itself: an asset with the three
+# programs and no lib/ passes every check that only looks at bin/ and then
+# fails on the card at the first `rustc --version`.
+define assert_rust_stage
+	set -e; s=$(RUST_STAGE); \
+	for f in usr/bin/rustc usr/bin/cargo; do \
+	  [ -x "$$s/$$f" ] || { \
+	    echo "  FAIL     $$s/$$f is missing - is this a SepiaOS rust asset?" >&2; exit 1; }; \
+	  m=$$(od -An -tx1 -j 18 -N2 "$$s/$$f" | tr -d ' \n'); \
+	  [ "$$m" = "b700" ] || { \
+	    echo "  FAIL     $$f has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	  grep -aq 'ld-musl-aarch64.so.1' "$$s/$$f" \
+	    || { echo "  FAIL     $$f does not ask for the musl loader" >&2; exit 1; }; \
+	done; \
+	ls $$s/usr/lib/librustc_driver-*.so >/dev/null 2>&1 \
+	  || { echo "  FAIL     no librustc_driver - bin/rustc is only a shim and loads it" >&2; exit 1; }; \
+	ls $$s/usr/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd-*.rlib >/dev/null 2>&1 \
+	  || { echo "  FAIL     no libstd for aarch64-unknown-linux-musl - nothing could be compiled" >&2; exit 1; }; \
+	[ -s "$$s/usr/share/licenses/rust/COPYRIGHT" ] \
+	  || { echo "  FAIL     the asset carries no COPYRIGHT; this ships binaries of a licensed project" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: rust-update
+rust-update: ## Re-resolve the newest Rust release and refetch
+	@rm -f $(RUST_ENV)
+	@$(MAKE) --no-print-directory rust
+
+.PHONY: rust-tag
+rust-tag: $(RUST_ENV) ## Print the Rust release tag in use
+	@source $(RUST_ENV); echo "$$RUST_TAG"
+
+.PHONY: rust-info
+rust-info: $(RUST_STAMP) ## Show the fetched Rust release and what it contains
+	@source $(RUST_ENV); \
+	 if [ "$$RUST_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(RUST_REPO)"; \
+	 echo "  tag      $$RUST_TAG$$k$(if $(RUST_TAG), (pinned))"; \
+	 echo "  asset    $$RUST_ASSET"; \
+	 echo "  rust     $${RUST_VER:-<not named in the release notes>}"; \
+	 echo "  staged   $(RUST_STAGE) ($$(du -sm $(RUST_STAGE) | cut -f1) MiB)"
+	@printf '  programs %s\n' "$$(ls $(RUST_STAGE)/usr/bin | tr '\n' ' ')"
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. Only the three programs and the driver are read rather than the
+# whole tree: the standard library is 4,000 rlibs, which are archives rather
+# than ELF objects, and reading them says nothing about whether the card can
+# run the compiler.
+.PHONY: rust-check
+rust-check: $(RUST_STAMP) $(TOOLCHAIN_DEP) ## Re-read the Rust toolchain: architecture, loader, library closure
+	@$(call assert_rust_stage)
+	@$(call assert_rust_closure)
+
+define assert_rust_closure
+	set -e; n=0; \
+	for f in $(RUST_STAGE)/usr/bin/rustc $(RUST_STAGE)/usr/bin/cargo \
+	         $(RUST_STAGE)/usr/lib/librustc_driver-*.so; do \
+	  [ -f "$$f" ] || continue; \
+	  $(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	    || { echo "  FAIL     $$f is not aarch64" >&2; exit 1; }; \
+	  miss=; \
+	  for d in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	              | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	    case "$$d" in \
+	      libc.so*|libgcc_s.so*) ;; \
+	      *) [ -e "$(RUST_STAGE)/usr/lib/$$d" ] || miss="$$miss $$d";; \
+	    esac; \
+	  done; \
+	  [ -z "$$miss" ] || { \
+	    echo "  FAIL     $$(basename $$f) needs$$miss, which is neither the card's libc nor in the asset" >&2; \
+	    exit 1; }; \
+	  n=$$((n+1)); \
+	done; \
+	[ "$$n" -ge 3 ] || { echo "  FAIL     only $$n of the three products were readable" >&2; exit 1; }; \
+	echo "  OK       $$n files: aarch64, and every library they need is here or is musl"
+endef
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -2777,7 +3040,7 @@ KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 # LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same chain for the
 # other two) is a genuine file chain. Only the switches change the tree while
 # touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -2889,7 +3152,7 @@ $(ROOTFS_CFG): FORCE
 	@printf '%s\n' '$(ROOTFS_SIG)' | cmp -s - $@ || printf '%s\n' '$(ROOTFS_SIG)' > $@
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_STAMP) \
-                 $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) \
+                 $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) $(RUST_DEP) \
                  $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
@@ -2910,6 +3173,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@$(call install_toolchain)
 	@$(call install_gnu_make)
 	@$(call install_e2fsprogs)
+	@$(call install_rust)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
@@ -3024,6 +3288,28 @@ endef
 # sbin/fsck straight into bin/busybox, and the card would come up with no
 # shell, no init and no way to find out why. The same trap is why sbin/init is
 # unlinked before the overlay is copied in.
+# The Rust toolchain, on the same terms as GNU make and e2fsprogs: a `usr/`
+# tree copied in whole, guarded from the inside by the switch, and refusing to
+# overwrite anything already in the tree. It runs after all of them so that
+# check sees the toolchain's 2,361 entries and e2fsprogs' 31 as well.
+#
+# It is 725 MiB, which is most of what a card carries and most of the time this
+# copy takes. There is nothing to add beside it - rustc finds its own sysroot
+# by walking up from /usr/bin/rustc - but it does need a linker to be useful,
+# and that is the clang from the toolchain above rather than anything here.
+define install_rust
+	set -e; \
+	[ -n '$(RUST_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); u=$(abspath $(RUST_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$u") <(names "$$(cd $$r && pwd)")); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the Rust toolchain would overwrite files already in the tree:" >&2; \
+	  printf '           %s\n' $$c >&2; exit 1; }; \
+	cp -R "$$u"/. $$r/; \
+	printf '  RUST     rustc and cargo -> %s (%s MiB)\n' "$$r" "$$(du -sm $$u | cut -f1)"
+endef
+
 define install_e2fsprogs
 	set -e; \
 	[ -n '$(E2FSPROGS_DEP)' ] || exit 0; \
@@ -3057,6 +3343,7 @@ define generate_etc
 	$(if $(MAKE_DEP),source $(MAKE_ENV);,MAKE_TAG=; GNU_MAKE_VERSION=;) \
 	$(if $(E2FSPROGS_DEP),source $(E2FSPROGS_ENV);,E2FSPROGS_TAG=; E2FSPROGS_VERSION=;) \
 	$(if $(WIRELESS_DEP),source $(WIFI_ENV);,WIFI_TAG=; WPA_VER=;) \
+	$(if $(RUST_DEP),source $(RUST_ENV);,RUST_TAG=; RUST_VER=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -3082,7 +3369,9 @@ define generate_etc
 	  [ -z "$$E2FSPROGS_TAG" ] || { echo "SEPIAOS_E2FSPROGS_RELEASE=\"$$E2FSPROGS_TAG\""; \
 	                                echo "SEPIAOS_E2FSPROGS=\"$$E2FSPROGS_VERSION\""; }; \
 	  [ -z "$$WIFI_TAG" ] || { echo "SEPIAOS_WIFI_RELEASE=\"$$WIFI_TAG\""; \
-	                           echo "SEPIAOS_WPA_SUPPLICANT=\"$$WPA_VER\""; }; } > $$r/etc/os-release; \
+	                           echo "SEPIAOS_WPA_SUPPLICANT=\"$$WPA_VER\""; }; \
+	  [ -z "$$RUST_TAG" ] || { echo "SEPIAOS_RUST_RELEASE=\"$$RUST_TAG\""; \
+	                          echo "SEPIAOS_RUST=\"$$RUST_VER\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -3112,6 +3401,8 @@ define assert_rootfs
 	         usr/include/stdio.h usr/include/linux/kd.h usr/lib/crt1.o usr/lib/crti.o \
 	         usr/lib/libc.a usr/lib/libm.a) \
 	         $(if $(MAKE_DEP),usr/bin/make usr/share/licenses/make/COPYING) \
+	         $(if $(RUST_DEP),usr/bin/rustc usr/bin/cargo \
+	         usr/share/licenses/rust/COPYRIGHT) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
@@ -3121,6 +3412,12 @@ define assert_rootfs
 	l=$$(readlink "$$r/lib/ld-musl-aarch64.so.1"); \
 	[ -f "$$r$$l" ] \
 	  || { echo "  FAIL     the loader points at $$l, which is not in the tree" >&2; exit 1; }; \
+	$(if $(RUST_DEP),\
+	ls $$r/usr/lib/librustc_driver-*.so >/dev/null 2>&1 \
+	  || { echo "  FAIL     no librustc_driver in the tree; usr/bin/rustc is a shim that loads it" >&2; exit 1; }; \
+	ls $$r/usr/lib/rustlib/aarch64-unknown-linux-musl/lib/libstd-*.rlib >/dev/null 2>&1 \
+	  || { echo "  FAIL     no Rust standard library in the tree" >&2; exit 1; }; \
+	,) \
 	$(if $(LLVM_DEP),\
 	[ -f "$$r/usr/bin/$$(readlink $$r/usr/bin/ld)" ] \
 	  || { echo "  FAIL     usr/bin/ld does not resolve to a linker in the tree" >&2; exit 1; }; \
@@ -3182,7 +3479,7 @@ rootfs-info: $(ROOTFS_STAMP) ## Show what was staged into the root filesystem
 # partway through libLLVM.so with the toolchain in. QEMU refuses any SD image
 # whose size is not a power of two, so 512 is the next rung rather than a
 # choice - it gives a 448 MiB root that lands about two thirds full.
-IMAGE_SIZE_MIB ?= $(if $(LLVM_DEP),512,256)
+IMAGE_SIZE_MIB ?= $(if $(RUST_DEP),2048,$(if $(LLVM_DEP),512,256))
 ROOTFS_LABEL   ?= sepiaos-root
 
 # Neither of the two settings above touches a file, and $(IMAGE) is named
@@ -3714,6 +4011,9 @@ help: ## Show this help
 	  "WIFI_TAG"          "pin a wifi release instead of taking the newest one" \
 	  "WIFI_REPO"         "where libnl and wpa_supplicant come from (default $(WIFI_REPO))" \
 	  "BRCM_VERSION"      "pin the Broadcom firmware package instead of the newest" \
+	  "WITH_RUST"         "ship the Rust toolchain, 725 MiB (default $(WITH_RUST))" \
+	  "RUST_TAG"          "pin a Rust release instead of taking the newest one" \
+	  "RUST_REPO"         "where the Rust toolchain comes from (default $(RUST_REPO))" \
 	  "WITH_LLVM"         "ship the on-device clang/lld toolchain (default $(WITH_LLVM))" \
 	  "LLVM_TAG"          "pin an LLVM release instead of taking the newest one" \
 	  "LLVM_REPO"         "where the toolchain comes from (default $(LLVM_REPO))" \
@@ -3760,6 +4060,8 @@ help: ## Show this help
 	@echo "  make WITH_LLVM=0 image                 without the toolchain, back to 256 MiB"
 	@echo "  make WITH_MAKE=0 image                 without GNU make on the card"
 	@echo "  make WITH_E2FSPROGS=0 image            without them, back to a cross-built resize2fs"
+	@echo "  make rust                              the newest Rust toolchain for the device"
+	@echo "  make WITH_RUST=0 image                 without Rust, and back to a 512 MiB card"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"
