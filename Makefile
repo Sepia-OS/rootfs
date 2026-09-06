@@ -2957,6 +2957,250 @@ define assert_rust_closure
 endef
 
 # ---------------------------------------------------------------------------
+# grit, from Sepia-OS/grit
+#
+# `Sepia-OS/grit` cross-builds grit - a Git implementation in Rust - and
+# publishes the binary with a `git` symlink beside it. That symlink is the
+# point: the card gains the command everyone's fingers already know.
+#
+# Structurally this is the llvm, make, e2fsprogs, wifi and rust steps again.
+# What is particular:
+#
+#   - The binary is *statically* linked, which nothing else this repository
+#     consumes is. It asks for no interpreter and needs no shared library at
+#     all, so the usual "aarch64, musl loader, libc.so and nothing else" check
+#     would fail on a perfectly good asset; grit-check asserts the absence of
+#     both instead, which is the stronger claim.
+#   - The asset carries a symlink that has to survive being unpacked, copied
+#     into the rootfs and then written into an ext4 image by mke2fs. It is
+#     relative - `git -> grit` - so it resolves at every one of those steps and
+#     on the card; an absolute one would resolve on the build host and dangle
+#     everywhere else.
+#
+# At 9.5 MiB it changes nothing about the image size, unlike the Rust toolchain
+# above.
+# ---------------------------------------------------------------------------
+
+WITH_GRIT ?= 1
+
+GRIT_REPO ?= Sepia-OS/grit
+
+# Pin a specific release, e.g. GRIT_TAG=v0.5.0. Empty means "resolve the newest
+# one", cached in build/grit/release.env like every other upstream version this
+# build takes. `make grit-update` moves it.
+GRIT_TAG  ?=
+
+DL_GRIT    := $(DL_DIR)/grit
+GRIT_DIR   := $(BUILD_DIR)/grit
+GRIT_ENV   := $(GRIT_DIR)/release.env
+GRIT_STAGE := $(GRIT_DIR)/stage
+GRIT_STAMP := $(GRIT_DIR)/.staged
+GRIT_CFG   := $(GRIT_DIR)/.config
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+GRIT_SIG    = $(GRIT_REPO)|$(GRIT_TAG)|$(GITHUB_API)|env1
+
+ifeq ($(WITH_GRIT),1)
+  GRIT_DEP := $(GRIT_STAMP)
+else
+  GRIT_DEP :=
+endif
+
+.PHONY: grit
+grit: $(GRIT_STAMP) ## Fetch, verify and unpack grit and its git symlink
+	@source $(GRIT_ENV); printf '  READY    grit %s (%s) -> %s\n' \
+	   "$${GRIT_VER:-?}" "$$GRIT_TAG" $(GRIT_STAGE)
+
+$(GRIT_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(GRIT_SIG)' | cmp -s - $@ || printf '%s\n' '$(GRIT_SIG)' > $@
+
+# The release body is mined the way every other one is: it states the version
+# verbatim as a table row, `| grit | `0.5.0` |`.
+$(GRIT_ENV): $(GRIT_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(GRIT_REPO) ($(if $(GRIT_TAG),pinned $(GRIT_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(GRIT_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(GRIT_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(GRIT_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(GRIT_REPO) has no release tagged '$(GRIT_TAG)'. Leave GRIT_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(GRIT_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(GRIT_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(GRIT_REPO) does not exist, or this token cannot see it. Build without" >&2; \
+	     echo "it using WITH_GRIT=0, or point GRIT_REPO at a repository that has cut" >&2; \
+	     echo "a release." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(GRIT_REPO) has published no release yet. Build without it using" >&2; \
+	     echo "WITH_GRIT=0, or pin one with GRIT_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *grit *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 { echo "GRIT_TAG='$$tag'"; \
+	   echo "GRIT_PRERELEASE='$$pre'"; \
+	   echo "GRIT_ASSET='$$ast'"; \
+	   echo "GRIT_ASSET_URL='$$asturl'"; \
+	   echo "GRIT_ASSET_ID='$$astid'"; \
+	   echo "GRIT_SUMS_URL='$$sumurl'"; \
+	   echo "GRIT_VER='$$ver'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^GRIT_TAG='\(.*\)'/  GRIT     \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it. The marker
+# is written only after VERIFY passes, so an interrupted download is refetched
+# rather than trusted.
+$(GRIT_STAMP): $(GRIT_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(GRIT_ENV); \
+	 d=$(DL_GRIT)/$$GRIT_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$GRIT_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$GRIT_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$GRIT_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$GRIT_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$GRIT_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$GRIT_ASSET"; \
+	   $(CURL) -o "$$d/$$GRIT_ASSET.part" "$$GRIT_ASSET_URL"; \
+	   mv -f "$$d/$$GRIT_ASSET.part" "$$d/$$GRIT_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$GRIT_ASSET"; \
+	 ( cd "$$d" && grep -F "$$GRIT_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$GRIT_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$GRIT_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$GRIT_ASSET -> $(GRIT_STAGE)"; \
+	 rm -rf $(GRIT_STAGE); mkdir -p $(GRIT_STAGE); \
+	 tar -xf "$$d/$$GRIT_ASSET" -C $(GRIT_STAGE)
+	@$(call assert_grit_stage)
+	@touch $@
+
+# Asked of the unpacked asset before any of it reaches the rootfs. Deliberately
+# uses nothing from the cross-toolchain - this step is a download. ELF byte 18
+# is e_machine, little-endian, and 0xb7 is AArch64.
+#
+# The symlink is the part worth checking hardest, because it is the part that
+# is easy to get wrong in a way nothing else notices: -L says it is a link,
+# readlink says it points at the bare name rather than an absolute path that
+# would dangle on the card, and -e says it resolves inside the asset. `git`
+# pointing at nothing is a card with no git and no error message.
+define assert_grit_stage
+	set -e; s=$(GRIT_STAGE); \
+	[ -x "$$s/usr/bin/grit" ] || { \
+	  echo "  FAIL     $$s/usr/bin/grit is missing - is this a SepiaOS grit asset?" >&2; exit 1; }; \
+	m=$$(od -An -tx1 -j 18 -N2 "$$s/usr/bin/grit" | tr -d ' \n'); \
+	[ "$$m" = "b700" ] || { \
+	  echo "  FAIL     usr/bin/grit has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	[ -L "$$s/usr/bin/git" ] || { \
+	  echo "  FAIL     usr/bin/git is not a symlink - that is the command the card gets typed at" >&2; exit 1; }; \
+	t=$$(readlink "$$s/usr/bin/git"); \
+	[ "$$t" = grit ] || { \
+	  echo "  FAIL     usr/bin/git points at '$$t', not the relative name grit" >&2; exit 1; }; \
+	[ -e "$$s/usr/bin/git" ] || { \
+	  echo "  FAIL     usr/bin/git points outside the asset" >&2; exit 1; }; \
+	[ -s "$$s/usr/share/licenses/grit/LICENSE" ] \
+	  || { echo "  FAIL     the asset carries no LICENSE; this ships somebody else's binary" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); grit is static and needs none" >&2; exit 1; }
+endef
+
+.PHONY: grit-update
+grit-update: ## Re-resolve the newest grit release and refetch
+	@rm -f $(GRIT_ENV)
+	@$(MAKE) --no-print-directory grit
+
+.PHONY: grit-tag
+grit-tag: $(GRIT_ENV) ## Print the grit release tag in use
+	@source $(GRIT_ENV); echo "$$GRIT_TAG"
+
+.PHONY: grit-info
+grit-info: $(GRIT_STAMP) ## Show the fetched grit release and what it contains
+	@source $(GRIT_ENV); \
+	 if [ "$$GRIT_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(GRIT_REPO)"; \
+	 echo "  tag      $$GRIT_TAG$$k$(if $(GRIT_TAG), (pinned))"; \
+	 echo "  asset    $$GRIT_ASSET"; \
+	 echo "  grit     $${GRIT_VER:-<not named in the release notes>}"; \
+	 echo "  staged   $(GRIT_STAGE) ($$(du -sk $(GRIT_STAGE) | cut -f1) KiB)"
+	@ls -l $(GRIT_STAGE)/usr/bin | sed 's|^|  bin      |'
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. The claim being checked is the opposite of every other package's:
+# grit is static, so what has to be true is that it asks for *no* interpreter
+# and needs *no* shared library. A grit that grew a DT_NEEDED would be a grit
+# that stops working the day something on the card moves.
+.PHONY: grit-check
+grit-check: $(GRIT_STAMP) $(TOOLCHAIN_DEP) ## Re-read grit: architecture, and that it really is static
+	@$(call assert_grit_stage)
+	@$(call assert_grit_static)
+
+define assert_grit_static
+	set -e; f=$(GRIT_STAGE)/usr/bin/grit; \
+	$(CROSS)readelf -h "$$f" | grep -q AArch64 \
+	  || { echo "  FAIL     usr/bin/grit is not aarch64" >&2; exit 1; }; \
+	! $(CROSS)readelf -l "$$f" | grep -q INTERP \
+	  || { echo "  FAIL     usr/bin/grit asks for an interpreter, so it is not static" >&2; exit 1; }; \
+	n=$$($(CROSS)readelf -d "$$f" 2>/dev/null | grep -c NEEDED || true); \
+	[ "$$n" = 0 ] \
+	  || { echo "  FAIL     usr/bin/grit needs $$n shared libraries, so it is not static" >&2; exit 1; }; \
+	echo "  OK       usr/bin/grit: aarch64, static, no interpreter and nothing needed"
+endef
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -3040,7 +3284,7 @@ KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 # LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same chain for the
 # other two) is a genuine file chain. Only the switches change the tree while
 # touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|WITH_GRIT=$(WITH_GRIT)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -3153,6 +3397,7 @@ $(ROOTFS_CFG): FORCE
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_STAMP) \
                  $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) $(RUST_DEP) \
+                 $(GRIT_DEP) \
                  $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
@@ -3174,6 +3419,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@$(call install_gnu_make)
 	@$(call install_e2fsprogs)
 	@$(call install_rust)
+	@$(call install_grit)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
@@ -3297,6 +3543,28 @@ endef
 # copy takes. There is nothing to add beside it - rustc finds its own sysroot
 # by walking up from /usr/bin/rustc - but it does need a linker to be useful,
 # and that is the clang from the toolchain above rather than anything here.
+# grit, on the same terms as everything else: a `usr/` tree copied in whole,
+# guarded from the inside by the switch, and refusing to overwrite anything
+# already in the tree.
+#
+# `cp -R` and not `cp`: the asset carries `usr/bin/git` as a symlink to `grit`,
+# and following it here would put a second 9.5 MiB copy of the binary on the
+# card under a different name. cp -R preserves it, mke2fs writes it into the
+# image as a symlink, and the card gets one binary with two names.
+define install_grit
+	set -e; \
+	[ -n '$(GRIT_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); g=$(abspath $(GRIT_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$g") <(names "$$(cd $$r && pwd)")); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     grit would overwrite files already in the tree:" >&2; \
+	  printf '           %s\n' $$c >&2; exit 1; }; \
+	cp -R "$$g"/. $$r/; \
+	printf '  GRIT     grit and the git link -> %s (%s KiB)\n' \
+	   "$$r" "$$(du -sk $$g | cut -f1)"
+endef
+
 define install_rust
 	set -e; \
 	[ -n '$(RUST_DEP)' ] || exit 0; \
@@ -3344,6 +3612,7 @@ define generate_etc
 	$(if $(E2FSPROGS_DEP),source $(E2FSPROGS_ENV);,E2FSPROGS_TAG=; E2FSPROGS_VERSION=;) \
 	$(if $(WIRELESS_DEP),source $(WIFI_ENV);,WIFI_TAG=; WPA_VER=;) \
 	$(if $(RUST_DEP),source $(RUST_ENV);,RUST_TAG=; RUST_VER=;) \
+	$(if $(GRIT_DEP),source $(GRIT_ENV);,GRIT_TAG=; GRIT_VER=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -3371,7 +3640,9 @@ define generate_etc
 	  [ -z "$$WIFI_TAG" ] || { echo "SEPIAOS_WIFI_RELEASE=\"$$WIFI_TAG\""; \
 	                           echo "SEPIAOS_WPA_SUPPLICANT=\"$$WPA_VER\""; }; \
 	  [ -z "$$RUST_TAG" ] || { echo "SEPIAOS_RUST_RELEASE=\"$$RUST_TAG\""; \
-	                          echo "SEPIAOS_RUST=\"$$RUST_VER\""; }; } > $$r/etc/os-release; \
+	                          echo "SEPIAOS_RUST=\"$$RUST_VER\""; }; \
+	  [ -z "$$GRIT_TAG" ] || { echo "SEPIAOS_GRIT_RELEASE=\"$$GRIT_TAG\""; \
+	                          echo "SEPIAOS_GRIT=\"$$GRIT_VER\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
@@ -3403,6 +3674,8 @@ define assert_rootfs
 	         $(if $(MAKE_DEP),usr/bin/make usr/share/licenses/make/COPYING) \
 	         $(if $(RUST_DEP),usr/bin/rustc usr/bin/cargo \
 	         usr/share/licenses/rust/COPYRIGHT) \
+	         $(if $(GRIT_DEP),usr/bin/grit usr/bin/git \
+	         usr/share/licenses/grit/LICENSE) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
@@ -3412,6 +3685,12 @@ define assert_rootfs
 	l=$$(readlink "$$r/lib/ld-musl-aarch64.so.1"); \
 	[ -f "$$r$$l" ] \
 	  || { echo "  FAIL     the loader points at $$l, which is not in the tree" >&2; exit 1; }; \
+	$(if $(GRIT_DEP),\
+	[ -L "$$r/usr/bin/git" ] \
+	  || { echo "  FAIL     usr/bin/git is a file rather than the symlink to grit" >&2; exit 1; }; \
+	[ "$$(readlink $$r/usr/bin/git)" = grit ] \
+	  || { echo "  FAIL     usr/bin/git does not point at grit" >&2; exit 1; }; \
+	,) \
 	$(if $(RUST_DEP),\
 	ls $$r/usr/lib/librustc_driver-*.so >/dev/null 2>&1 \
 	  || { echo "  FAIL     no librustc_driver in the tree; usr/bin/rustc is a shim that loads it" >&2; exit 1; }; \
@@ -4011,6 +4290,9 @@ help: ## Show this help
 	  "WIFI_TAG"          "pin a wifi release instead of taking the newest one" \
 	  "WIFI_REPO"         "where libnl and wpa_supplicant come from (default $(WIFI_REPO))" \
 	  "BRCM_VERSION"      "pin the Broadcom firmware package instead of the newest" \
+	  "WITH_GRIT"         "ship grit and the git symlink (default $(WITH_GRIT))" \
+	  "GRIT_TAG"          "pin a grit release instead of taking the newest one" \
+	  "GRIT_REPO"         "where grit comes from (default $(GRIT_REPO))" \
 	  "WITH_RUST"         "ship the Rust toolchain, 725 MiB (default $(WITH_RUST))" \
 	  "RUST_TAG"          "pin a Rust release instead of taking the newest one" \
 	  "RUST_REPO"         "where the Rust toolchain comes from (default $(RUST_REPO))" \
@@ -4062,6 +4344,8 @@ help: ## Show this help
 	@echo "  make WITH_E2FSPROGS=0 image            without them, back to a cross-built resize2fs"
 	@echo "  make rust                              the newest Rust toolchain for the device"
 	@echo "  make WITH_RUST=0 image                 without Rust, and back to a 512 MiB card"
+	@echo "  make grit                              the newest grit, and the git command"
+	@echo "  make WITH_GRIT=0 image                 without git on the card"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"

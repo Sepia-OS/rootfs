@@ -256,12 +256,36 @@ make rust-update                # move onto a newer one
 make WITH_RUST=0 image          # a 512 MiB card with no Rust on it
 ```
 
+### Retrieve grit, and the `git` command
+
+The latest release of https://github.com/Sepia-OS/grit shall be retrieved and
+unpacked into the root file system, so that a SepiaOS device has version
+control on it. `grit` is a Git implementation in Rust; the asset carries the
+binary and a **`git` symlink beside it**, so the command a card is actually
+going to be typed at does the right thing.
+
+It is **statically linked**, which nothing else on the card is: it asks for no
+interpreter and needs no shared library at all. `grit-check` asserts exactly
+that — the absence of both — where every other package is checked for the musl
+loader and a dependency on `libc.so`.
+
+At 9.5 MiB it changes nothing about the image size. `WITH_GRIT=0` leaves it
+out.
+
+```sh
+make grit                       # resolve, verify and unpack it
+make grit-info                  # which release, which version, how big
+make GRIT_TAG=v0.5.0 grit       # a specific release
+make grit-update                # move onto a newer one
+make WITH_GRIT=0 image          # a card with no git on it
+```
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
 populated with musl libc, busybox, the kernel modules, the LLVM toolchain, GNU
-make, the e2fsprogs filesystem tools and the Rust toolchain from the previous
-steps. The rootfs
+make, the e2fsprogs filesystem tools, the Rust toolchain and grit from the
+previous steps. The rootfs
 shall be created with `ext4` file system.
 
 The bootable image is created using the boot partition, musl libc and
@@ -443,9 +467,9 @@ the release workflow does not override any of them — so what is published is
 the same card every CI run builds and boots, rather than a configuration that
 is first exercised inside the release build itself. The `prerelease` input
 still selects the boot partition's channel and deliberately selects **no**
-channel for the six siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
-`musl_tag`, `wifi_tag` and `rust_tag` pin those the way `boot_tag` pins a boot
-partition. The release
+channel for the seven siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
+`musl_tag`, `wifi_tag`, `rust_tag` and `grit_tag` pin those the way `boot_tag`
+pins a boot partition. The release
 notes quote the LLVM, GNU make, e2fsprogs and musl versions out of the built
 tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 

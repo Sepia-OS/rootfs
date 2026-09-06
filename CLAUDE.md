@@ -43,6 +43,10 @@ gmake rust                              # fetch the Rust toolchain for the devic
 gmake rust-info                         # which release, which version, how big
 gmake rust-check                        # aarch64, loader, library closure
 gmake WITH_RUST=0 image                 # no Rust, and a 512 MiB card again
+gmake grit                              # fetch grit and the git symlink
+gmake grit-info                         # which release, which version, how big
+gmake grit-check                        # aarch64, and that it really is static
+gmake WITH_GRIT=0 image                 # a card with no git on it
 gmake rootfs                            # stage the FHS tree under build/rootfs
 gmake rootfs-info                       # size, file count, kernels it carries
 gmake image                             # build/image/sepiaos-<version>.img
@@ -357,7 +361,7 @@ Step 7 shapes step 6: the shipped image is sized to its contents, not to any par
 
 All eight steps of `README.md` are implemented. What is *not* here: nothing has been run on real hardware, so `config.txt`, device-tree auto-selection and overlays remain untested; there is no networking, no package management and no release/CI wiring (`dist/` is still empty and `.github/` has no workflow); and the image is not reproducible byte-for-byte, because mke2fs stamps a random filesystem UUID and the file timestamps come from the build.
 
-The sibling repositories live beside this one, and this one is the only one that *assembles* rather than produces: [../boot](../boot) (the FAT boot partition, and the closest model for the house style), [../musl](../musl) (the libc everything here links against), [../llvm](../llvm), [../make](../make), [../e2fsprogs](../e2fsprogs), [../wifi](../wifi) and [../rust-toolchain](../rust-toolchain) (the packages the card carries), plus [../spm](../spm) (the package manager, early). This repository consumes a published release from seven of them - `boot`, `musl`, `wifi`, `llvm`, `make`, `e2fsprogs` and `rust-toolchain` - and builds only busybox and the image itself.
+The sibling repositories live beside this one, and this one is the only one that *assembles* rather than produces: [../boot](../boot) (the FAT boot partition, and the closest model for the house style), [../musl](../musl) (the libc everything here links against), [../llvm](../llvm), [../make](../make), [../e2fsprogs](../e2fsprogs), [../wifi](../wifi), [../rust-toolchain](../rust-toolchain) and [../grit](../grit) (the packages the card carries), plus [../spm](../spm) (the package manager, early). This repository consumes a published release from eight of them - `boot`, `musl`, `wifi`, `llvm`, `make`, `e2fsprogs`, `rust-toolchain` and `grit` - and builds only busybox and the image itself.
 
 ## The Contract With the `boot` Repository
 
@@ -405,6 +409,15 @@ These are the facts the rootfs build has to match; all were read out of `../boot
 - **The closure check allows `libgcc_s.so.1` as well as the card's libc**, because upstream links its aarch64-musl build against it and ships it in the asset's own `usr/lib`. Every other `DT_NEEDED` has to be musl or a file in the asset.
 - **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-rust-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| rust | \`1.98.1\` |`, mined into `build/rust/release.env` and recorded as `SEPIAOS_RUST` beside `SEPIAOS_RUST_RELEASE`.
 - **It will never contain a libc or a loader**, like every other sibling asset; `assert_rust_stage` refuses one.
+
+## The Contract With the `grit` Repository
+
+`Sepia-OS/grit` cross-builds grit — a Git implementation in Rust — and publishes it with the `git` symlink the card is actually typed at. The fetch is `make`'s shape; what is particular:
+
+- **It is statically linked, and nothing else here is.** It asks for no interpreter and needs no shared library, so the family's usual check — musl loader, `DT_NEEDED` of `libc.so` and nothing else — would *fail* on a perfectly good asset. `assert_grit_static` asserts the absence of both instead, which is the stronger claim: there is nothing on the card it can fail to find.
+- **The asset carries a symlink that has to survive three copies**: out of the tarball, into `build/rootfs`, and into the ext4 image through `mke2fs -d`. It is relative (`git -> grit`), so it resolves at every step and on the card; an absolute one would resolve on the build host and dangle everywhere else. `install_grit` uses `cp -R`, which preserves it — plain `cp` would follow it and put a second 9.5 MiB copy of the binary on the card under a different name. `assert_rootfs` reads the link back out of the staged tree.
+- **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-grit-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| grit | \`0.5.0\` |`, mined into `build/grit/release.env` and recorded as `SEPIAOS_GRIT` beside `SEPIAOS_GRIT_RELEASE`.
+- **It ships `grit` alone**, not `grit-git`: the upstream workspace builds both, and upstream's own release asset for this target carries the one.
 
 ## The Contract With the `llvm` Repository
 

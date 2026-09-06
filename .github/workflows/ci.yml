@@ -141,6 +141,11 @@ jobs:
       - name: Resolve and fetch the Rust toolchain
         run: make rust
 
+      # And grit, which is what puts `git` on the card. 3 MiB, so it costs
+      # nothing next to the toolchain above.
+      - name: Resolve and fetch grit
+        run: make grit
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -169,6 +174,7 @@ jobs:
           make wifi-info
           make wireless-info
           make rust-info
+          make grit-info
           make modules-info
           make llvm-info
           make make-info
@@ -207,6 +213,11 @@ jobs:
       # ships), or a file in the asset.
       - name: Read the Rust toolchain back
         run: make rust-check
+
+      # The opposite claim to every other package's: grit is static, so what is
+      # checked is that it asks for *no* interpreter and needs nothing.
+      - name: Read grit back
+        run: make grit-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

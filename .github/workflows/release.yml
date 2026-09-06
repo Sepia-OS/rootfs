@@ -59,6 +59,11 @@ on:
         required: false
         default: ''
         type: string
+      grit_tag:
+        description: 'Pin a specific Sepia-OS/grit release instead of taking the newest one (optional). grit is what provides the git command.'
+        required: false
+        default: ''
+        type: string
 
 # One release at a time, and never cancelled halfway: a half-finished publish
 # would leave a branch, a tag or a release behind with nothing on it.
@@ -182,6 +187,8 @@ jobs:
       wifi_release: ${{ steps.facts.outputs.wifi_release }}
       rust: ${{ steps.facts.outputs.rust }}
       rust_release: ${{ steps.facts.outputs.rust_release }}
+      grit: ${{ steps.facts.outputs.grit }}
+      grit_release: ${{ steps.facts.outputs.grit_release }}
       llvm: ${{ steps.facts.outputs.llvm }}
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
       gnu_make: ${{ steps.facts.outputs.gnu_make }}
@@ -237,6 +244,9 @@ jobs:
       # CI builds and boots - which here also means the released image is 2 GiB
       # rather than 512 MiB.
       RUST_TAG: ${{ inputs.rust_tag }}
+      # grit, from Sepia-OS/grit - and with it the `git` command. WITH_GRIT is
+      # left at its default like every other switch.
+      GRIT_TAG: ${{ inputs.grit_tag }}
       # The filesystem tools, from Sepia-OS/e2fsprogs, on exactly the same
       # terms as GNU make: not through CHANNEL, a pin that does not decay, and
       # WITH_E2FSPROGS left at its default so the released card is the card CI
@@ -289,6 +299,9 @@ jobs:
 
       - name: Resolve and fetch the Rust toolchain
         run: make rust
+
+      - name: Resolve and fetch grit
+        run: make grit
 
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
@@ -345,6 +358,8 @@ jobs:
             echo "wifi_release=${SEPIAOS_WIFI_RELEASE}"
             echo "rust=${SEPIAOS_RUST}"
             echo "rust_release=${SEPIAOS_RUST_RELEASE}"
+            echo "grit=${SEPIAOS_GRIT}"
+            echo "grit_release=${SEPIAOS_GRIT_RELEASE}"
             echo "llvm=${SEPIAOS_LLVM}"
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "gnu_make=${SEPIAOS_MAKE}"
@@ -423,6 +438,8 @@ jobs:
           WIFI_RELEASE: ${{ needs.build.outputs.wifi_release }}
           RUST: ${{ needs.build.outputs.rust }}
           RUST_RELEASE: ${{ needs.build.outputs.rust_release }}
+          GRIT: ${{ needs.build.outputs.grit }}
+          GRIT_RELEASE: ${{ needs.build.outputs.grit_release }}
           LLVM: ${{ needs.build.outputs.llvm }}
           LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
           # Not MAKE: that name is GNU make's own, and exporting it into a
@@ -450,6 +467,7 @@ jobs:
           | musl | \`${MUSL}\` (\`${MUSL_RELEASE}\` from \`Sepia-OS/musl\`) |
           | wpa_supplicant | \`${WPA}\` (\`${WIFI_RELEASE}\` from \`Sepia-OS/wifi\`) |
           | rust | \`${RUST}\` (\`${RUST_RELEASE}\` from \`Sepia-OS/rust-toolchain\`) |
+          | grit | \`${GRIT}\` (\`${GRIT_RELEASE}\` from \`Sepia-OS/grit\`), as \`git\` |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
           | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
           | e2fsprogs | \`${E2FSPROGS}\` (\`${E2FSPROGS_RELEASE}\` from \`Sepia-OS/e2fsprogs\`) |
