@@ -3201,6 +3201,144 @@ define assert_grit_static
 endef
 
 # ---------------------------------------------------------------------------
+# The timezone database
+#
+# A card has to be able to say what time it is *here*, not only in UTC, and
+# first boot asks which zone it is in - so the zone files have to be on the
+# card to choose from. They come from Debian's `tzdata` package, unpacked the
+# same way the Broadcom firmware is: a .deb is an ar archive of two tarballs,
+# and `ar x` plus `tar` is all it takes.
+#
+# 260 KiB compressed, 1.9 MiB unpacked, 443 files. That is the whole database
+# rather than a selection, because the selection somebody wants is exactly the
+# one that would have been left out, and 1.9 MiB against a 2 GiB card is not a
+# trade worth thinking about.
+#
+# zone1970.tab is the file that matters as much as the zones themselves: it is
+# the canonical list - 312 real zones across nine regions, without the
+# backward-compatibility aliases that would otherwise offer somebody
+# "US/Pacific-New" - and it is what sepia-firstboot and sepia-time page
+# through. Without it there is a database and no way to pick from it.
+#
+# musl reads /etc/localtime when TZ is unset, which is why setting a zone here
+# is a symlink and nothing else: no profile edit, no environment variable, and
+# `date` in a script started by init gets the same answer as `date` at a login
+# prompt.
+# ---------------------------------------------------------------------------
+
+WITH_TZDATA ?= 1
+
+# Empty means "latest", resolved once from the pool index and cached like every
+# other version here. Debian's own archive, not the Raspberry Pi one: tzdata is
+# not a Pi package and the RPi pool does not carry it.
+TZDATA_VERSION ?=
+TZDATA_BASE    := https://deb.debian.org/debian/pool/main/t/tzdata
+
+TZDATA_DIR   := $(BUILD_DIR)/tzdata
+TZDATA_ENV   := $(TZDATA_DIR)/version.env
+TZDATA_CFG   := $(TZDATA_DIR)/.config
+TZDATA_STAGE := $(TZDATA_DIR)/stage
+TZDATA_STAMP := $(TZDATA_DIR)/.staged
+DL_TZDATA    := $(DL_DIR)/tzdata
+
+TZDATA_SIG    = $(TZDATA_VERSION)|$(TZDATA_BASE)
+
+ifeq ($(WITH_TZDATA),1)
+  TZDATA_DEP := $(TZDATA_STAMP)
+else
+  TZDATA_DEP :=
+endif
+
+.PHONY: tzdata
+tzdata: $(TZDATA_DEP) ## Fetch the timezone database for the card
+ifeq ($(WITH_TZDATA),1)
+	@source $(TZDATA_ENV); printf '  READY    tzdata %s -> %s (%s zones)\n' \
+	   "$$TZDATA_VER" $(TZDATA_STAGE) \
+	   "$$(awk '!/^#/ && NF' $(TZDATA_STAGE)/usr/share/zoneinfo/zone1970.tab | wc -l | tr -d ' ')"
+else
+	@echo "  SKIP     WITH_TZDATA=0: the card will only know UTC"
+endif
+
+$(TZDATA_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(TZDATA_SIG)' | cmp -s - $@ || printf '%s\n' '$(TZDATA_SIG)' > $@
+
+$(TZDATA_ENV): $(TZDATA_CFG)
+	@mkdir -p $(@D)
+	@echo "  RESOLVE  tzdata"
+	@set -e; \
+	 if [ -n '$(TZDATA_VERSION)' ]; then v='$(TZDATA_VERSION)'; else \
+	   v=$$($(CURL) "$(TZDATA_BASE)/" 2>/dev/null \
+	        | grep -oE 'tzdata_[0-9][^"]*_all\.deb' \
+	        | sed 's|^tzdata_||; s|_all\.deb$$||' | sort -uV | tail -1 || true); \
+	 fi; \
+	 [ -n "$$v" ] || { \
+	   echo "Could not resolve a tzdata version from $(TZDATA_BASE)/." >&2; \
+	   echo "Pin one with TZDATA_VERSION=, or build without it using WITH_TZDATA=0." >&2; \
+	   exit 1; }; \
+	 printf "TZDATA_VER='%s'\n" "$$v" > $@.part
+	@mv -f $@.part $@
+	@source $@; printf '  TZDATA   %s\n' "$$TZDATA_VER"
+
+# Only usr/share/zoneinfo is kept. The package also carries its changelog and
+# Debian's own maintainer scripts' worth of documentation, and the card has no
+# reader for either.
+#
+# zoneinfo/localtime is dropped as well: it is Debian's placeholder for the
+# symlink that /etc/localtime is, and a second one inside the database would
+# only be a thing to wonder about later.
+$(TZDATA_STAMP): $(TZDATA_ENV) Makefile
+	@source $(TZDATA_ENV); t=tzdata_$${TZDATA_VER}_all.deb; \
+	 $(call fetch_recorded,$(DL_TZDATA),$$t,$(TZDATA_BASE)/$$t,tzdata-$$TZDATA_VER); \
+	 x=$(TZDATA_DIR)/unpacked; \
+	 echo "  UNPACK   $$t"; \
+	 rm -rf $$x $(TZDATA_STAGE); mkdir -p $$x $(TZDATA_STAGE)/usr/share; \
+	 ( cd $$x && ar x $(abspath $(DL_TZDATA))/$$t data.tar.xz && tar -xf data.tar.xz ) || { \
+	   echo "  FAIL     could not unpack $$t" >&2; exit 1; }; \
+	 [ -d $$x/usr/share/zoneinfo ] || { \
+	   echo "  FAIL     $$t has no usr/share/zoneinfo" >&2; exit 1; }; \
+	 cp -R $$x/usr/share/zoneinfo $(TZDATA_STAGE)/usr/share/; \
+	 rm -f $(TZDATA_STAGE)/usr/share/zoneinfo/localtime; \
+	 printf '  ZONES    %s files, %s canonical zones -> %s\n' \
+	   "$$(find $(TZDATA_STAGE) -type f | wc -l | tr -d ' ')" \
+	   "$$(awk '!/^#/ && NF' $(TZDATA_STAGE)/usr/share/zoneinfo/zone1970.tab | wc -l | tr -d ' ')" \
+	   $(TZDATA_STAGE)
+	@$(call assert_tzdata)
+	@touch $@
+
+# What the picker needs, asked of the tree rather than of the package: the
+# canonical list, a zone named in it that really exists as a file, and UTC -
+# which is what a card falls back to and what /etc/localtime points at until
+# somebody chooses otherwise.
+define assert_tzdata
+	set -e; z=$(TZDATA_STAGE)/usr/share/zoneinfo; \
+	[ -s "$$z/zone1970.tab" ] || { \
+	  echo "  FAIL     no zone1970.tab - there would be nothing to page through" >&2; exit 1; }; \
+	[ -f "$$z/UTC" ] || { echo "  FAIL     no UTC zone" >&2; exit 1; }; \
+	[ -f "$$z/Europe/Berlin" ] || { \
+	  echo "  FAIL     no Europe/Berlin - the database looks incomplete" >&2; exit 1; }; \
+	n=$$(awk '!/^#/ && NF' "$$z/zone1970.tab" | wc -l | tr -d ' '); \
+	[ "$$n" -gt 100 ] || { \
+	  echo "  FAIL     only $$n zones in zone1970.tab" >&2; exit 1; }
+endef
+
+.PHONY: tzdata-info
+tzdata-info: $(TZDATA_DEP) ## Show the timezone database and what it covers
+ifeq ($(WITH_TZDATA),1)
+	@source $(TZDATA_ENV); echo "  version  $$TZDATA_VER"
+	@echo "  from     $(TZDATA_BASE)"
+	@echo "  staged   $(TZDATA_STAGE) ($$(du -sk $(TZDATA_STAGE) | cut -f1) KiB)"
+	@printf '  zones    %s canonical, %s files\n' \
+	   "$$(awk '!/^#/ && NF' $(TZDATA_STAGE)/usr/share/zoneinfo/zone1970.tab | wc -l | tr -d ' ')" \
+	   "$$(find $(TZDATA_STAGE) -type f | wc -l | tr -d ' ')"
+	@printf '  regions  %s\n' \
+	   "$$(awk '!/^#/ && NF {print $$3}' $(TZDATA_STAGE)/usr/share/zoneinfo/zone1970.tab \
+	      | cut -d/ -f1 | sort -u | tr '\n' ' ')"
+else
+	@echo "  WITH_TZDATA=0 - this image knows only UTC"
+endif
+
+# ---------------------------------------------------------------------------
 # Step 6, part 2 - the root filesystem tree
 #
 # build/rootfs is the Linux FHS tree that becomes partition 2: busybox and its
@@ -3284,7 +3422,7 @@ KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 # LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same chain for the
 # other two) is a genuine file chain. Only the switches change the tree while
 # touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|WITH_GRIT=$(WITH_GRIT)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|WITH_GRIT=$(WITH_GRIT)|WITH_TZDATA=$(WITH_TZDATA)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -3397,7 +3535,7 @@ $(ROOTFS_CFG): FORCE
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_STAMP) \
                  $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) $(RUST_DEP) \
-                 $(GRIT_DEP) \
+                 $(GRIT_DEP) $(TZDATA_DEP) \
                  $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
@@ -3420,6 +3558,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@$(call install_e2fsprogs)
 	@$(call install_rust)
 	@$(call install_grit)
+	@$(if $(TZDATA_DEP),cp -R $(TZDATA_STAGE)/. $(ROOTFS_DIR)/,:)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
 	@cp -R $(OVERLAY)/. $(ROOTFS_DIR)/
@@ -3427,7 +3566,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@chmod 0755 $(ROOTFS_DIR) $(ROOTFS_DIR)/etc/init.d/rcS $(ROOTFS_DIR)/etc/init.d/rcK \
 	            $(ROOTFS_DIR)/usr/sbin/sepia-gettys $(ROOTFS_DIR)/usr/sbin/sepia-firstboot \
 	            $(if $(E2FS_TGT_DEP),$(ROOTFS_DIR)/usr/sbin/resize2fs) $(ROOTFS_DIR)/usr/bin/sepia-keymap \
-	            $(ROOTFS_DIR)/usr/sbin/sepia-network \
+	            $(ROOTFS_DIR)/usr/sbin/sepia-network $(ROOTFS_DIR)/usr/sbin/sepia-time \
 	            $(ROOTFS_DIR)/usr/share/udhcpc/default.script
 	@$(if $(WIRELESS_DEP),chmod 0755 $(ROOTFS_DIR)/usr/sbin/wpa_supplicant $(ROOTFS_DIR)/usr/sbin/wpa_cli $(ROOTFS_DIR)/usr/sbin/wpa_passphrase,:)
 	@chmod 0700 $(ROOTFS_DIR)/root
@@ -3600,6 +3739,17 @@ define install_e2fsprogs
 	   "$$r" "$$(du -sk $$e | cut -f1)" "$$(echo $$c | wc -w | tr -d ' ')"
 endef
 
+# /etc/sepia-build-date is the clock's floor, in seconds since the epoch. A Pi
+# has no battery-backed clock, so the card boots at 1970 unless something says
+# otherwise - and every TLS certificate is "not valid before" a date after
+# that, so an unset clock means no HTTPS at all. sepia-time reads this at boot
+# and sets the clock forward if it is behind: an image cannot be running before
+# it was built. It is a floor rather than the time, and ntpd replaces it with
+# the real thing once there is a network.
+#
+# It is also one more reason the image is not byte-reproducible, alongside the
+# random filesystem UUID mke2fs stamps into it.
+#
 # fstab names the boot partition so `mount /boot` in rcS has something to read,
 # and the swap line is appended by sepia-firstboot once the partition exists.
 # The root entry is documentation and a fsck order: the kernel has already
@@ -3644,6 +3794,9 @@ define generate_etc
 	  [ -z "$$GRIT_TAG" ] || { echo "SEPIAOS_GRIT_RELEASE=\"$$GRIT_TAG\""; \
 	                          echo "SEPIAOS_GRIT=\"$$GRIT_VER\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
+	date +%s > $$r/etc/sepia-build-date; \
+	echo UTC > $$r/etc/timezone; \
+	$(if $(TZDATA_DEP),ln -sf /usr/share/zoneinfo/UTC $$r/etc/localtime;,) \
 	: > $$r/etc/sepiaos-password-unchanged
 endef
 
@@ -3665,6 +3818,9 @@ define assert_rootfs
 	         etc/passwd etc/shadow usr/bin/sepia-keymap \
 	         usr/share/keymaps/english_us.kmap \
 	         etc/network.conf usr/sbin/sepia-network sbin/udhcpc \
+	         usr/sbin/sepia-time usr/sbin/ntpd etc/sepia-build-date etc/timezone \
+	         $(if $(TZDATA_DEP),usr/share/zoneinfo/zone1970.tab usr/share/zoneinfo/UTC \
+	         etc/localtime) \
 	         $(if $(WIRELESS_DEP),usr/sbin/wpa_supplicant usr/sbin/wpa_passphrase \
 	         usr/lib/libnl-3.so.200 \
 	         lib/firmware/brcm/brcmfmac43455-sdio.bin) \
@@ -4291,6 +4447,8 @@ help: ## Show this help
 	  "WIFI_REPO"         "where libnl and wpa_supplicant come from (default $(WIFI_REPO))" \
 	  "BRCM_VERSION"      "pin the Broadcom firmware package instead of the newest" \
 	  "WITH_GRIT"         "ship grit and the git symlink (default $(WITH_GRIT))" \
+	  "WITH_TZDATA"       "ship the timezone database, 1.9 MiB (default $(WITH_TZDATA))" \
+	  "TZDATA_VERSION"    "pin a tzdata release instead of taking the newest one" \
 	  "GRIT_TAG"          "pin a grit release instead of taking the newest one" \
 	  "GRIT_REPO"         "where grit comes from (default $(GRIT_REPO))" \
 	  "WITH_RUST"         "ship the Rust toolchain, 725 MiB (default $(WITH_RUST))" \
@@ -4346,6 +4504,8 @@ help: ## Show this help
 	@echo "  make WITH_RUST=0 image                 without Rust, and back to a 512 MiB card"
 	@echo "  make grit                              the newest grit, and the git command"
 	@echo "  make WITH_GRIT=0 image                 without git on the card"
+	@echo "  make tzdata                            the timezone database first boot picks from"
+	@echo "  make WITH_TZDATA=0 image               a card that knows only UTC"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
 	@echo "  make test                              boot it under QEMU and check it works"
 	@echo "  make boot-check                        just the boot to a login prompt"

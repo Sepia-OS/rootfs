@@ -1,7 +1,7 @@
 #!/bin/sh
-# Set this machine up, once: ask what it should do about networking and which
-# keyboard it has, then grow the root filesystem into the storage device and
-# add swap.
+# Set this machine up, once: ask what it should do about networking, which
+# keyboard it has and which timezone it is in, then grow the root filesystem
+# into the storage device and add swap.
 #
 # This runs in two passes with a reboot between them, and that is a constraint
 # rather than a choice: the kernel will not re-read a partition table while one
@@ -23,6 +23,8 @@ SETUP=$STATE/setup-done
 KEYMAP_DIR=/usr/share/keymaps
 NETWORK=/usr/sbin/sepia-network
 KEYMAP=/usr/bin/sepia-keymap
+TIME=/usr/sbin/sepia-time
+ZONETAB=/usr/share/zoneinfo/zone1970.tab
 
 # How long to wait for an answer. The first question is the one that finds out
 # whether anybody is there: if it goes unanswered the rest are not asked at all,
@@ -190,6 +192,91 @@ ask_password() {
 	return 0
 }
 
+# Two levels, and that is not decoration: there are 312 canonical zones, which
+# at twenty to a page is sixteen pages of Enter to reach Europe/Berlin. Picking
+# the region first turns that into one screen and then two pages.
+#
+# The regions come from the same table the zones do, so a tzdata release that
+# adds or drops one needs nothing here. UTC is offered explicitly as 0, because
+# it is both a real answer and what the card already is - somebody who wants it
+# should not have to find "Etc/UTC" in a list to say so.
+ask_timezone() {
+	[ -r "$ZONETAB" ] || { say "no timezone database installed to choose from"; return 0; }
+	current=$($TIME zone 2>/dev/null || echo UTC)
+
+	regions=$(awk '!/^#/ && NF { print $3 }' "$ZONETAB" | cut -d/ -f1 | sort -u)
+	[ -n "$regions" ] || { say "the timezone table is empty"; return 0; }
+	rtotal=$(printf '%s\n' $regions | wc -l | tr -d ' ')
+
+	out ""
+	out "  Timezone (now $current)"
+	out "$(printf '    %3d) %s' 0 'UTC - leave it as it is')"
+	i=0
+	for r in $regions; do
+		i=$((i + 1))
+		out "$(printf '    %3d) %s' "$i" "$r")"
+	done
+	outn "  Choose a region 0-$rtotal, or Enter to keep $current: "
+	answer=$(ask "$NEXT_WAIT") || answer=
+
+	case "$answer" in
+		'') say "timezone: unchanged ($current)"; return 0 ;;
+		0) $TIME zone UTC >/dev/null 2>&1 && say "timezone: UTC"; return 0 ;;
+		*[!0-9]*) say "timezone: unchanged ($current)"; return 0 ;;
+	esac
+	if [ "$answer" -lt 1 ] || [ "$answer" -gt "$rtotal" ]; then
+		say "timezone: $answer is not one of 0-$rtotal, leaving it unchanged"
+		return 0
+	fi
+	region=$(printf '%s\n' $regions | sed -n "${answer}p")
+
+	zones=$(awk -v r="$region/" '!/^#/ && NF && index($3, r) == 1 { print $3 }' "$ZONETAB" | sort)
+	total=$(printf '%s\n' $zones | wc -l | tr -d ' ')
+
+	# Paged exactly as the keyboard question is: Enter takes the next page and
+	# wraps, a number picks that zone, anything else keeps what is configured.
+	PAGE=20
+	first=1
+	while :; do
+		out ""
+		out "  Timezone - $region"
+		i=0
+		for z in $zones; do
+			i=$((i + 1))
+			if [ "$i" -ge "$first" ] && [ "$i" -lt $((first + PAGE)) ]; then
+				out "$(printf '    %3d) %s' "$i" "${z#*/}")"
+			fi
+		done
+		last=$((first + PAGE - 1))
+		[ "$last" -gt "$total" ] && last=$total
+		outn "$(printf '  %d-%d of %d. Choose a number, Enter for more, k to keep %s: ' \
+			"$first" "$last" "$total" "$current")"
+		answer=$(ask "$NEXT_WAIT") || answer=
+
+		case "$answer" in
+			'')
+				first=$((first + PAGE))
+				[ "$first" -gt "$total" ] && first=1
+				continue
+				;;
+			*[!0-9]*) say "timezone: unchanged ($current)"; return 0 ;;
+		esac
+		break
+	done
+
+	if [ "$answer" -lt 1 ] || [ "$answer" -gt "$total" ]; then
+		say "timezone: $answer is not one of 1-$total, leaving it unchanged"
+		return 0
+	fi
+	name=$(printf '%s\n' $zones | sed -n "${answer}p")
+	if $TIME zone "$name" >/dev/null 2>&1; then
+		say "timezone: $name"
+	else
+		say "timezone: could not set $name, leaving it at $current"
+	fi
+	return 0
+}
+
 ask_keymap() {
 	# Read from the directory rather than from `sepia-keymap list`: that is
 	# where the tool itself looks, and it cannot be misparsed the way its
@@ -285,7 +372,7 @@ setup() {
 	out ""
 	out "SepiaOS first boot. A few questions, then it carries on by itself."
 	if ! ask_network; then
-		say "no answer; keeping the defaults - ethernet on DHCP, keyboard unchanged"
+		say "no answer; keeping the defaults - ethernet on DHCP, keyboard and timezone unchanged"
 		touch "$SETUP"
 		restore_printk
 		exec 3>&-
@@ -293,6 +380,11 @@ setup() {
 	fi
 	ask_password
 	ask_keymap
+	# Last of the four, and after the network on purpose: nothing here needs
+	# one, but a card that has just been told it has no network is a card
+	# whose clock will only ever be the build date, and the zone still decides
+	# what `date` prints.
+	ask_timezone
 	out ""
 
 	touch "$SETUP"

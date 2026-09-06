@@ -303,6 +303,8 @@ shall be saved for the system:
   country code.
 - which console keymap to use, chosen by number from a list of every keymap
   installed on the image.
+- which timezone it is in, chosen by region and then by city from the timezone
+  database on the card. Both lists are paged.
 
 The questions are asked on the screen, since answering them needs a keyboard: a
 board booting to a serial console keeps the defaults (ethernet on DHCP, and
@@ -535,6 +537,94 @@ an image that carries none of it is a reasonable thing to want.
 
 The country code is passed to the supplicant as `country=`. Without one the
 radio is held to the channels that are legal everywhere.
+
+### The clock
+
+A Raspberry Pi has **no battery-backed clock**, so nothing on the board
+remembers the time while the power is off. Left alone the card boots at 1
+January 1970, and that is not cosmetic: every TLS certificate on the internet
+is "not valid before" some date after 1970, so an unset clock means no HTTPS at
+all — `grit clone https://…` fails, and so does anything else that talks to a
+server.
+
+`/usr/sbin/sepia-time up` runs from `rcS` **immediately after the network comes
+up**, and does two things:
+
+- **The floor.** `/etc/sepia-build-date` holds the moment the image was built.
+  If the clock reads earlier than that it is set forward, because an image
+  cannot be running before it was made. This needs no network and no waiting,
+  and it is what makes the *first* boot able to talk HTTPS.
+- **ntpd.** busybox's, started in the background as a daemon rather than a
+  one-shot — a board with no RTC also has no way to keep time across a long
+  uptime. Nothing waits for it: a time server that does not answer must not
+  hold up the login prompt.
+
+It is configured in `/etc/network.conf` beside the interfaces:
+
+```sh
+NTP="on"                      # or off
+NTP_SERVERS="pool.ntp.org"    # space separated
+```
+
+```sh
+sepia-time status      # the clock, the zone, and whether ntpd is running
+sepia-time sync        # ask a time server now, and wait for the answer
+sepia-time floor       # just the build-date floor
+```
+
+### The timezone
+
+**Nothing can work this out for the card.** NTP carries UTC and no zone at all;
+a Pi has no RTC and QEMU emulates none, so there is nothing on the board to
+remember one; DHCP *can* carry a zone (RFC 4833 options 100 and 101) and
+essentially no router sends them; and IP geolocation means trusting a
+third-party service with the device's address at every boot. So the card is
+asked, once, and told otherwise afterwards.
+
+**First boot asks it**, as the fourth of its questions, from the timezone
+database on the card — `tzdata`, unpacked from Debian's package the same way
+the Broadcom firmware is: 1.9 MiB, 312 canonical zones from
+`zone1970.tab`, which is the list without the backward-compatibility aliases.
+
+The question is **two levels**, and that is not decoration: 312 zones at twenty
+to a page is sixteen pages of Enter to reach `Europe/Berlin`. Picking the
+region first turns that into one screen and then two pages.
+
+```
+  Timezone (now UTC)
+      0) UTC - leave it as it is
+      1) Africa
+      2) America
+      ...
+  Choose a region 0-9, or Enter to keep UTC:
+
+  Timezone - Europe
+      1) Amsterdam
+      2) Andorra
+      ...
+  1-20 of 38. Choose a number, Enter for more, k to keep UTC:
+```
+
+Enter takes the next page and wraps round, so it is never a dead end — the same
+behaviour the keyboard question has. A board with no screen keeps UTC.
+
+Afterwards:
+
+```sh
+sepia-time zone                 # what it is now
+sepia-time zone Europe/Berlin   # set it
+sepia-time zones                # the regions
+sepia-time zones Europe         # that region, a page at a time
+```
+
+Setting a zone is a symlink at `/etc/localtime` and the name in
+`/etc/timezone`, and nothing else: musl reads `/etc/localtime` when `TZ` is
+unset, so `date` in a script started by init gives the same answer as `date` at
+a login prompt. `WITH_TZDATA=0` leaves the database out and the card knows only
+UTC.
+
+`status` says plainly when the time is still only the build date — TLS works,
+but the clock is not yet right.
 
 ```sh
 make wireless          # the wifi package and the firmware together

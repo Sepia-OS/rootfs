@@ -38,6 +38,17 @@ swapon -a 2>/dev/null
 # in the background, rather than holding the login prompt up behind it.
 /usr/sbin/sepia-network up
 
+# The clock, and it has to be after the network because half of it needs one.
+# A Pi has no battery-backed clock, so without this the card boots at the
+# epoch - and every TLS certificate on the internet is "not valid before" a
+# date after 1970, which means no HTTPS at all: `grit clone https://...`
+# fails, and so does anything else that talks to a server.
+#
+# Two halves: the clock is set forward to the image's build date if it is
+# behind it, which needs no network and is what makes the first boot work, and
+# then ntpd is started in the background. Nothing waits for a time server.
+/usr/sbin/sepia-time up
+
 # Before the getty, so the first thing typed at the login prompt is already in
 # the configured layout. Silent when there is no screen attached.
 /usr/bin/sepia-keymap apply

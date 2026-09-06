@@ -1,0 +1,304 @@
+#!/bin/sh
+# The clock: making it right, and keeping it right.
+#
+# A Raspberry Pi has no battery-backed clock. Nothing on the board remembers
+# what time it was while the power was off, so every boot starts at whatever
+# the kernel decided - which is the epoch, 1 January 1970, unless something
+# tells it otherwise. That is not a cosmetic problem:
+#
+#   - Every TLS certificate on the internet has a "not valid before" date, and
+#     all of them are after 1970. A card with the wrong clock cannot complete
+#     an HTTPS handshake at all, so `grit clone https://...` fails, and so does
+#     anything else that talks to a server.
+#   - Files get timestamps from 1970, which makes `make` and anything else
+#     comparing mtimes behave strangely for as long as the clock is wrong.
+#
+# Two mechanisms, in this order, because they answer two different questions:
+#
+#   1. The floor. /etc/sepia-build-date holds the moment this image was built,
+#      as seconds since the epoch. If the clock reads earlier than that, the
+#      clock is wrong - an image cannot be running before it was made - so it
+#      is set forward to the build date. That costs no network and no waiting,
+#      and it is what makes TLS work on the first boot of a card that has
+#      never seen a time server. It is a floor and not the time: the card
+#      thinks it is the moment the image was built until something better
+#      arrives.
+#
+#   2. ntpd. busybox's, started after the network is up, as a daemon rather
+#      than a one-shot: a board with no RTC also has no way to keep time
+#      across a long uptime, so this is a thing to keep running rather than
+#      run once. It steps the clock when it starts and slews it afterwards.
+#
+# The daemon is started in the background and nothing waits for it. A time
+# server that does not answer must not hold up the login prompt - the same
+# rule sepia-network works to.
+
+set -u
+
+CONF=/etc/network.conf
+FLOOR=/etc/sepia-build-date
+RUNDIR=/run/sepia-time
+PIDFILE=$RUNDIR/ntpd.pid
+
+# The zone, which is a separate question from the time. musl reads
+# /etc/localtime when TZ is unset, so setting a zone is a symlink and nothing
+# else: no profile edit and no environment variable, which is what makes `date`
+# in a script started by init agree with `date` at a login prompt.
+#
+# /etc/timezone holds the name in plain text beside it, because a symlink can
+# be read but not asked "what are you called" - and the name is what a person
+# and `status` both want.
+ZONEINFO=/usr/share/zoneinfo
+LOCALTIME=/etc/localtime
+TZNAME=/etc/timezone
+ZONETAB=$ZONEINFO/zone1970.tab
+
+# Where to ask, when /etc/network.conf names nobody. pool.ntp.org resolves to
+# whichever servers are near, which is the right default for a device that
+# could be anywhere.
+NTP_DEFAULT="pool.ntp.org"
+
+self=${0##*/}
+
+die()  { echo "$self: $*" >&2; exit 1; }
+note() { echo "$self: $*"; }
+
+usage() {
+	cat <<USAGE
+usage: $self <command>
+
+  status        what the clock says, the zone, and whether ntpd is running
+  floor         set the clock forward to the build date if it is behind it
+  up            floor, then start ntpd (this is what boot runs)
+  sync          ask a time server now and wait for the answer
+  stop          stop ntpd
+  zone          print the configured zone
+  zone <name>   set it, e.g. $self zone Europe/Berlin
+  zones         list the regions
+  zones <region>  list that region's zones, a page at a time
+
+Configured in $CONF:
+
+  NTP="on"                  on or off
+  NTP_SERVERS="a b c"       space separated; default $NTP_DEFAULT
+USAGE
+}
+
+read_conf() {
+	NTP="on"
+	NTP_SERVERS=""
+	# shellcheck disable=SC1090
+	[ -r "$CONF" ] && . "$CONF"
+	[ -n "$NTP_SERVERS" ] || NTP_SERVERS=$NTP_DEFAULT
+}
+
+# The build date, as seconds since the epoch, or nothing if the file is absent
+# or does not hold a number. Absent is not an error: an image built before this
+# file existed still boots, it just has no floor to stand on.
+build_date() {
+	[ -r "$FLOOR" ] || return 0
+	read -r d _ < "$FLOOR" 2>/dev/null || return 0
+	case "$d" in
+		''|*[!0-9]*) return 0;;
+		*) echo "$d";;
+	esac
+}
+
+# `date -s @<epoch>` is the busybox spelling that takes a plain number. The
+# comparison is done in the shell rather than by handing both to date, because
+# the whole point of this function is that date cannot be trusted yet.
+apply_floor() {
+	b=$(build_date)
+	[ -n "$b" ] || return 0
+	now=$(date +%s)
+	if [ "$now" -lt "$b" ]; then
+		date -s "@$b" > /dev/null 2>&1 \
+			|| { note "could not set the clock to the build date"; return 1; }
+		note "clock was behind the build date; set to $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+	fi
+	return 0
+}
+
+ntpd_pid() {
+	[ -r "$PIDFILE" ] || return 1
+	read -r p _ < "$PIDFILE" 2>/dev/null || return 1
+	[ -n "$p" ] && [ -d "/proc/$p" ] || return 1
+	echo "$p"
+}
+
+start_ntpd() {
+	read_conf
+	case "$NTP" in
+		on|dhcp|yes|1) ;;
+		*) note "NTP is off in $CONF"; return 0;;
+	esac
+
+	command -v ntpd > /dev/null 2>&1 || { note "no ntpd on this system"; return 1; }
+
+	if ntpd_pid > /dev/null; then
+		note "ntpd is already running"
+		return 0
+	fi
+
+	mkdir -p "$RUNDIR"
+
+	# -p once per server, which is how busybox ntpd takes them. -N asks for
+	# the higher scheduling priority a clock daemon wants. No -n: it
+	# daemonises, and nothing here waits for it.
+	set --
+	for s in $NTP_SERVERS; do set -- "$@" -p "$s"; done
+
+	if ntpd -N "$@" > /dev/null 2>&1; then
+		# busybox ntpd writes no pidfile of its own, so its pid is found the
+		# same way anything else here finds a daemon it started.
+		pidof ntpd > "$PIDFILE" 2>/dev/null || true
+		note "ntpd started ($NTP_SERVERS)"
+	else
+		note "ntpd would not start"
+		return 1
+	fi
+	return 0
+}
+
+stop_ntpd() {
+	p=$(ntpd_pid) || { note "ntpd is not running"; return 0; }
+	kill "$p" 2>/dev/null || true
+	rm -f "$PIDFILE"
+	note "ntpd stopped"
+}
+
+# The blocking form, for a person at a prompt who wants the clock right now
+# rather than in a minute. -q makes busybox ntpd set the clock and exit; -n
+# keeps it in the foreground so the wait means something.
+sync_now() {
+	read_conf
+	command -v ntpd > /dev/null 2>&1 || die "no ntpd on this system"
+	set --
+	for s in $NTP_SERVERS; do set -- "$@" -p "$s"; done
+	note "asking $NTP_SERVERS"
+	if ntpd -n -q -N "$@"; then
+		note "clock set to $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+	else
+		die "no time server answered"
+	fi
+}
+
+# The canonical list, from the table rather than from the directory: the
+# directory also holds the backward-compatibility aliases, and offering
+# somebody "US/Pacific-New" as a choice would be offering them a name upstream
+# keeps only so that old configurations do not break.
+zones_in() {
+	[ -r "$ZONETAB" ] || return 1
+	if [ -n "${1:-}" ]; then
+		awk -v r="$1/" '!/^#/ && NF && index($3, r) == 1 { print $3 }' "$ZONETAB" | sort
+	else
+		awk '!/^#/ && NF { print $3 }' "$ZONETAB" | sort
+	fi
+}
+
+regions() { zones_in | cut -d/ -f1 | sort -u; }
+
+current_zone() {
+	if [ -r "$TZNAME" ]; then
+		read -r z _ < "$TZNAME" 2>/dev/null && [ -n "$z" ] && { echo "$z"; return 0; }
+	fi
+	# No name recorded: read it back off the symlink, which is where the
+	# system actually looks.
+	if [ -L "$LOCALTIME" ]; then
+		l=$(readlink "$LOCALTIME")
+		case "$l" in "$ZONEINFO"/*) echo "${l#"$ZONEINFO"/}"; return 0;; esac
+	fi
+	echo UTC
+}
+
+set_zone() {
+	z=$1
+	[ -d "$ZONEINFO" ] || die "no timezone database on this system ($ZONEINFO)"
+	# A name rather than a path: no leading slash, no dots, nothing that would
+	# point the symlink outside the database.
+	case "$z" in
+		''|/*|*..*|*' '*) die "'$z' is not a zone name";;
+	esac
+	[ -f "$ZONEINFO/$z" ] || die "no such zone: $z (try '$self zones')"
+	ln -sf "$ZONEINFO/$z" "$LOCALTIME" || die "could not set $LOCALTIME"
+	echo "$z" > "$TZNAME" || die "could not write $TZNAME"
+	note "timezone: $z, now and on every boot"
+	note "it is $(date '+%Y-%m-%d %H:%M:%S %Z') here"
+}
+
+# Paged for the same reason sepia-keymap's list is: America alone has 121
+# zones and a VT cannot be scrolled back. Skipped entirely when stdout is not
+# a terminal, so `sepia-time zones Europe | grep Berlin` keeps working.
+list_zones() {
+	region=${1:-}
+	if [ -z "$region" ]; then
+		regions
+		return 0
+	fi
+	all=$(zones_in "$region")
+	[ -n "$all" ] || die "no zones in '$region' (try '$self zones' for the regions)"
+	total=$(printf '%s\n' "$all" | wc -l | tr -d ' ')
+	current=$(current_zone)
+
+	page=0
+	if [ -t 1 ] && exec 4</dev/tty 2>/dev/null; then
+		rows=$(stty size 2>/dev/null | cut -d' ' -f1)
+		case "$rows" in ''|*[!0-9]*) rows=24;; esac
+		[ "$rows" -gt 6 ] || rows=24
+		page=$((rows - 3))
+	fi
+
+	shown=0
+	for z in $all; do
+		mark=" "
+		[ "$z" = "$current" ] && mark="*"
+		echo "$mark $z"
+		shown=$((shown + 1))
+		if [ "$page" -gt 0 ] && [ "$shown" -lt "$total" ] \
+		   && [ $((shown % page)) -eq 0 ]; then
+			printf -- '-- %d of %d -- Enter for more, q to stop: ' "$shown" "$total"
+			read -r reply <&4 || { echo; break; }
+			case "$reply" in [qQ]*) break;; esac
+		fi
+	done
+	[ "$page" -gt 0 ] && exec 4<&-
+	return 0
+}
+
+status() {
+	read_conf
+	echo "  now       $(date '+%Y-%m-%d %H:%M:%S %Z')"
+	echo "  utc       $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+	echo "  zone      $(current_zone)$([ -d "$ZONEINFO" ] || echo '  (no database installed)')"
+	b=$(build_date)
+	if [ -n "$b" ]; then
+		echo "  built     $(date -u -d "@$b" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date -u -r "$b" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "@$b")"
+	else
+		echo "  built     unrecorded ($FLOOR is missing)"
+	fi
+	echo "  ntp       $NTP"
+	echo "  servers   $NTP_SERVERS"
+	if p=$(ntpd_pid); then
+		echo "  ntpd      running (pid $p)"
+	else
+		echo "  ntpd      not running"
+	fi
+	# A clock still at or before the build date has not been set by anything
+	# other than the floor, which is worth saying plainly: TLS will work, but
+	# the time is not the time.
+	if [ -n "$b" ] && [ "$(date +%s)" -le "$((b + 60))" ]; then
+		echo "  note      no time server has answered yet; this is the build date"
+	fi
+}
+
+case "${1:-status}" in
+	status)      status;;
+	zone)        if [ $# -ge 2 ]; then set_zone "$2"; else current_zone; fi;;
+	zones)       list_zones "${2:-}";;
+	floor)       apply_floor;;
+	up)          apply_floor; start_ntpd;;
+	sync)        sync_now;;
+	stop)        stop_ntpd;;
+	-h|--help|help) usage;;
+	*)           usage >&2; exit 2;;
+esac
