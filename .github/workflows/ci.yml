@@ -146,6 +146,12 @@ jobs:
       - name: Resolve and fetch grit
         run: make grit
 
+      # The editor: 15 MiB compressed and 216 MiB unpacked, nearly all of it
+      # tree-sitter grammars. It is why a card *without* the Rust toolchain is
+      # 1 GiB rather than 512 MiB; with Rust on, 2 GiB already covered it.
+      - name: Resolve and fetch helix
+        run: make helix
+
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
 
@@ -218,6 +224,14 @@ jobs:
       # checked is that it asks for *no* interpreter and needs nothing.
       - name: Read grit back
         run: make grit-check
+
+      # hx and all 245 grammars: aarch64, the musl loader, and every library
+      # named is either the card's musl or one of the two the LLVM package
+      # puts there. Every grammar is read rather than one of them - twelve have
+      # C++ scanners and need libstdc++ where the other 233 do not, so no
+      # single grammar can speak for the set.
+      - name: Read helix back
+        run: make helix-check
 
       # The README asks for smoke tests on these four boards; this is that step.
       # One image, booted as each of them, checked all the way to a login prompt.

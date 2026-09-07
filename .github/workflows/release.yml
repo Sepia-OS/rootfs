@@ -64,6 +64,11 @@ on:
         required: false
         default: ''
         type: string
+      helix_tag:
+        description: 'Pin a specific Sepia-OS/helix release instead of taking the newest one (optional). This is the editor - 216 MiB on the card.'
+        required: false
+        default: ''
+        type: string
 
 # One release at a time, and never cancelled halfway: a half-finished publish
 # would leave a branch, a tag or a release behind with nothing on it.
@@ -189,6 +194,8 @@ jobs:
       rust_release: ${{ steps.facts.outputs.rust_release }}
       grit: ${{ steps.facts.outputs.grit }}
       grit_release: ${{ steps.facts.outputs.grit_release }}
+      helix: ${{ steps.facts.outputs.helix }}
+      helix_release: ${{ steps.facts.outputs.helix_release }}
       llvm: ${{ steps.facts.outputs.llvm }}
       llvm_release: ${{ steps.facts.outputs.llvm_release }}
       gnu_make: ${{ steps.facts.outputs.gnu_make }}
@@ -247,6 +254,10 @@ jobs:
       # grit, from Sepia-OS/grit - and with it the `git` command. WITH_GRIT is
       # left at its default like every other switch.
       GRIT_TAG: ${{ inputs.grit_tag }}
+      # The editor, from Sepia-OS/helix. WITH_HELIX is left at its default like
+      # every other switch, so the released card is the card CI builds and
+      # boots - and it is why a card with no Rust on it is 1 GiB not 512 MiB.
+      HELIX_TAG: ${{ inputs.helix_tag }}
       # The filesystem tools, from Sepia-OS/e2fsprogs, on exactly the same
       # terms as GNU make: not through CHANNEL, a pin that does not decay, and
       # WITH_E2FSPROGS left at its default so the released card is the card CI
@@ -302,6 +313,9 @@ jobs:
 
       - name: Resolve and fetch grit
         run: make grit
+
+      - name: Resolve and fetch helix
+        run: make helix
 
       - name: Resolve and fetch the on-device toolchain
         run: make llvm
@@ -360,6 +374,8 @@ jobs:
             echo "rust_release=${SEPIAOS_RUST_RELEASE}"
             echo "grit=${SEPIAOS_GRIT}"
             echo "grit_release=${SEPIAOS_GRIT_RELEASE}"
+            echo "helix=${SEPIAOS_HELIX}"
+            echo "helix_release=${SEPIAOS_HELIX_RELEASE}"
             echo "llvm=${SEPIAOS_LLVM}"
             echo "llvm_release=${SEPIAOS_LLVM_RELEASE}"
             echo "gnu_make=${SEPIAOS_MAKE}"
@@ -371,7 +387,8 @@ jobs:
 
       # -T0 uses every core; the checksum is taken afterwards, so the threaded
       # encoder's different framing does not matter. The image is mostly empty
-      # space and compresses to a fraction of its 256 MiB.
+      # space and compresses to a fraction of its size - which is 2 GiB with the
+      # Rust toolchain on it, not the 256 MiB this said when it was written.
       - name: Compress and checksum
         env:
           ASSET: ${{ needs.gate.outputs.asset }}
@@ -440,6 +457,8 @@ jobs:
           RUST_RELEASE: ${{ needs.build.outputs.rust_release }}
           GRIT: ${{ needs.build.outputs.grit }}
           GRIT_RELEASE: ${{ needs.build.outputs.grit_release }}
+          HELIX: ${{ needs.build.outputs.helix }}
+          HELIX_RELEASE: ${{ needs.build.outputs.helix_release }}
           LLVM: ${{ needs.build.outputs.llvm }}
           LLVM_RELEASE: ${{ needs.build.outputs.llvm_release }}
           # Not MAKE: that name is GNU make's own, and exporting it into a
@@ -468,6 +487,7 @@ jobs:
           | wpa_supplicant | \`${WPA}\` (\`${WIFI_RELEASE}\` from \`Sepia-OS/wifi\`) |
           | rust | \`${RUST}\` (\`${RUST_RELEASE}\` from \`Sepia-OS/rust-toolchain\`) |
           | grit | \`${GRIT}\` (\`${GRIT_RELEASE}\` from \`Sepia-OS/grit\`), as \`git\` |
+          | helix | \`${HELIX}\` (\`${HELIX_RELEASE}\` from \`Sepia-OS/helix\`), as \`hx\` |
           | LLVM | \`${LLVM}\` (\`${LLVM_RELEASE}\` from \`Sepia-OS/llvm\`) |
           | GNU make | \`${GNU_MAKE}\` (\`${MAKE_RELEASE}\` from \`Sepia-OS/make\`) |
           | e2fsprogs | \`${E2FSPROGS}\` (\`${E2FSPROGS_RELEASE}\` from \`Sepia-OS/e2fsprogs\`) |

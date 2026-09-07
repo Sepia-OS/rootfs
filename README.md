@@ -280,12 +280,42 @@ make grit-update                # move onto a newer one
 make WITH_GRIT=0 image          # a card with no git on it
 ```
 
+### Retrieve the Helix editor
+
+The latest release of https://github.com/Sepia-OS/helix shall be retrieved and
+unpacked into the root file system, so that a SepiaOS device can be edited on
+directly. The asset carries `usr/bin/hx` and the whole runtime beside it — 245
+tree-sitter grammars, their query sets and the themes — and the runtime
+directory is compiled into the binary, so nothing has to be set in an
+environment for `hx` to find it.
+
+It is **216 MiB**, 196 MiB of which is grammars. That is what makes a card
+without the Rust toolchain 1 GiB rather than 512 MiB; with Rust on, the image
+was already 2 GiB and the editor changes nothing. `WITH_HELIX=0` leaves it out
+and the card goes back to 512 MiB.
+
+`hx` is dynamically linked, and has to be: it `dlopen`s a grammar the first
+time a language is opened, and a static musl binary cannot `dlopen` at all. It
+needs `libgcc_s.so.1`, and twelve of the grammars — the ones with C++ scanners
+— need `libstdc++.so.6`. **Neither is in the asset: both come from the LLVM
+package**, so `WITH_HELIX=1` requires `WITH_LLVM=1`, and the build now says so
+rather than producing a card whose editor dies at `exec`.
+
+```sh
+make helix                      # resolve, verify and unpack it
+make helix-info                 # which release, which version, how big
+make HELIX_TAG=v25.07.1 helix   # a specific release
+make helix-update               # move onto a newer one
+make helix-check                # aarch64, loader, closure over all 245 grammars
+make WITH_HELIX=0 image         # a 512 MiB card with no editor on it
+```
+
 ### Create a bootable image
 
 The rootfs shall be created based on the Linux File Hierarchy Standard and
 populated with musl libc, busybox, the kernel modules, the LLVM toolchain, GNU
-make, the e2fsprogs filesystem tools, the Rust toolchain and grit from the
-previous steps. The rootfs
+make, the e2fsprogs filesystem tools, the Rust toolchain, grit and the Helix
+editor from the previous steps. The rootfs
 shall be created with `ext4` file system.
 
 The bootable image is created using the boot partition, musl libc and
@@ -469,9 +499,9 @@ the release workflow does not override any of them — so what is published is
 the same card every CI run builds and boots, rather than a configuration that
 is first exercised inside the release build itself. The `prerelease` input
 still selects the boot partition's channel and deliberately selects **no**
-channel for the seven siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
-`musl_tag`, `wifi_tag`, `rust_tag` and `grit_tag` pin those the way `boot_tag`
-pins a boot partition. The release
+channel for the eight siblings; `llvm_tag`, `make_tag`, `e2fsprogs_tag`,
+`musl_tag`, `wifi_tag`, `rust_tag`, `grit_tag` and `helix_tag` pin those the
+way `boot_tag` pins a boot partition. The release
 notes quote the LLVM, GNU make, e2fsprogs and musl versions out of the built
 tree's `/etc/os-release`, so they cannot drift from what was actually shipped.
 

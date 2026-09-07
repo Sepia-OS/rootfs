@@ -12,6 +12,39 @@ the image's own `/etc/os-release`.
 
 ### Added
 
+- The **Helix editor**, fetched from the newest `Sepia-OS/helix` release and
+  installed into the image the same way musl, wifi, e2fsprogs, Rust and grit
+  are: resolved over the GitHub API, cached on the release asset's id, verified
+  against the release's `SHA256SUMS`, unpacked to a stage, asserted, then copied
+  in with a collision check. `hx` and the whole runtime beside it - 245
+  tree-sitter grammars, their query sets and the themes. On by default;
+  `WITH_HELIX=0` leaves it out, `HELIX_TAG` pins a release, and `make helix`,
+  `helix-info`, `helix-tag`, `helix-update` and `helix-check` are the usual
+  five targets.
+- `SEPIAOS_HELIX` and `SEPIAOS_HELIX_RELEASE` in `/etc/os-release`, a
+  `helix_tag` input on the release workflow, and a `| helix |` row in the
+  release notes - all read out of the built tree rather than written by hand.
+- A third rung on the `IMAGE_SIZE_MIB` default. The editor is 216 MiB, 196 MiB
+  of which is grammars, and the toolchain plus the editor plus the base tree
+  come to about 528 MiB - which does not fit the 452 MiB root of a 512 MiB
+  card. So a default card without the Rust toolchain is now **1 GiB**; with
+  Rust it stays 2 GiB, which was already sized for 725 MiB of compiler and
+  swallows the editor as well.
+- `helix-check` reads **every** grammar rather than one of them. They are not a
+  homogeneous set - 233 need `libc` and `libgcc_s`, and twelve have C++
+  scanners and need `libstdc++` too - so no single grammar can speak for the
+  rest.
+
+### Fixed
+
+- `assert_rootfs` now refuses a tree that has `hx` or `cargo` on it without
+  `usr/lib/libgcc_s.so.1`, and one with `hx` but no `usr/lib/libstdc++.so.6`.
+  Both libraries come from the **LLVM package alone** - neither the Rust
+  toolchain nor helix ships them - so `WITH_RUST=1 WITH_LLVM=0` has been
+  producing a card whose `cargo` dies at `exec` for as long as `WITH_RUST` has
+  existed, silently and with nothing to catch it. It is a build failure now
+  instead of a discovery made on the card.
+
 - `sepia-time`, and with it a clock the card can rely on. A Raspberry Pi has no
   battery-backed clock, so the card booted at 1 January 1970 — and since every
   TLS certificate is "not valid before" a date after that, HTTPS could not work

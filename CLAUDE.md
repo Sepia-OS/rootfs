@@ -46,6 +46,10 @@ gmake WITH_RUST=0 image                 # no Rust, and a 512 MiB card again
 gmake grit                              # fetch grit and the git symlink
 gmake grit-info                         # which release, which version, how big
 gmake grit-check                        # aarch64, and that it really is static
+
+gmake helix                             # fetch the Helix editor and its runtime
+gmake helix-info                        # which release, which version, how big
+gmake helix-check                       # aarch64, loader, closure over all 245 grammars
 gmake WITH_GRIT=0 image                 # a card with no git on it
 gmake rootfs                            # stage the FHS tree under build/rootfs
 gmake rootfs-info                       # size, file count, kernels it carries
@@ -411,7 +415,7 @@ These are the facts the rootfs build has to match; all were read out of `../boot
 - **725 MiB unpacked**, more than every other package on the card together, and the reason `IMAGE_SIZE_MIB` defaults to **2048** when `WITH_RUST=1`. 264 MiB of everything else plus 725 does not fit in 512, and QEMU only accepts a power of two, so 1024 would leave about 35 MiB free. `WITH_RUST=0` returns the default to 512.
 - **`bin/rustc` is a 72 KiB shim.** It finds its sysroot by walking up from its own path and loads `librustc_driver-*.so` out of `usr/lib/`. A tree with the three programs and no `lib/` passes any check that only looks at `bin/` and then fails on the card at the first `rustc --version`, so `assert_rust_stage` and `assert_rootfs` both name the driver and `libstd`.
 - **Rust cannot link a program by itself.** `rustc` shells out to `cc` for the final link, which on a SepiaOS card is the clang from `Sepia-OS/llvm`. The switches stay independent anyway: a card with Rust and no clang compiles to object files and stops, which is strange but not something to refuse.
-- **The closure check allows `libgcc_s.so.1` as well as the card's libc**, because upstream links its aarch64-musl build against it and ships it in the asset's own `usr/lib`. Every other `DT_NEEDED` has to be musl or a file in the asset.
+- **The closure check allows `libgcc_s.so.1` as well as the card's libc**, because upstream links its aarch64-musl build against it — `cargo` carries that `DT_NEEDED`. The asset does **not** ship it: the card's only copy comes from the **LLVM** package, which means `WITH_RUST=1 WITH_LLVM=0` produces a card whose cargo dies at exec. Nothing asserts that today. `libgcc_s` is a system library like the loader and ought to be staged by this repository from its cross-toolchain, rather than arriving as a side effect of one package. 
 - **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-rust-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| rust | \`1.98.1\` |`, mined into `build/rust/release.env` and recorded as `SEPIAOS_RUST` beside `SEPIAOS_RUST_RELEASE`.
 - **It will never contain a libc or a loader**, like every other sibling asset; `assert_rust_stage` refuses one.
 
@@ -423,6 +427,17 @@ These are the facts the rootfs build has to match; all were read out of `../boot
 - **The asset carries a symlink that has to survive three copies**: out of the tarball, into `build/rootfs`, and into the ext4 image through `mke2fs -d`. It is relative (`git -> grit`), so it resolves at every step and on the card; an absolute one would resolve on the build host and dangle everywhere else. `install_grit` uses `cp -R`, which preserves it — plain `cp` would follow it and put a second 9.5 MiB copy of the binary on the card under a different name. `assert_rootfs` reads the link back out of the staged tree.
 - **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-grit-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| grit | \`0.5.0\` |`, mined into `build/grit/release.env` and recorded as `SEPIAOS_GRIT` beside `SEPIAOS_GRIT_RELEASE`.
 - **It ships `grit` alone**, not `grit-git`: the upstream workspace builds both, and upstream's own release asset for this target carries the one.
+
+## The Contract With the `helix` Repository
+
+`Sepia-OS/helix` cross-builds the Helix editor and publishes `usr/bin/hx` with its runtime beside it. It is the first thing this repository puts on a card that is a program someone *uses* rather than a tool for building one. The fetch is the family's shape; what is particular:
+
+- **216 MiB, and 196 MiB of that is 245 tree-sitter grammars.** It costs about what the whole LLVM toolchain costs, which is why `IMAGE_SIZE_MIB` grew a third rung: a card without the Rust toolchain went from 512 MiB to 1 GiB. With Rust on, 2048 was already sized for 725 MiB of compiler and swallows the editor too, so the rungs are ordered largest-first and stop at the first that applies.
+- **It is dynamic where grit is static, and it has to be.** Helix `dlopen`s a grammar the first time a language is opened, and a static musl binary cannot `dlopen` at all — a static `hx` would edit files perfectly and have no highlighting, no indentation and no textobjects.
+- **`hx` needs `libgcc_s.so.1`, and twelve of the 245 grammars need `libstdc++.so.6`** — the twelve whose tree-sitter scanner is written in C++ rather than C. This asset ships neither, and neither does `rust-toolchain`: **the card's only copies of both come from the LLVM package.** So helix genuinely requires `WITH_LLVM=1`, and `assert_rootfs` now says so instead of leaving it to be discovered at `exec` time on the card. That check covers `WITH_RUST` too, which has had the same dependency since the day it was added and was never asserted.
+- **The runtime directory is compiled into the binary** (`/usr/lib/helix/runtime`), so nothing on the card needs `HELIX_RUNTIME` in an environment. That makes *where it is installed* a contract with the other repository rather than a local choice, so `assert_helix_stage` greps the path back out of `usr/bin/hx`: if it ever moves over there, the card would get an editor that silently finds none of its runtime.
+- **`helix-check` reads every grammar, never a sample.** They are not homogeneous — 233 need `libc` and `libgcc_s`, twelve need `libstdc++` as well — so no single one can speak for the set. That was learned in `Sepia-OS/helix`, where the check read only the first `.so` and the first happened to be one of the twelve; the CI failure it eventually caused is the reason this one loops.
+- **One `.tar.xz` asset and a `SHA256SUMS`**, named `sepiaos-helix-<version>-aarch64-musl-<tag>.tar.xz`. The release body states `| helix | \`25.07.1\` |`, mined into `build/helix/release.env` and recorded as `SEPIAOS_HELIX` beside `SEPIAOS_HELIX_RELEASE`.
 
 ## The Contract With the `llvm` Repository
 

@@ -3201,6 +3201,285 @@ define assert_grit_static
 endef
 
 # ---------------------------------------------------------------------------
+# helix, from Sepia-OS/helix
+#
+# `Sepia-OS/helix` cross-builds the Helix editor and publishes `usr/bin/hx`
+# with its runtime beside it: 245 tree-sitter grammars, their query sets and
+# the themes. It is the first thing this repository puts on the card that is a
+# program someone *uses*, rather than a tool for building one.
+#
+# Structurally this is the llvm, make, e2fsprogs, wifi, rust and grit steps
+# again. What is particular:
+#
+#   - **216 MiB, of which 196 MiB is grammars** - an editor that costs about
+#     what the whole LLVM toolchain costs. That is what moves IMAGE_SIZE_MIB
+#     below, the same way the Rust toolchain does; it is the reason a default
+#     card without Rust went from 512 MiB to 1 GiB.
+#   - **It is dynamic where grit is static, and it has to be.** Helix dlopens
+#     a grammar the first time a language is opened, and a static musl binary
+#     cannot dlopen at all - so a static hx would edit files perfectly and have
+#     no highlighting, no indentation and no textobjects.
+#   - **`hx` needs libgcc_s.so.1 and twelve of the grammars need
+#     libstdc++.so.6**, and this asset ships neither. The card's only copies of
+#     both come from the LLVM package, so helix genuinely requires WITH_LLVM=1.
+#     assert_rootfs states that rather than leaving it to be found at exec time
+#     on the card - see the note there. The Rust toolchain has had the same
+#     dependency all along and it was never asserted either.
+#   - The runtime directory is compiled into the binary, so nothing on the card
+#     needs HELIX_RUNTIME set in an environment. That makes where it is
+#     installed part of the contract with the other repository rather than a
+#     local choice, so assert_helix_stage reads the path back out of the
+#     binary.
+# ---------------------------------------------------------------------------
+
+WITH_HELIX ?= 1
+
+HELIX_REPO ?= Sepia-OS/helix
+
+# Pin a specific release, e.g. HELIX_TAG=v25.07.1. Empty means "resolve the
+# newest one", cached in build/helix/release.env like every other upstream
+# version this build takes. `make helix-update` moves it.
+HELIX_TAG  ?=
+
+DL_HELIX    := $(DL_DIR)/helix
+HELIX_DIR   := $(BUILD_DIR)/helix
+HELIX_ENV   := $(HELIX_DIR)/release.env
+HELIX_STAGE := $(HELIX_DIR)/stage
+HELIX_STAMP := $(HELIX_DIR)/.staged
+HELIX_CFG   := $(HELIX_DIR)/.config
+
+# Where the runtime lives on the card. Compiled into hx over in $(HELIX_REPO),
+# so this is not a local choice: it is read back out of the binary below.
+HELIX_RUNTIME := /usr/lib/helix/runtime
+
+# The trailing token is the format of release.env rather than an input to it;
+# bump it when a field is added, so an env file written by an older Makefile is
+# re-resolved instead of being sourced with the new field silently empty.
+HELIX_SIG    = $(HELIX_REPO)|$(HELIX_TAG)|$(GITHUB_API)|env1
+
+ifeq ($(WITH_HELIX),1)
+  HELIX_DEP := $(HELIX_STAMP)
+else
+  HELIX_DEP :=
+endif
+
+.PHONY: helix
+helix: $(HELIX_STAMP) ## Fetch, verify and unpack the Helix editor and its runtime
+	@source $(HELIX_ENV); printf '  READY    helix %s (%s) -> %s\n' \
+	   "$${HELIX_VER:-?}" "$$HELIX_TAG" $(HELIX_STAGE)
+
+$(HELIX_CFG): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(HELIX_SIG)' | cmp -s - $@ || printf '%s\n' '$(HELIX_SIG)' > $@
+
+# The release body is mined the way every other one is: it states the version
+# verbatim as a table row, `| helix | `25.07.1` |`.
+$(HELIX_ENV): $(HELIX_CFG)
+	@mkdir -p $(@D)
+	@command -v jq >/dev/null 2>&1 || { \
+	  echo "jq is required to read the GitHub release metadata." >&2; \
+	  echo "macOS 13+ ships it at /usr/bin/jq; otherwise: brew install jq / apt-get install jq" >&2; \
+	  exit 1; }
+	@echo "  RESOLVE  $(HELIX_REPO) ($(if $(HELIX_TAG),pinned $(HELIX_TAG),newest release))"
+	@api="$(GITHUB_API)/repos/$(HELIX_REPO)"; \
+	 hdr=(-H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28'); \
+	 if [ -n "$${GITHUB_TOKEN:-}" ]; then hdr+=(-H "Authorization: Bearer $$GITHUB_TOKEN"); fi; \
+	 body=$$(mktemp); trap 'rm -f "$$body"' EXIT; \
+	 get() { curl --silent --show-error --location \
+	              --retry 3 --retry-delay 2 --retry-connrefused \
+	              "$${hdr[@]}" -o "$$body" -w '%{http_code}' "$$1"; }; \
+	 refuse() { \
+	   case "$$1" in \
+	     403|429) echo "GitHub API rate limit hit (HTTP $$1). Set GITHUB_TOKEN to raise it." >&2;; \
+	     *) echo "GitHub API returned HTTP $$1 for $$2" >&2;; \
+	   esac; exit 1; }; \
+	 if [ -n '$(HELIX_TAG)' ]; then \
+	   code=$$(get "$$api/releases/tags/$(HELIX_TAG)"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(HELIX_REPO) has no release tagged '$(HELIX_TAG)'. Leave HELIX_TAG empty" >&2; \
+	     echo "to take the newest one, or check 'gh release list --repo $(HELIX_REPO)'." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "release $(HELIX_TAG)"; \
+	   rel=$$(cat "$$body"); \
+	 else \
+	   code=$$(get "$$api/releases?per_page=100"); \
+	   if [ "$$code" = 404 ]; then \
+	     echo "$(HELIX_REPO) does not exist, or this token cannot see it. Build without" >&2; \
+	     echo "it using WITH_HELIX=0, or point HELIX_REPO at a repository that has cut" >&2; \
+	     echo "a release." >&2; \
+	     exit 1; fi; \
+	   [ "$$code" = 200 ] || refuse "$$code" "the release list"; \
+	   rel=$$(jq -c '[.[]|select(.draft==false)]|sort_by(.published_at)|last' "$$body"); \
+	   if [ -z "$$rel" ] || [ "$$rel" = null ]; then \
+	     echo "$(HELIX_REPO) has published no release yet. Build without it using" >&2; \
+	     echo "WITH_HELIX=0, or pin one with HELIX_TAG=<tag>." >&2; exit 1; fi; \
+	 fi; \
+	 tag=$$(jq -r '.tag_name // empty' <<<"$$rel"); \
+	 pre=$$(jq -r '.prerelease // false' <<<"$$rel"); \
+	 ast=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .name // empty' <<<"$$rel"); \
+	 asturl=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 astid=$$(jq -r '[.assets[] | select(.name | endswith(".tar.xz"))] | first | .id // empty' <<<"$$rel"); \
+	 sumurl=$$(jq -r '[.assets[] | select(.name == "SHA256SUMS")] | first | .browser_download_url // empty' <<<"$$rel"); \
+	 if [ -z "$$ast" ]; then \
+	   echo "Release $$tag carries no .tar.xz asset - was it renamed?" >&2; exit 1; fi; \
+	 if [ -z "$$sumurl" ]; then \
+	   echo "Release $$tag carries no SHA256SUMS - refusing to use an unverifiable asset." >&2; exit 1; fi; \
+	 [[ "$$astid" =~ ^[0-9]+$$ ]] || { \
+	   echo "Release $$tag gave asset id '$$astid', which is not a number - the" >&2; \
+	   echo "cache below keys on it, so refusing rather than caching on nothing." >&2; exit 1; }; \
+	 for v in "$$tag" "$$ast"; do \
+	   [[ "$$v" =~ ^[A-Za-z0-9._+-]+$$ ]] || { echo "Refusing '$$v': not a plain tag/filename." >&2; exit 1; }; \
+	 done; \
+	 for v in "$$asturl" "$$sumurl"; do \
+	   [[ "$$v" == https://* ]] || { echo "Refusing non-https URL '$$v'." >&2; exit 1; }; \
+	 done; \
+	 ver=$$(jq -r '.body // ""' <<<"$$rel" \
+	        | sed -n 's/^| *helix *|[^|]*`\([^`]*\)`.*/\1/p' | head -1); \
+	 [[ "$$ver" =~ ^[0-9][0-9A-Za-z._-]*$$ ]] || ver=''; \
+	 { echo "HELIX_TAG='$$tag'"; \
+	   echo "HELIX_PRERELEASE='$$pre'"; \
+	   echo "HELIX_ASSET='$$ast'"; \
+	   echo "HELIX_ASSET_URL='$$asturl'"; \
+	   echo "HELIX_ASSET_ID='$$astid'"; \
+	   echo "HELIX_SUMS_URL='$$sumurl'"; \
+	   echo "HELIX_VER='$$ver'"; } > $@.part
+	@mv -f $@.part $@
+	@sed -n "s/^HELIX_TAG='\(.*\)'/  HELIX    \1/p" $@
+
+# Keyed by tag under downloads/, surviving `clean` like every other upstream
+# artifact, with the release asset's GitHub id recorded beside it. The marker
+# is written only after VERIFY passes, so an interrupted download is refetched
+# rather than trusted.
+$(HELIX_STAMP): $(HELIX_ENV) Makefile
+	@command -v xz >/dev/null 2>&1 || { \
+	  echo "xz is required to unpack the asset (brew install xz / apt-get install xz-utils)" >&2; \
+	  exit 1; }
+	@mkdir -p $(@D)
+	@source $(HELIX_ENV); \
+	 d=$(DL_HELIX)/$$HELIX_TAG; mkdir -p "$$d"; \
+	 if [ ! -f "$$d/.asset-id" ] \
+	    || [ "$$(cat "$$d/.asset-id")" != "$$HELIX_ASSET_ID" ]; then \
+	   rm -f "$$d/SHA256SUMS" "$$d/$$HELIX_ASSET"; \
+	 fi; \
+	 if [ ! -f "$$d/SHA256SUMS" ]; then \
+	   echo "  FETCH    SHA256SUMS"; \
+	   $(CURL) -o "$$d/SHA256SUMS.part" "$$HELIX_SUMS_URL"; \
+	   mv -f "$$d/SHA256SUMS.part" "$$d/SHA256SUMS"; \
+	 fi; \
+	 if [ ! -f "$$d/$$HELIX_ASSET" ] \
+	    || ! ( cd "$$d" && grep -F "$$HELIX_ASSET" SHA256SUMS \
+	           | $(SHA256) --check --quiet - ) >/dev/null 2>&1; then \
+	   echo "  FETCH    $$HELIX_ASSET (15 MiB)"; \
+	   $(CURL) -o "$$d/$$HELIX_ASSET.part" "$$HELIX_ASSET_URL"; \
+	   mv -f "$$d/$$HELIX_ASSET.part" "$$d/$$HELIX_ASSET"; \
+	 fi; \
+	 echo "  VERIFY   $$HELIX_ASSET"; \
+	 ( cd "$$d" && grep -F "$$HELIX_ASSET" SHA256SUMS | $(SHA256) --check --quiet - ) || { \
+	   echo "  FAIL     $$HELIX_ASSET does not match SHA256SUMS; delete $$d and retry" >&2; exit 1; }; \
+	 printf '%s\n' "$$HELIX_ASSET_ID" > "$$d/.asset-id"; \
+	 echo "  UNPACK   $$HELIX_ASSET -> $(HELIX_STAGE)"; \
+	 rm -rf $(HELIX_STAGE); mkdir -p $(HELIX_STAGE); \
+	 tar -xf "$$d/$$HELIX_ASSET" -C $(HELIX_STAGE)
+	@$(call assert_helix_stage)
+	@touch $@
+
+# Asked of the unpacked asset before any of it reaches the rootfs. Deliberately
+# uses nothing from the cross-toolchain - this step is a download. ELF byte 18
+# is e_machine, little-endian, and 0xb7 is AArch64.
+#
+# The grammar count is the point of the package: hx without them is an editor
+# with no highlighting, and an asset that lost them would still contain a
+# working binary and pass every other check here.
+#
+# Reading the runtime path back out of the binary is the one check that is not
+# about this asset being well-formed but about it agreeing with *this*
+# repository: the path is compiled in over there, and if it ever moves, hx on
+# the card finds no grammars and says nothing about why.
+define assert_helix_stage
+	set -e; s=$(HELIX_STAGE); \
+	[ -x "$$s/usr/bin/hx" ] || { \
+	  echo "  FAIL     $$s/usr/bin/hx is missing - is this a SepiaOS helix asset?" >&2; exit 1; }; \
+	m=$$(od -An -tx1 -j 18 -N2 "$$s/usr/bin/hx" | tr -d ' \n'); \
+	[ "$$m" = "b700" ] || { \
+	  echo "  FAIL     usr/bin/hx has ELF machine 0x$$m, expected b700 (AArch64)" >&2; exit 1; }; \
+	g=$$(ls -1 $$s$(HELIX_RUNTIME)/grammars/*.so 2>/dev/null | wc -l | tr -d ' '); \
+	[ "$$g" -gt 100 ] || { \
+	  echo "  FAIL     the asset carries only $$g grammars under $(HELIX_RUNTIME)/grammars" >&2; \
+	  echo "           an hx without them has no highlighting and no indentation" >&2; exit 1; }; \
+	[ -d "$$s$(HELIX_RUNTIME)/queries" ] || { \
+	  echo "  FAIL     the asset carries no query sets; the grammars alone highlight nothing" >&2; exit 1; }; \
+	grep -aq '$(HELIX_RUNTIME)' "$$s/usr/bin/hx" || { \
+	  echo "  FAIL     hx was not built to look in $(HELIX_RUNTIME)" >&2; \
+	  echo "           it is compiled into the binary over in $(HELIX_REPO) - if it moved there" >&2; \
+	  echo "           the card gets an editor that silently finds none of its runtime" >&2; exit 1; }; \
+	[ -s "$$s/usr/share/licenses/helix/LICENSE" ] \
+	  || { echo "  FAIL     the asset carries no LICENSE; this ships somebody else's program" >&2; exit 1; }; \
+	c=$$(find $$s \( -name 'libc.so*' -o -name 'ld-musl-*' \) -print | head -1); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     the asset carries a libc ($$c); the card's musl comes from step 3" >&2; exit 1; }
+endef
+
+.PHONY: helix-update
+helix-update: ## Re-resolve the newest helix release and refetch
+	@rm -f $(HELIX_ENV)
+	@$(MAKE) --no-print-directory helix
+
+.PHONY: helix-tag
+helix-tag: $(HELIX_ENV) ## Print the helix release tag in use
+	@source $(HELIX_ENV); echo "$$HELIX_TAG"
+
+.PHONY: helix-info
+helix-info: $(HELIX_STAMP) ## Show the fetched helix release and what it contains
+	@source $(HELIX_ENV); \
+	 if [ "$$HELIX_PRERELEASE" = true ]; then k=' (pre-release)'; else k=''; fi; \
+	 echo "  repo     $(HELIX_REPO)"; \
+	 echo "  tag      $$HELIX_TAG$$k$(if $(HELIX_TAG), (pinned))"; \
+	 echo "  asset    $$HELIX_ASSET"; \
+	 echo "  helix    $${HELIX_VER:-<not named in the release notes>}"; \
+	 echo "  staged   $(HELIX_STAGE) ($$(du -sm $(HELIX_STAGE) | cut -f1) MiB)"
+	@printf '  grammars %s\n' "$$(ls -1 $(HELIX_STAGE)$(HELIX_RUNTIME)/grammars/*.so | wc -l | tr -d ' ')"
+	@printf '  runtime  %s\n' "$(HELIX_RUNTIME) (compiled into hx)"
+
+# The re-read target, off the build path because it needs the cross-toolchain's
+# readelf. Every grammar is read rather than a sample of them: they are not a
+# homogeneous set - 233 need libc and libgcc_s, and twelve have C++ scanners
+# and need libstdc++ too - so one of them cannot speak for the rest. That was
+# found the hard way in $(HELIX_REPO), where the check used to read the first
+# one only and the first one happened to be one of the twelve.
+.PHONY: helix-check
+helix-check: $(HELIX_STAMP) $(TOOLCHAIN_DEP) ## Re-read helix: architecture, loader, library closure
+	@$(call assert_helix_stage)
+	@$(call assert_helix_closure)
+
+define assert_helix_closure
+	set -e; s=$(HELIX_STAGE); \
+	$(CROSS)readelf -l "$$s/usr/bin/hx" | grep -q 'ld-musl-aarch64.so.1' \
+	  || { echo "  FAIL     usr/bin/hx does not use the musl loader" >&2; exit 1; }; \
+	host=""; miss=""; needs=""; n=0; \
+	for f in "$$s/usr/bin/hx" $$s$(HELIX_RUNTIME)/grammars/*.so; do \
+	  b=$$(basename $$f); \
+	  $(CROSS)readelf -h "$$f" | grep -q AArch64 || { host="$$host $$b"; continue; }; \
+	  for d in $$($(CROSS)readelf -d "$$f" 2>/dev/null \
+	              | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do \
+	    needs="$$needs $$d"; \
+	    case "$$d" in \
+	      libc.so*|libgcc_s.so*|libstdc++.so*) ;; \
+	      *) [ -e "$$s/usr/lib/$$d" ] || miss="$$miss $$b:$$d";; \
+	    esac; \
+	  done; \
+	  n=$$((n+1)); \
+	done; \
+	[ -z "$$host" ] || { \
+	  echo "  FAIL    $$host: not aarch64" >&2; exit 1; }; \
+	[ -z "$$miss" ] || { \
+	  u=$$(echo $$miss | tr ' ' '\n' | sort -u); \
+	  echo "  FAIL     needed by helix and provided by neither the card nor the asset:" >&2; \
+	  echo "$$u" | head -12 | sed 's/^/             /' >&2; \
+	  exit 1; }; \
+	echo "  OK       hx and $$((n-1)) grammars: aarch64, needing $$(echo $$needs | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+endef
+
+# ---------------------------------------------------------------------------
 # The timezone database
 #
 # A card has to be able to say what time it is *here*, not only in UTC, and
@@ -3422,7 +3701,7 @@ KEYMAP_VENDOR_DIR := $(BUILD_DIR)/keymaps-vendor
 # LLVM_SIG -> LLVM_CFG -> LLVM_ENV -> LLVM_STAMP (and the same chain for the
 # other two) is a genuine file chain. Only the switches change the tree while
 # touching nothing.
-ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|WITH_GRIT=$(WITH_GRIT)|WITH_TZDATA=$(WITH_TZDATA)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
+ROOTFS_SIG    = WITH_WIFI=$(WITH_WIFI)|WITH_LLVM=$(WITH_LLVM)|WITH_MAKE=$(WITH_MAKE)|WITH_E2FSPROGS=$(WITH_E2FSPROGS)|WITH_RUST=$(WITH_RUST)|WITH_GRIT=$(WITH_GRIT)|WITH_HELIX=$(WITH_HELIX)|WITH_TZDATA=$(WITH_TZDATA)|VERSION=$(SEPIAOS_VERSION)|DISPLAY=$(SEPIAOS_VERSION_DISPLAY)
 ROOTFS_CFG   := $(BUILD_DIR)/rootfs.config
 
 ROOTFS_DIR   := $(BUILD_DIR)/rootfs
@@ -3535,7 +3814,7 @@ $(ROOTFS_CFG): FORCE
 
 $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_STAMP) \
                  $(WIRELESS_DEP) $(LLVM_DEP) $(MAKE_DEP) $(E2FSPROGS_DEP) $(RUST_DEP) \
-                 $(GRIT_DEP) $(TZDATA_DEP) \
+                 $(GRIT_DEP) $(HELIX_DEP) $(TZDATA_DEP) \
                  $(ROOTFS_CFG) $(OVERLAY_SRC) Makefile
 	@mkdir -p $(IMG_DIR)
 	@echo "  STAGE    $(ROOTFS_DIR)"
@@ -3558,6 +3837,7 @@ $(ROOTFS_STAMP): $(BB_BIN) $(MUSL_STAMP) $(MOD_STAMP) $(E2FS_TGT_DEP) $(KEYMAP_S
 	@$(call install_e2fsprogs)
 	@$(call install_rust)
 	@$(call install_grit)
+	@$(call install_helix)
 	@$(if $(TZDATA_DEP),cp -R $(TZDATA_STAGE)/. $(ROOTFS_DIR)/,:)
 	@cp $(KEYMAP_DIR)/*.kmap $(ROOTFS_DIR)/usr/share/keymaps/
 	@rm -f $(ROOTFS_DIR)/sbin/init
@@ -3704,6 +3984,25 @@ define install_grit
 	   "$$r" "$$(du -sk $$g | cut -f1)"
 endef
 
+# helix, on the same terms as the rest: a `usr/` tree copied in whole and
+# refusing to overwrite anything already there. 216 MiB of it, which is why
+# the line it prints says so - it is the single largest thing on a card that
+# has no Rust toolchain on it.
+define install_helix
+	set -e; \
+	[ -n '$(HELIX_DEP)' ] || exit 0; \
+	r=$(ROOTFS_DIR); h=$(abspath $(HELIX_STAGE)); \
+	names() { ( cd "$$1" && find . -mindepth 1 \( -type f -o -type l \) -print | sort ); }; \
+	c=$$(comm -12 <(names "$$h") <(names "$$(cd $$r && pwd)")); \
+	[ -z "$$c" ] || { \
+	  echo "  FAIL     helix would overwrite files already in the tree:" >&2; \
+	  printf '           %s\n' $$c >&2; exit 1; }; \
+	cp -R "$$h"/. $$r/; \
+	printf '  HELIX    hx and %s grammars -> %s (%s MiB)\n' \
+	   "$$(ls -1 $$h$(HELIX_RUNTIME)/grammars/*.so | wc -l | tr -d ' ')" \
+	   "$$r" "$$(du -sm $$h | cut -f1)"
+endef
+
 define install_rust
 	set -e; \
 	[ -n '$(RUST_DEP)' ] || exit 0; \
@@ -3763,6 +4062,7 @@ define generate_etc
 	$(if $(WIRELESS_DEP),source $(WIFI_ENV);,WIFI_TAG=; WPA_VER=;) \
 	$(if $(RUST_DEP),source $(RUST_ENV);,RUST_TAG=; RUST_VER=;) \
 	$(if $(GRIT_DEP),source $(GRIT_ENV);,GRIT_TAG=; GRIT_VER=;) \
+	$(if $(HELIX_DEP),source $(HELIX_ENV);,HELIX_TAG=; HELIX_VER=;) \
 	{ echo 'root:$(ROOT_PASSWORD_HASH):20000:0:99999:7:::'; \
 	  echo 'daemon:*:20000:0:99999:7:::'; \
 	  echo 'nobody:*:20000:0:99999:7:::'; } > $$r/etc/shadow; \
@@ -3792,7 +4092,9 @@ define generate_etc
 	  [ -z "$$RUST_TAG" ] || { echo "SEPIAOS_RUST_RELEASE=\"$$RUST_TAG\""; \
 	                          echo "SEPIAOS_RUST=\"$$RUST_VER\""; }; \
 	  [ -z "$$GRIT_TAG" ] || { echo "SEPIAOS_GRIT_RELEASE=\"$$GRIT_TAG\""; \
-	                          echo "SEPIAOS_GRIT=\"$$GRIT_VER\""; }; } > $$r/etc/os-release; \
+	                          echo "SEPIAOS_GRIT=\"$$GRIT_VER\""; }; \
+	  [ -z "$$HELIX_TAG" ] || { echo "SEPIAOS_HELIX_RELEASE=\"$$HELIX_TAG\""; \
+	                           echo "SEPIAOS_HELIX=\"$$HELIX_VER\""; }; } > $$r/etc/os-release; \
 	{ echo 'SepiaOS $(SEPIAOS_VERSION_DISPLAY) \n \l'; echo; } > $$r/etc/issue; \
 	date +%s > $$r/etc/sepia-build-date; \
 	echo UTC > $$r/etc/timezone; \
@@ -3832,6 +4134,8 @@ define assert_rootfs
 	         usr/share/licenses/rust/COPYRIGHT) \
 	         $(if $(GRIT_DEP),usr/bin/grit usr/bin/git \
 	         usr/share/licenses/grit/LICENSE) \
+	         $(if $(HELIX_DEP),usr/bin/hx \
+	         usr/share/licenses/helix/LICENSE) \
 	         usr/share/udhcpc/default.script \
 	         usr/sbin/sepia-firstboot usr/sbin/sepia-gettys; do \
 	  [ -e "$$r/$$f" ] || { echo "  FAIL     $$r/$$f is missing" >&2; exit 1; }; \
@@ -3846,6 +4150,26 @@ define assert_rootfs
 	  || { echo "  FAIL     usr/bin/git is a file rather than the symlink to grit" >&2; exit 1; }; \
 	[ "$$(readlink $$r/usr/bin/git)" = grit ] \
 	  || { echo "  FAIL     usr/bin/git does not point at grit" >&2; exit 1; }; \
+	,) \
+	$(if $(HELIX_DEP),\
+	g=$$(ls -1 $$r$(HELIX_RUNTIME)/grammars/*.so 2>/dev/null | wc -l | tr -d ' '); \
+	[ "$$g" -gt 100 ] \
+	  || { echo "  FAIL     only $$g helix grammars reached the tree - hx cannot highlight anything" >&2; exit 1; }; \
+	[ -d "$$r$(HELIX_RUNTIME)/queries" ] \
+	  || { echo "  FAIL     helix has no query sets in the tree" >&2; exit 1; }; \
+	,) \
+	$(if $(or $(HELIX_DEP),$(RUST_DEP)),\
+	[ -f "$$r/usr/lib/libgcc_s.so.1" ] \
+	  || { echo "  FAIL     usr/lib/libgcc_s.so.1 is not in the tree" >&2; \
+	       echo "           hx and cargo each carry it as a DT_NEEDED and neither package ships it;" >&2; \
+	       echo "           the card's only copy comes from the LLVM package - use WITH_LLVM=1" >&2; \
+	       echo "           or leave out whichever of WITH_HELIX / WITH_RUST is on" >&2; exit 1; }; \
+	,) \
+	$(if $(HELIX_DEP),\
+	[ -f "$$r/usr/lib/libstdc++.so.6" ] \
+	  || { echo "  FAIL     usr/lib/libstdc++.so.6 is not in the tree" >&2; \
+	       echo "           twelve helix grammars have C++ scanners and need it; it ships with" >&2; \
+	       echo "           the LLVM package - use WITH_LLVM=1 or WITH_HELIX=0" >&2; exit 1; }; \
 	,) \
 	$(if $(RUST_DEP),\
 	ls $$r/usr/lib/librustc_driver-*.so >/dev/null 2>&1 \
@@ -3914,7 +4238,15 @@ rootfs-info: $(ROOTFS_STAMP) ## Show what was staged into the root filesystem
 # partway through libLLVM.so with the toolchain in. QEMU refuses any SD image
 # whose size is not a power of two, so 512 is the next rung rather than a
 # choice - it gives a 448 MiB root that lands about two thirds full.
-IMAGE_SIZE_MIB ?= $(if $(RUST_DEP),2048,$(if $(LLVM_DEP),512,256))
+#
+# Helix adds a third rung, for the same reason and with the same arithmetic:
+# it is 216 MiB, 196 MiB of which is tree-sitter grammars. The toolchain and
+# the editor and the base tree together come to about 528 MiB, which does not
+# fit the 452 MiB root a 512 MiB card has, so a default card with an editor on
+# it is 1 GiB. With the Rust toolchain the question does not arise - 2048 was
+# already sized for 725 MiB of compiler and swallows the editor as well - so
+# the rungs are ordered largest first and stop at the first that applies.
+IMAGE_SIZE_MIB ?= $(if $(RUST_DEP),2048,$(if $(HELIX_DEP),1024,$(if $(LLVM_DEP),512,256)))
 ROOTFS_LABEL   ?= sepiaos-root
 
 # Neither of the two settings above touches a file, and $(IMAGE) is named
@@ -4451,6 +4783,9 @@ help: ## Show this help
 	  "TZDATA_VERSION"    "pin a tzdata release instead of taking the newest one" \
 	  "GRIT_TAG"          "pin a grit release instead of taking the newest one" \
 	  "GRIT_REPO"         "where grit comes from (default $(GRIT_REPO))" \
+	  "WITH_HELIX"        "ship the Helix editor and its runtime, 216 MiB (default $(WITH_HELIX))" \
+	  "HELIX_TAG"         "pin a helix release instead of taking the newest one" \
+	  "HELIX_REPO"        "where helix comes from (default $(HELIX_REPO))" \
 	  "WITH_RUST"         "ship the Rust toolchain, 725 MiB (default $(WITH_RUST))" \
 	  "RUST_TAG"          "pin a Rust release instead of taking the newest one" \
 	  "RUST_REPO"         "where the Rust toolchain comes from (default $(RUST_REPO))" \
@@ -4504,6 +4839,7 @@ help: ## Show this help
 	@echo "  make WITH_RUST=0 image                 without Rust, and back to a 512 MiB card"
 	@echo "  make grit                              the newest grit, and the git command"
 	@echo "  make WITH_GRIT=0 image                 without git on the card"
+	@echo "  make WITH_HELIX=0 image                without the editor - and a 512 MiB card"
 	@echo "  make tzdata                            the timezone database first boot picks from"
 	@echo "  make WITH_TZDATA=0 image               a card that knows only UTC"
 	@echo "  make IMAGE_SIZE_MIB=1024 image         a roomier one"
