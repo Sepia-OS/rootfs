@@ -34,6 +34,37 @@ the image's own `/etc/os-release`.
   homogeneous set - 233 need `libc` and `libgcc_s`, and twelve have C++
   scanners and need `libstdc++` too - so no single grammar can speak for the
   rest.
+- [`docs/dev/ROOTFS.md`](docs/dev/ROOTFS.md), an inventory of the twenty-five
+  device-level subsystems this repository authors itself, as opposed to the ten
+  payloads it fetches and unpacks - keymaps, the clock and the timezone, the
+  init system and the getty generation, the four first-boot questions and the
+  two-pass resize, swap, networking and wifi, the tree skeleton and the card
+  image. Each entry says what it produces on the device, which external payload
+  it wraps if any, and where it lives. The boot is documented in `rcS` order,
+  because the order is the argument.
+- The same document records what is **not** on the card, since several of those
+  are load-bearing: no syslog, no cron, no remote access, no `machine-id`, no
+  locale or console font, no terminfo, and no supported way to add a startup
+  service. It also notes that `/etc/fstab` carries a `/boot` line that nothing
+  ever mounts - a documentation bug - and that the card ships no system CA
+  bundle, which turns out **not** to be a gap: `grit` and `spm` both embed the
+  Mozilla roots through `webpki-roots` and read no trust store at all, so HTTPS
+  works and the clock floor delivers what it was added for. The cost of that is
+  paid on root expiry instead, when every Rust binary on the card has to be
+  rebuilt rather than one package updated.
+- [`docs/dev/PACKAGED-ROOTFS.md`](docs/dev/PACKAGED-ROOTFS.md), a plan for
+  assembling the tree by installing spm packages instead of unpacking release
+  tarballs with `install_*` macros, with a base set that can be updated but not
+  removed. Nineteen packages, twelve of them base; seven milestones, each of
+  which leaves the tree building. It also records what cannot be a package and
+  why - the FHS skeleton, the permission block, eight generated `/etc` files
+  and `/var/lib/sepia` - so the boundary is written down rather than rediscovered.
+- The finding that makes that plan cheap: musl, busybox, e2fsprogs and wifi
+  **already** carry a `metadata.json` and a `package` target, and the `ROOTS`
+  relaxation they were written against has landed in spm. What is missing is
+  not packaging but an installer - `spm` has no alternate-root install, and
+  `store/mod.rs` refuses a `--root` flag by name and on purpose. The plan
+  proposes a separate host-side `spm graft` verb rather than relaxing that.
 
 ### Fixed
 
